@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "langset"
+version = "0.1.0"
+description = "Few-shot fine-tune an LLM to emit a latent into a bespoke, specialized geometry — and drop the result into SetFit as a Sentence-Transformer body."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Stephen Solka" }]
+dependencies = [
+    "torch>=2.2",
+    "transformers>=4.41",          # no upper bound -> modern backbones (Qwen3 etc.) work by default
+    "peft>=0.13.2",
+    "sentence-transformers>=3.0",
+    "datasets>=2.15.0",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+# `pip install langset[setfit]` pins the VERIFIED SetFit-composition window. SetFit pins transformers>=4.41 but
+# imports `default_logdir` (removed after 4.46); 4.46 + torch>=2.5 hits a torch.distributed.tensor bug. So:
+setfit = ["setfit>=1.1.0", "transformers>=4.41,<4.47", "torch>=2.2,<2.5", "scikit-learn"]
+wandb = ["wandb>=0.18"]
+dev = ["pytest", "ruff"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/langset"]

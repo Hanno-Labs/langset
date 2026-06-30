@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# environments
+.venv/
+venv/
+
+# trained outputs / artifacts (the example model lives on the HF Hub, not in git)
+langset-music/
+langset-out/
+*.pt
+
+# OS / tooling
+.DS_Store
+.ruff_cache/
+.pytest_cache/
+.ipynb_checkpoints/
