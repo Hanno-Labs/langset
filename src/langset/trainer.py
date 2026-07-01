@@ -1,13 +1,14 @@
-"""Trainer: bootstrap the target geometry from the bootstrap encoder, contrastively fit the LLM emitter, and
-EMA-specialize the geometry away from the seed. Selects/early-stops on held-out geometry (see selection.py),
-never on training loss.
+"""Trainer: fit the LLM emitter so `emit(input_text)` lands where `emit(target_text)` does — a native
+self-contrastive objective (both views in the model's own space, in-batch negatives). The target text DEFINES
+the geometry. Two light aux terms keep it grounded and spread; selection is collapse-aware.
 
-Dataset rows: `input_text`, `target_text`, plus optional geometry-label columns (EVAL-ONLY probes).
+Dataset rows: `input_text` (what you have at inference) + `target_text` (a description of the same item that
+defines where it should land). Pass a `datasets.Dataset` or `list[dict]`; use `column_mapping` to rename.
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -16,6 +17,11 @@ import torch.nn.functional as F
 from langset import selection
 from langset.modeling import LangSetModel
 from langset.training_args import TrainingArguments
+
+_RECON_K = 8            # soft-prompt tokens the latent expands into for the recon decoder
+_RECON_MAXLEN = 128     # target_text tokens the recon aux reconstructs
+_COLLAPSE_PENALTY = 3.0
+_COLLAPSE_FLOOR = 0.4   # collapse below this isn't penalized; above it, selection is tanked
 
 
 def _columns(dataset: Any) -> dict[str, list[Any]]:
@@ -27,46 +33,55 @@ def _columns(dataset: Any) -> dict[str, list[Any]]:
 
 class Trainer:
     def __init__(self, model: LangSetModel, args: TrainingArguments, train_dataset: Any,
-                 eval_dataset: Optional[Any] = None, column_mapping: Optional[dict[str, str]] = None,
-                 label_columns: Optional[list[str]] = None) -> None:
+                 eval_dataset: Optional[Any] = None, column_mapping: Optional[dict[str, str]] = None) -> None:
         self.model = model
         self.args = args
         cols = _columns(train_dataset)
-        cmap = column_mapping or {}
-        inv = {v: k for k, v in cmap.items()}                 # user-col -> canonical
-        get = lambda canon: cols[inv.get(canon, canon)]       # noqa: E731
+        inv = {v: k for k, v in (column_mapping or {}).items()}   # user-col -> canonical
+        get = lambda canon: cols[inv.get(canon, canon)]           # type: ignore[index]  # noqa: E731
         self.input_text = [str(x) for x in get("input_text")]
         self.target_text = [str(x) for x in get("target_text")]
-        used = {inv.get("input_text", "input_text"), inv.get("target_text", "target_text")}
-        lc = label_columns if label_columns is not None else [c for c in cols if c not in used]
-        self.label_cols = {c: [str(x) for x in cols[c]] for c in lc}
         if args.verbose:
-            print(f"[langset] {len(self.input_text)} rows | label columns (eval-only): {list(self.label_cols)}",
-                  flush=True)
+            print(f"[langset] {len(self.input_text)} rows", flush=True)
 
     def train(self) -> LangSetModel:
         a, m = self.args, self.model
         dev = m.device
         torch.manual_seed(a.seed)
         rng = np.random.default_rng(a.seed)
+        tok = m.tokenizer
 
-        # 1. bootstrap targets = bootstrap_encoder(target_text)  (the seed geometry)
-        tgt_np = m.bootstrap_encoder.encode(self.target_text, normalize_embeddings=True,
-                                            convert_to_numpy=True, show_progress_bar=False).astype(np.float32)
-        tgt = torch.tensor(tgt_np, device=dev)
+        def tok_to(texts: list[str], mx: int) -> tuple[torch.Tensor, torch.Tensor]:
+            e = tok(texts, padding=True, truncation=True, max_length=mx, return_tensors="pt")
+            return e["input_ids"].to(dev), e["attention_mask"].to(dev)
+
+        ids, mask = tok_to(self.input_text, a.max_len)            # input view
+        t2_ids, t2_mask = tok_to(self.target_text, a.max_len)     # target view (self-contrastive target)
+        tr_ids, tr_mask = tok_to(self.target_text, _RECON_MAXLEN)  # target tokens for the recon aux
+
         n = len(self.input_text)
         perm = rng.permutation(n)
         n_val = max(4, int(n * a.val_frac))
-        val_idx = perm[:n_val]
-        tr_idx = perm[n_val:]
+        val_idx, tr_idx = perm[:n_val], perm[n_val:]
 
-        tok = m.tokenizer
-        enc_in = tok(self.input_text, padding=True, truncation=True, max_length=a.max_len, return_tensors="pt")
-        ids = enc_in["input_ids"].to(dev)
-        mask = enc_in["attention_mask"].to(dev)
+        # recon aux: latent -> K soft tokens -> backbone decodes target_text (token CE). Grounds the latent in the
+        # text. `connector` is TRAINING-ONLY scaffolding (not saved; inference just emits the latent).
+        hsz, vsz = m.h, int(m.backbone.config.vocab_size)
+        connector = torch.nn.Linear(m.latent_dim, _RECON_K * hsz).to(dev)
 
-        ema = tgt.clone()                                     # EMA self-target (the "specialize" step)
-        opt = torch.optim.AdamW([p for p in m.parameters() if p.requires_grad], lr=a.lr)
+        def recon_loss(latent: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+            ti, tm = tr_ids[rows], tr_mask[rows]
+            temb = m.embed(ti)
+            soft = connector(latent).view(latent.size(0), _RECON_K, hsz).to(temb.dtype)
+            seq = torch.cat([soft, temb], dim=1)
+            am = torch.cat([torch.ones(latent.size(0), _RECON_K, device=dev, dtype=tm.dtype), tm], dim=1)
+            logits = m.backbone(inputs_embeds=seq, attention_mask=am).logits
+            pred_lg = logits[:, _RECON_K - 1:_RECON_K - 1 + ti.size(1), :].float()
+            return F.cross_entropy(pred_lg.reshape(-1, vsz), ti.masked_fill(tm == 0, -100).reshape(-1),
+                                   ignore_index=-100)
+
+        opt = torch.optim.AdamW([p for p in m.parameters() if p.requires_grad] + list(connector.parameters()),
+                                lr=a.lr)
         run = None
         if a.report_to == "wandb":
             import wandb  # type: ignore[import-untyped]
@@ -80,37 +95,41 @@ class Trainer:
             for i in range(0, len(order), a.batch_size):
                 idx = torch.tensor(order[i:i + a.batch_size], device=dev)
                 pred = m(ids[idx], mask[idx])
-                target = ema[idx] if a.ema else tgt[idx]
-                logits = (pred @ target.t()) / a.tau          # InfoNCE, in-batch negatives
-                loss = F.cross_entropy(logits, torch.arange(len(idx), device=dev))
-                if a.lam_anchor > 0:                          # pull toward the frozen bootstrap (0 = fully specialize)
-                    loss = loss + a.lam_anchor * (1 - (pred * tgt[idx]).sum(1)).mean()
+                target = m(t2_ids[idx], t2_mask[idx])            # self-contrastive: emit(target_text), same space
+                logits = (pred @ target.t()) / a.tau            # in-batch negatives force separation (no collapse)
+                loss = F.cross_entropy(logits, torch.arange(len(idx), device=dev))          # primary
+                loss = loss + a.lam_recon * recon_loss(pred, idx)                            # aux: grounding
+                if a.lam_uniform > 0 and len(idx) > 1:                                       # aux: uniformity
+                    sq = torch.pdist(F.normalize(pred, p=2, dim=-1), p=2).pow(2)
+                    loss = loss + a.lam_uniform * sq.mul(-2.0).exp().mean().log()
                 opt.zero_grad(); loss.backward(); opt.step()
-                if a.ema:
-                    with torch.no_grad():
-                        upd = a.ema_m * ema[idx] + (1 - a.ema_m) * pred.detach()
-                        ema[idx] = F.normalize(upd, p=2, dim=-1)
                 tot += float(loss.detach()); nb += 1
 
             if ep % a.eval_every:
                 continue
-            # 2. validate in the CURRENT geometry: input-view vs target-view co-location (never vs the seed)
-            vi = self.input_text and [self.input_text[j] for j in val_idx]
-            vt = [self.target_text[j] for j in val_idx]
-            emit_in = m.encode(vi, normalize_embeddings=True)
-            emit_tg = m.encode(vt, normalize_embeddings=True)
-            labels_val = {k: [v[j] for j in val_idx] for k, v in self.label_cols.items()}
-            metrics = selection.evaluate(emit_in, emit_tg, labels_val, tgt_np[val_idx], a.select)
+            # validate in the CURRENT geometry: input-view vs target-view retrieval + collapse + held-out recon.
+            emit_in = np.asarray(m.encode([self.input_text[j] for j in val_idx], normalize_embeddings=True))
+            emit_tg = np.asarray(m.encode([self.target_text[j] for j in val_idx], normalize_embeddings=True))
+            mrr = selection.retrieval_mrr(emit_in, emit_tg)["mrr"]
+            collapse = selection.collapse_score(emit_in)
+            with torch.no_grad():
+                rv, tot_v = 0.0, 0
+                for s in range(0, len(val_idx), a.batch_size):
+                    vb = torch.tensor(val_idx[s:s + a.batch_size], device=dev)
+                    rv += float(recon_loss(m(ids[vb], mask[vb]), vb)) * len(vb); tot_v += len(vb)
+                recon_val = rv / tot_v
+            # recon_val is teacher-forced -> blind to collapse; hard-penalize high collapse so a collapsed epoch
+            # can never win.
+            sel_score = -recon_val - _COLLAPSE_PENALTY * max(0.0, collapse - _COLLAPSE_FLOOR)
             if a.verbose:
-                extra = f" purity_mean={metrics.get('purity_mean'):.3f} beats={metrics.get('beats_bootstrap')}" \
-                    if "purity_mean" in metrics else ""
-                print(f"ep{ep:02d} loss={tot/nb:.3f} mrr={metrics['mrr']:.3f} collapse={metrics['collapse']:.3f}"
-                      f"{extra} score={metrics['score']:.3f} [{metrics['select_mode']}]", flush=True)
+                print(f"ep{ep:02d} loss={tot/nb:.3f} mrr={mrr:.3f} collapse={collapse:.3f} "
+                      f"recon_val={recon_val:.3f} sel={sel_score:.3f}", flush=True)
             if run is not None:
-                run.log({"loss": tot / nb, **metrics, "epoch": ep})
+                run.log({"loss": tot / nb, "mrr": mrr, "collapse": collapse, "recon_val": recon_val,
+                         "sel_score": sel_score, "epoch": ep})
 
-            if metrics["score"] > best_score:
-                best_score = metrics["score"]
+            if sel_score > best_score:
+                best_score = sel_score
                 best_state = {"head": {k: v.detach().cpu().clone() for k, v in m.head.state_dict().items()},
                               "lora": {k: v.detach().cpu().clone()
                                        for k, v in m.backbone.state_dict().items() if "lora" in k}}
@@ -119,7 +138,7 @@ class Trainer:
                 no_improve += 1
                 if no_improve >= a.patience:
                     if a.verbose:
-                        print(f"[langset] early stop at ep{ep} (best score {best_score:.3f})", flush=True)
+                        print(f"[langset] early stop at ep{ep} (best {best_score:.3f})", flush=True)
                     break
 
         if best_state is not None:                            # restore best
@@ -131,5 +150,5 @@ class Trainer:
         if run is not None:
             run.finish()
         if a.verbose:
-            print(f"[langset] done. best score={best_score:.3f} -> {a.output_dir}", flush=True)
+            print(f"[langset] done. best={best_score:.3f} -> {a.output_dir}", flush=True)
         return m

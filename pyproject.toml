@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "langset"
-version = "0.1.0"
-description = "Few-shot fine-tune an LLM to emit a latent into a bespoke, specialized geometry — and drop the result into SetFit as a Sentence-Transformer body."
+version = "0.2.0"
+description = "Few-shot fine-tune an LLM to emit a latent into a bespoke geometry you define with text — and drop the result into SetFit as a Sentence-Transformer body."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
