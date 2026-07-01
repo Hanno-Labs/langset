@@ -6,8 +6,15 @@ you can retrieve albums that *sound* alike. The demo this library was extracted 
 - `input_text`  = album review
 - `target_text` = a sonic **fingerprint** (an LLM-written "how it sounds" description) that DEFINES the geometry
 
-`data/prepared.json` — album reviews paired with fingerprints (the fingerprints describe sound, not identity, so
-retrieval is by sound).
+**No review text is shipped here.** `prepare.py` reconstructs the training rows from public data, joining on
+artist+album:
+
+| field | source |
+|---|---|
+| `input_text` (review) | [`mediumrarely/pitchfork-reviews`](https://huggingface.co/datasets/mediumrarely/pitchfork-reviews) — public review text (~99% coverage) |
+| `target_text` (fingerprint) | [`Hanno-Labs/sounds-like-fingerprints`](https://huggingface.co/datasets/Hanno-Labs/sounds-like-fingerprints) — our sonic fingerprints |
+
+Both are pulled with `datasets.load_dataset`, so the example is fully reproducible with no local data.
 
 ## Run
 

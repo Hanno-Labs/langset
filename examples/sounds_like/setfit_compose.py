@@ -17,7 +17,6 @@ import modal
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 app = modal.App("langset-setfit")
-body_vol = modal.Volume.from_name("langset-soundslike-body")
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -25,29 +24,30 @@ image = (
                  "peft>=0.13.2", "datasets>=2.15.0", "scikit-learn", "numpy", "hf_transfer")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
     .add_local_dir(str(REPO / "src/langset"), "/root/langset")
-    .add_local_file(str(HERE / "data/prepared.json"), "/root/prepared.json")
+    .add_local_file(str(HERE / "prepare.py"), "/root/prepare.py")
 )
 
 
-@app.function(gpu="a10g", image=image, timeout=3600, volumes={"/vol": body_vol})
+@app.function(gpu="a10g", image=image, timeout=3600)
 def run() -> dict[str, Any]:
-    import json
     import sys
     from collections import Counter
     import numpy as np
     sys.path.insert(0, "/root")
+    from huggingface_hub import snapshot_download  # type: ignore[import-untyped]
     from langset import LangSetModel
+    from prepare import joined_rows
     from setfit import SetFitModel  # type: ignore[import-untyped]
     print("[setfit] imports OK in aligned window (transformers 4.46.3 + torch 2.4.1 + setfit 1.1.0)", flush=True)
 
     from collections import defaultdict
-    recs = json.loads(Path("/root/prepared.json").read_text())
-    model = LangSetModel.load("/vol/body")
+    recs = joined_rows()                                                             # public reviews x fingerprints
+    model = LangSetModel.load(snapshot_download("Hanno-Labs/langset-sounds-like"))   # the published body
     prim = lambda r: str(r["genre"]).split(" / ")[0].strip().lower()  # noqa: E731
     counts = Counter(prim(r) for r in recs)
     names = sorted(g for g, c in counts.items() if c >= 15 and g not in ("", "nan"))
     lab2id = {n: i for i, n in enumerate(names)}
-    rec2 = [(r["review"], lab2id[prim(r)]) for r in recs if prim(r) in lab2id]
+    rec2 = [(r["input_text"], lab2id[prim(r)]) for r in recs if prim(r) in lab2id]
     rng = np.random.default_rng(1)
     by_cls: dict[int, list[str]] = defaultdict(list)
     for txt, y in rec2:
