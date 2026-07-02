@@ -13,7 +13,11 @@ venv/
 # trained outputs / artifacts (the example model lives on the HF Hub, not in git)
 langset-music/
 langset-out/
+langset-ner*/
 *.pt
+
+# run logs / scratch
+*.log
 
 # OS / tooling
 .DS_Store
