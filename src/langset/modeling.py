@@ -133,16 +133,24 @@ def build_backbone(llm_model: str, lora_r: int, dropout: float, bf16: bool, dev:
     from transformers import AutoModelForCausalLM  # type: ignore[import-untyped]
     dt = torch.bfloat16 if bf16 else torch.float32
 
-    def _load(attn: Optional[str]) -> Any:
+    def _try_load(dtype_key: str, attn: Optional[str]) -> Any:
         # sdpa (default) avoids materializing the O(S^2) eager-attention score matrix — a long seed (3072 tokens)
         # OOM'd a 0.6B model at 72GB on eager. attention_dropout is dropped for multimodal wrappers that reject it.
-        kw: dict[str, Any] = {"dtype": dt}
+        kw: dict[str, Any] = {dtype_key: dt}
         if attn:
             kw["attn_implementation"] = attn
         try:
             return AutoModelForCausalLM.from_pretrained(llm_model, attention_dropout=dropout, **kw)
         except TypeError:                    # multimodal wrappers (e.g. Gemma4ForConditionalGeneration) reject it
             return AutoModelForCausalLM.from_pretrained(llm_model, **kw)
+
+    def _load(attn: Optional[str]) -> Any:
+        # transformers renamed `torch_dtype` -> `dtype` (~4.56); langset declares transformers>=4.41, so try the
+        # new kwarg then fall back to the old one for broad version compat.
+        try:
+            return _try_load("dtype", attn)
+        except TypeError:
+            return _try_load("torch_dtype", attn)
 
     try:
         base = _load(attn_implementation or None)
