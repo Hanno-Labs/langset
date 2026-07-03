@@ -163,5 +163,6 @@ one is conditioned on those already emitted.
 
 ## Status
 
-v0.2 — the core engine, validated on a real task (album review → "how it sounds" latent) with a downstream
-SetFit composition. Apache-2.0.
+v0.3 — adds **multi-latent** (variable-length latent-set emission via FSQ). The core engine is validated on a
+real task (album review → "how it sounds" latent) with a downstream SetFit composition; multi-latent is
+validated on CoNLL-2003 multi-entity extraction across SmolLM and Qwen backbones. Apache-2.0.
