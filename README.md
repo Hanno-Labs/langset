@@ -118,7 +118,51 @@ SetFit imports `transformers.training_args.default_logdir` (removed after 4.46),
 `torch.distributed.tensor` bug — hence the cap. Use the frozen-body `SetFitModel.fit`/`predict` path above; the
 full `setfit.Trainer` (fine-tunes the body) is fragile in this window.
 
+## Multi-latent — one input, a *set* of latents
+
+Everything above emits **one** latent per input. Multi-latent emits a **variable-length set** — one latent per
+distinct item in the input — autoregressively, with the model deciding *how many* via a learned STOP. Each
+latent lands in the same bespoke geometry, so you decode it the same way you'd decode a single one (nearest
+neighbor against a bank, a downstream head, whatever).
+
+**Why:** a single vector is the wrong shape whenever one input contains an unknown number of things. Collapse
+*"Apple and Microsoft partnered in California"* into one embedding and you've blended three items into one
+blurry point. Multi-latent keeps them separate — three latents, each retrievable on its own — and, unlike a
+fixed-slot head, it doesn't need you to know the count in advance.
+
+Where it fits:
+
+* **Multi-item extraction** — entities, keyphrases, skills, ingredients: read a document, emit a latent per
+  item, retrieve each against a reference bank. ([`examples/ner-multi-latent/`](examples/ner-multi-latent/)
+  does exactly this for named entities.)
+* **Multi-vector retrieval** — represent a query or document as a *set* of latents (ColBERT-style late
+  interaction) instead of one averaged vector, for finer-grained matching.
+* **Multi-aspect / multi-label** — one latent per facet (a product's `{brand, category, material}`) or per
+  applicable label, instead of one vector forced to mean several things at once.
+* **Multi-intent parsing** — an utterance carrying several intents → a latent each.
+
+```python
+from langset import LangSetModel
+import torch.nn.functional as F
+
+m = LangSetModel.load("path/to/checkpoint", device="cpu")
+
+# a reference bank you retrieve emitted latents against (any short label works)
+bank = ["PER: Barack Obama", "LOC: Berlin", "PER: Angela Merkel", "ORG: Apple", "LOC: California"]
+zb = F.normalize(m.emit(bank).float(), dim=-1)                       # [N, d]
+
+# emit a VARIABLE-length set from one input — the count is decided by a learned STOP
+lat = F.normalize(m.rollout("Barack Obama visited Berlin to meet Angela Merkel.").float(), dim=-1)
+for v in lat:                                                        # -> one latent per entity
+    print(bank[int((v @ zb.T).argmax())])                           # PER: Barack Obama / LOC: Berlin / PER: Angela Merkel
+```
+
+Under the hood each latent is finite-scalar-quantized (FSQ) into per-dimension digits the model predicts, an
+EMA target twin keeps the set from collapsing, and every emitted latent is fed back into the stream so the next
+one is conditioned on those already emitted.
+
 ## Status
 
-v0.2 — the core engine, validated on a real task (album review → "how it sounds" latent) with a downstream
-SetFit composition. Apache-2.0.
+v0.3 — adds **multi-latent** (variable-length latent-set emission via FSQ). The core engine is validated on a
+real task (album review → "how it sounds" latent) with a downstream SetFit composition; multi-latent is
+validated on CoNLL-2003 multi-entity extraction across SmolLM and Qwen backbones. Apache-2.0.
