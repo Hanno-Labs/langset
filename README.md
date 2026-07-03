@@ -157,12 +157,27 @@ for v in lat:                                                        # -> one la
     print(bank[int((v @ zb.T).argmax())])                           # PER: Barack Obama / LOC: Berlin / PER: Angela Merkel
 ```
 
+Train it with the same `Trainer` — a multi-latent model reads rows of `{input_text, target_texts: [...]}` (a
+*list* of targets per input) instead of a single `target_text`:
+
+```python
+from langset import LangSetModel, Trainer, TrainingArguments
+
+rows = [{"input_text": "Barack Obama visited Berlin to meet Angela Merkel.",
+         "target_texts": ["PER: Barack Obama", "LOC: Berlin", "PER: Angela Merkel"]},
+        # ...
+       ]
+model = LangSetModel.from_pretrained("Qwen/Qwen3-0.6B-Base", multi_latent=True)  # FSQ set-emission head
+Trainer(model, TrainingArguments(epochs=15), rows).train()
+```
+
 Under the hood each latent is finite-scalar-quantized (FSQ) into per-dimension digits the model predicts, an
-EMA target twin keeps the set from collapsing, and every emitted latent is fed back into the stream so the next
-one is conditioned on those already emitted.
+EMA target twin (stop-grad) supplies the target latents so the set can't collapse, and every emitted latent is
+fed back into the stream so the next one is conditioned on those already emitted.
 
 ## Status
 
-v0.3 — adds **multi-latent** (variable-length latent-set emission via FSQ). The core engine is validated on a
-real task (album review → "how it sounds" latent) with a downstream SetFit composition; multi-latent is
-validated on CoNLL-2003 multi-entity extraction across SmolLM and Qwen backbones. Apache-2.0.
+v0.4 — **multi-latent is now first-class in `Trainer`** (`{input_text, target_texts: [...]}` rows), plus sdpa
+attention for long inputs. The core engine is validated on a real task (album review → "how it sounds" latent)
+with a downstream SetFit composition; multi-latent is validated on CoNLL-2003 multi-entity extraction across
+SmolLM and Qwen backbones. Apache-2.0.

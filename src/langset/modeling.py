@@ -113,7 +113,8 @@ def _text_tower(model: Any) -> Any:
     return node
 
 
-def build_backbone(llm_model: str, lora_r: int, dropout: float, bf16: bool, dev: str) -> Any:
+def build_backbone(llm_model: str, lora_r: int, dropout: float, bf16: bool, dev: str,
+                   attn_implementation: str = "sdpa") -> Any:
     if llm_model.startswith("unsloth/"):        # Unsloth patches Gemma-4 clippable-linears so PEFT LoRA can attach
         from unsloth import FastModel  # type: ignore[import-untyped]  # (must be imported before transformers)
         base, _ = FastModel.from_pretrained(model_name=llm_model, dtype=None, max_seq_length=4096,
@@ -131,11 +132,24 @@ def build_backbone(llm_model: str, lora_r: int, dropout: float, bf16: bool, dev:
     from peft import LoraConfig, get_peft_model  # type: ignore[import-untyped]
     from transformers import AutoModelForCausalLM  # type: ignore[import-untyped]
     dt = torch.bfloat16 if bf16 else torch.float32
-    kw: dict[str, Any] = {"dtype": dt, "attn_implementation": "sdpa"}
+
+    def _load(attn: Optional[str]) -> Any:
+        # sdpa (default) avoids materializing the O(S^2) eager-attention score matrix — a long seed (3072 tokens)
+        # OOM'd a 0.6B model at 72GB on eager. attention_dropout is dropped for multimodal wrappers that reject it.
+        kw: dict[str, Any] = {"dtype": dt}
+        if attn:
+            kw["attn_implementation"] = attn
+        try:
+            return AutoModelForCausalLM.from_pretrained(llm_model, attention_dropout=dropout, **kw)
+        except TypeError:                    # multimodal wrappers (e.g. Gemma4ForConditionalGeneration) reject it
+            return AutoModelForCausalLM.from_pretrained(llm_model, **kw)
+
     try:
-        base = AutoModelForCausalLM.from_pretrained(llm_model, attention_dropout=dropout, **kw)
-    except TypeError:                        # multimodal wrappers (e.g. Gemma4ForConditionalGeneration) reject it
-        base = AutoModelForCausalLM.from_pretrained(llm_model, **kw)
+        base = _load(attn_implementation or None)
+    except (ValueError, ImportError, RuntimeError, TypeError):   # this model/transformers version can't do the impl
+        if not attn_implementation:
+            raise
+        base = _load(None)                   # fall back to the model's default attention
     if hasattr(base, "language_model"):      # unwrap conditional-generation wrapper to the text tower
         base = base.language_model
     base = base.to(dev)
@@ -183,13 +197,13 @@ class LangSetModel(nn.Module):
     def from_pretrained(cls, llm_model: str, *, latent_dim: Optional[int] = None, n_latents: int = 1,
                         lora_r: int = 16, dropout: float = 0.0, bf16: bool = False, max_len: int = 512,
                         multi_latent: bool = False, fsq_dim: int = 128, fsq_levels: int = 8,
-                        device: Optional[str] = None) -> "LangSetModel":
+                        device: Optional[str] = None, attn_implementation: str = "sdpa") -> "LangSetModel":
         from transformers import AutoTokenizer  # type: ignore[import-untyped]
         dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
         tok = AutoTokenizer.from_pretrained(llm_model)
         if tok.pad_token_id is None:
             tok.pad_token = tok.eos_token
-        backbone = build_backbone(llm_model, lora_r, dropout, bf16, dev)
+        backbone = build_backbone(llm_model, lora_r, dropout, bf16, dev, attn_implementation)
         if latent_dim is None:                                   # default: emit in the backbone's own hidden space
             latent_dim = _cfg_int(backbone.config, "hidden_size")
         model = cls(backbone, tok, latent_dim, n_latents, llm_model, dropout, max_len,
