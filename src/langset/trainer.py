@@ -21,6 +21,7 @@ from langset.training_args import TrainingArguments
 
 _RECON_K = 8            # soft-prompt tokens the latent expands into for the recon decoder
 _RECON_MAXLEN = 128     # target_text tokens the recon aux reconstructs
+_LEARN_TGT = 160        # [LEARN] rows: max target (substance) tokens generated under next-token CE
 _COLLAPSE_PENALTY = 3.0
 _COLLAPSE_FLOOR = 0.4   # collapse below this isn't penalized; above it, selection is tanked
 
@@ -57,8 +58,18 @@ class Trainer:
                     raise ValueError(
                         f"multi_latent Trainer needs a 'target_texts' column of non-empty lists; row {i} = {v!r}")
                 self.target_texts.append([str(x) for x in v])
+            # optional MULTI-latent hard negatives: a per-row LIST of texts the emitted latents must be pushed AWAY
+            # from (batch-pooled InfoNCE bank, weight lam_hard_neg). Empty/None rows contribute no negatives.
+            self.hard_neg_texts: Optional[list[list[str]]] = None
+            if getattr(args, "hard_neg_field", None) is not None:
+                raw_hn = cols[inv.get(args.hard_neg_field, args.hard_neg_field)]
+                self.hard_neg_texts = [
+                    [str(x) for x in (v if isinstance(v, (list, tuple)) else ([v] if v not in (None, "") else []))]
+                    for v in raw_hn
+                ]
             if args.verbose:
-                print(f"[langset] {len(self.input_text)} rows (multi-latent)", flush=True)
+                hn = "" if not self.hard_neg_texts else " (+hard-neg)"
+                print(f"[langset] {len(self.input_text)} rows (multi-latent){hn}", flush=True)
             return
         self.target_text = [str(x) for x in get("target_text")]
         # optional false-negative masking: per-row set of facet keys; in-batch pairs sharing any key are masked.
@@ -69,9 +80,23 @@ class Trainer:
                 frozenset(v if isinstance(v, (list, tuple, set)) else [v]) if v not in (None, "") else frozenset()
                 for v in raw
             ]
+        # optional hard negatives: a mined near-miss target per row (encoded as an extra negative each step).
+        self.hard_neg_text: Optional[list[str]] = None
+        if getattr(args, "hard_neg_field", None) is not None:
+            raw = cols[inv.get(args.hard_neg_field, args.hard_neg_field)]
+            self.hard_neg_text = [str(v) if v not in (None, "") else "" for v in raw]
+        # optional knowledge-injection: rows tagged "learn" train next-token CE (input_text -> target_text) instead
+        # of contrastive; they're pulled OUT of the contrastive split and fed as a separate learn pool.
+        self.is_learn: list[bool] = [False] * len(self.input_text)
+        if getattr(args, "learn_field", None) is not None and args.learn_ratio > 0:
+            raw = cols[inv.get(args.learn_field, args.learn_field)]
+            self.is_learn = [str(v).lower() == "learn" for v in raw]
+        n_learn = sum(self.is_learn)
         if args.verbose:
             masked = "" if self.mask_keys is None else " (+false-neg mask)"
-            print(f"[langset] {len(self.input_text)} rows{masked}", flush=True)
+            hn = "" if self.hard_neg_text is None else " (+hard-neg)"
+            lr = "" if n_learn == 0 else f" (+{n_learn} learn @ratio {args.learn_ratio})"
+            print(f"[langset] {len(self.input_text)} rows{masked}{hn}{lr}", flush=True)
 
     def train(self) -> LangSetModel:
         if self.multi_latent:
@@ -89,11 +114,22 @@ class Trainer:
         ids, mask = tok_to(self.input_text, a.max_len)            # input view
         t2_ids, t2_mask = tok_to(self.target_text, a.max_len)     # target view (self-contrastive target)
         tr_ids, tr_mask = tok_to(self.target_text, _RECON_MAXLEN)  # target tokens for the recon aux
+        hn_ids = hn_mask = None
+        if self.hard_neg_text is not None:                        # hard-neg view (empty "" rows tokenize fine, masked below)
+            hn_ids, hn_mask = tok_to([t or " " for t in self.hard_neg_text], a.max_len)
+
+        # knowledge-injection: learn rows go to a SEPARATE next-token-CE pool; the contrastive split is embed-only.
+        learn_pool = [i for i in range(len(self.input_text)) if self.is_learn[i]]
+        ln_doc_ids = ln_doc_mask = ln_tgt_ids = ln_tgt_mask = None
+        if learn_pool:
+            ln_doc_ids, ln_doc_mask = tok_to([self.input_text[i] for i in learn_pool], a.max_len)      # instruction+case
+            ln_tgt_ids, ln_tgt_mask = tok_to([self.target_text[i] for i in learn_pool], _LEARN_TGT)    # german substance
 
         n = len(self.input_text)
-        perm = rng.permutation(n)
-        n_val = max(4, int(n * a.val_frac))
-        val_idx, tr_idx = perm[:n_val], perm[n_val:]
+        embed_all = np.array([i for i in range(n) if not self.is_learn[i]])
+        embed_perm = embed_all[rng.permutation(len(embed_all))]
+        n_val = max(4, int(len(embed_perm) * a.val_frac))
+        val_idx, tr_idx = embed_perm[:n_val], embed_perm[n_val:]
 
         # recon aux: latent -> K soft tokens -> backbone decodes target_text (token CE). Grounds the latent in the
         # text. `connector` is TRAINING-ONLY scaffolding (not saved; inference just emits the latent).
@@ -117,6 +153,21 @@ class Trainer:
             return F.cross_entropy(pred_lg.reshape(-1, vsz), ti.masked_fill(tm == 0, -100).reshape(-1),
                                    ignore_index=-100)
 
+        def learn_loss(pos: torch.Tensor) -> torch.Tensor:
+            # [LEARN] rows: teacher-forced causal LM. Condition on the case (instruction+case), CE ONLY on the German
+            # substance tokens -> forces the backbone's hidden states to REPRESENT the substance (builds the axis the
+            # probe found missing). Projection via the tied embedding on the target span only (no lm_head, no OOM).
+            di, dm = ln_doc_ids[pos], ln_doc_mask[pos]                       # type: ignore[index]
+            ti, tm = ln_tgt_ids[pos], ln_tgt_mask[pos]                       # type: ignore[index]
+            seq = torch.cat([di, ti], dim=1)
+            am = torch.cat([dm, tm], dim=1)
+            hid = m._last_hidden(m._run_backbone(m.embed(seq), am, seq, 0))  # all real tokens -> real_start=0
+            sd = di.size(1)
+            ph = hid[:, sd - 1: sd - 1 + ti.size(1), :]                     # hidden that predicts each target token
+            lg = F.linear(ph.float(), m.embed.weight.float())               # [B, St, vocab]
+            return F.cross_entropy(lg.reshape(-1, vsz), ti.masked_fill(tm == 0, -100).reshape(-1),
+                                   ignore_index=-100)
+
         opt = torch.optim.AdamW([p for p in m.parameters() if p.requires_grad] + list(connector.parameters()),
                                 lr=a.lr)
         run = None
@@ -130,22 +181,43 @@ class Trainer:
             order = tr_idx[rng.permutation(len(tr_idx))]
             tot = nb = 0.0
             for i in range(0, len(order), a.batch_size):
+                if learn_pool and rng.random() < a.learn_ratio:   # KNOWLEDGE step: teach substance before the retrieval step
+                    lp = torch.tensor(rng.choice(len(learn_pool), size=min(a.batch_size, len(learn_pool)),
+                                                 replace=False), device=dev)
+                    lloss = learn_loss(lp)
+                    opt.zero_grad(); lloss.backward(); opt.step()
                 idx = torch.tensor(order[i:i + a.batch_size], device=dev)
                 pred = m(ids[idx], mask[idx])
                 target = m(t2_ids[idx], t2_mask[idx])            # self-contrastive: emit(target_text), same space
-                logits = (pred @ target.t()) / a.tau            # in-batch negatives force separation (no collapse)
-                if self.mask_keys is not None:                  # drop false negatives: same-issue pairs aren't negatives
+                tmat = target
+                if hn_ids is not None:                          # HARD NEGATIVES: mined near-miss targets as extra
+                    with torch.no_grad():                       # negative columns. no_grad -> memory-safe (no 4th backward);
+                        hn = m(hn_ids[idx], hn_mask[idx])        # gradient still flows to `pred`, pushing it off the hard negs.
+                    tmat = torch.cat([target, hn], dim=0)        # [2B, d]: cols [0:B]=in-batch targets, [B:2B]=hard negs
+                logits = (pred @ tmat.t()) / a.tau              # in-batch negatives force separation (no collapse)
+                B = len(idx)
+                neg_mask = torch.zeros(B, logits.size(1), dtype=torch.bool, device=dev)   # NB: not `mask` (that's the attn mask)
+                if self.mask_keys is not None:                  # in-batch block: drop same-issue false negatives
                     bkeys = [self.mask_keys[j] for j in idx.tolist()]
-                    fn = torch.zeros(len(idx), len(idx), dtype=torch.bool, device=dev)
-                    for r in range(len(idx)):
+                    for r in range(B):
                         kr = bkeys[r]
                         if not kr:
                             continue
-                        for c in range(len(idx)):
+                        for c in range(B):
                             if r != c and (kr & bkeys[c]):
-                                fn[r, c] = True
-                    logits = logits.masked_fill(fn, float("-inf"))   # diagonal (positive) always kept
-                loss = F.cross_entropy(logits, torch.arange(len(idx), device=dev))          # primary
+                                neg_mask[r, c] = True
+                if hn_ids is not None:
+                    # PER-ANCHOR-ONLY hard neg: anchor i sees ONLY its own mined hard neg (col B+i), never the other
+                    # anchors' (a batch-SHARED negative cluster herds every emit off one region -> geometry collapse,
+                    # observed: collapse 0.03 -> 0.28/0.57). Keep the valid diagonal of the hard-neg block; mask rest.
+                    valid = [bool(self.hard_neg_text[j]) for j in idx.tolist()]
+                    for r in range(B):
+                        for c in range(B):
+                            if not (r == c and valid[c]):
+                                neg_mask[r, B + c] = True
+                if bool(neg_mask.any()):
+                    logits = logits.masked_fill(neg_mask, float("-inf"))   # diagonal (positive) always kept
+                loss = F.cross_entropy(logits, torch.arange(B, device=dev))                 # primary
                 loss = loss + a.lam_recon * recon_loss(pred, idx)                            # aux: grounding
                 if a.lam_uniform > 0 and len(idx) > 1:                                       # aux: uniformity
                     sq = torch.pdist(F.normalize(pred, p=2, dim=-1), p=2).pow(2)
@@ -340,7 +412,19 @@ class Trainer:
                 loss_dims = F.cross_entropy(dim_lg[:, :lmax, 1:, :].reshape(-1, fsq_levels),
                                             lab_rest.reshape(-1), ignore_index=-100)
                 recon_loss = (1.0 - F.cosine_similarity(recon[valid], target_lat[valid], dim=-1)).mean()
-                loss = loss_stop + loss_dims + recon_loss           # one objective — no lam_* knobs
+                loss = loss_stop + loss_dims + recon_loss           # base objective (+ optional hard-neg InfoNCE)
+                if self.hard_neg_texts is not None and a.lam_hard_neg > 0:
+                    hn_flat = [t for k in bidx for t in self.hard_neg_texts[k]]
+                    if hn_flat:                                     # each emitted recon: own EMA target vs a shared bank
+                        hn_bank = emit_texts(hn_flat, ema_model)    # [Nhn, d] stop-grad normalized hard-neg latents
+                        rv = F.normalize(recon[valid], dim=-1)      # [Nvalid, d] emitted reconstructions
+                        pos = (rv * target_lat[valid]).sum(-1, keepdim=True)   # [Nvalid, 1] cos to own target
+                        neg = rv @ hn_bank.t()                      # [Nvalid, Nhn] cos to every hard neg
+                        logits_hn = torch.cat([pos, neg], dim=1) / a.tau
+                        loss_hn = F.cross_entropy(
+                            logits_hn, torch.zeros(logits_hn.size(0), dtype=torch.long, device=dev))
+                        loss = loss + a.lam_hard_neg * loss_hn
+                        agg["loss_hard_neg"] = agg.get("loss_hard_neg", 0.0) + float(loss_hn.detach())
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
@@ -357,8 +441,9 @@ class Trainer:
             row = {"loss": tot / max(nb, 1), **{kk: vv / max(nb, 1) for kk, vv in agg.items()}}
             sel = metrics["retr_mrr"]
             if a.verbose:
+                hn_s = f" hn={row['loss_hard_neg']:.3f}" if "loss_hard_neg" in row else ""
                 print(f"ep{ep:02d} loss={row['loss']:.3f} stop={row['loss_stop']:.3f} dims={row['loss_dims']:.3f} "
-                      f"recon={row['recon_loss']:.3f} | retr_mrr={sel:.3f} distinct={metrics['n_distinct']} "
+                      f"recon={row['recon_loss']:.3f}{hn_s} | retr_mrr={sel:.3f} distinct={metrics['n_distinct']} "
                       f"avg_emit={metrics['avg_emitted']:.2f}", flush=True)
             if run is not None:
                 run.log({**row, "epoch": ep, "eval/retr_mrr": sel,

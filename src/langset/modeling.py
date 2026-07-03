@@ -164,7 +164,9 @@ def build_backbone(llm_model: str, lora_r: int, dropout: float, bf16: bool, dev:
     lora = LoraConfig(r=lora_r, lora_alpha=2 * lora_r, lora_dropout=dropout, bias="none",
                       target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                                       "gate_proj", "up_proj", "down_proj"])
-    return get_peft_model(base, lora)
+    # strip the lm_head (like the Unsloth path): we only read hidden states, and computing the full-vocab logits
+    # ([B,S,vocab]) every forward OOMs — a 0.6B at bs48/384 hit 78GB purely on Qwen3's 152k-vocab projection.
+    return _text_tower(get_peft_model(base, lora))
 
 
 class LangSetModel(nn.Module):
@@ -188,7 +190,7 @@ class LangSetModel(nn.Module):
         # The Unsloth path loads a text tower that always returns `last_hidden_state`, so we don't ask the backbone
         # to collect (and keep) every layer's hidden states — a big memory win. A plain ForCausalLM has no
         # `last_hidden_state`, so it still needs output_hidden_states to expose the final layer.
-        self._need_ohs = not str(llm_model).startswith("unsloth/")
+        self._need_ohs = hasattr(backbone, "lm_head")   # text tower -> last_hidden_state; raw ForCausalLM -> ohs
         self.latent_dim = latent_dim
         self.n_latents = n_latents
         self.multi_latent = multi_latent
