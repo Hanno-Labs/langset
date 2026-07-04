@@ -294,12 +294,18 @@ class LangSetModel(nn.Module):
     # ---- multi-latent autoregressive rollout (drives the feedback / stop_logit seams) ----
     @torch.no_grad()
     def rollout(self, text: Union[str, list[str]], max_steps: int = 8, stop_threshold: float = 0.0,
-                return_lengths: bool = False) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+                return_lengths: bool = False, return_confidence: bool = False, temperature: float = 0.0
+                ) -> Union[torch.Tensor, tuple[torch.Tensor, ...]]:
         """Autoregressive emission: real text tokens and emitted latents share ONE hidden stream. Each emitted
         latent is fed back into the sequence via `head.feedback` (the latent lives in the backbone's own hidden
         space, so an emitted latent and a real token embedding are the same kind of vector — they intermingle).
         Terminates per-row on the natural-EOS `stop_logit`. Returns [B, L, d] (or [L, d] for a single string),
-        zero-padding halted rows; pass `return_lengths` for the per-row emit count."""
+        zero-padding halted rows; pass `return_lengths` for the per-row emit count. `return_confidence` (FSQ path
+        only) additionally returns a dict of per-step NATIVE emission-confidence [B, L] tensors — the model's OWN
+        co-trained uncertainty: 'code' = mean per-dim FSQ digit-softmax certainty, 'stop' = P(STOP) at that step,
+        'dig0' = digit-0 level certainty. Returned as (lat, lengths, conf) when set. `temperature` (FSQ path only):
+        0 = deterministic argmax (default); >0 = SAMPLE each FSQ digit from softmax(logits/temperature), so K rolls
+        of one seed fan into a DISTRIBUTION of plausible futures (McDonald's multi-rollout)."""
         single = isinstance(text, str)
         texts = [text] if single else list(text)
         dev = self.device
@@ -314,16 +320,31 @@ class LangSetModel(nn.Module):
         alive = torch.ones(b, dtype=torch.bool, device=dev)
         lengths = torch.zeros(b, dtype=torch.long, device=dev)
         cols: list[torch.Tensor] = []
+        conf_code: list[torch.Tensor] = []                                  # native per-step confidences (FSQ path)
+        conf_stop: list[torch.Tensor] = []
+        conf_dig0: list[torch.Tensor] = []
         was_training = self.training
         self.eval()
         for _step in range(max_steps):
             if codebook:                                                     # AR: read the LAST real token's hidden
                 hid = self._last_hidden(self._run_backbone(seq, am, enc["input_ids"], 0))[:, -1]  # PLE-safe AR read
                 dim_lg, stop_lg = self.head.emit_logits(hid)                # [B, fsq_dim, L], [B, 1]
-                dim0 = torch.cat([dim_lg[:, 0, :], stop_lg], -1).argmax(-1)  # [B] over [L levels; STOP]
+                d0_full = torch.cat([dim_lg[:, 0, :], stop_lg], -1)         # [B, L+1] over [L levels; STOP]
+                if temperature and temperature > 0:                        # SAMPLE each digit (stochastic futures)
+                    dim0 = torch.multinomial(torch.softmax(d0_full.float() / temperature, -1), 1).squeeze(-1)
+                    rest = torch.multinomial(
+                        torch.softmax(dim_lg[:, 1:, :].float() / temperature, -1).reshape(-1, self.head.fsq_levels),
+                        1).reshape(b, -1)
+                else:                                                       # deterministic argmax (default)
+                    dim0 = d0_full.argmax(-1)
+                    rest = dim_lg[:, 1:, :].argmax(-1)
                 emit_now = alive & (dim0 != stop_idx)                       # halt on STOP (or already-dead rows)
-                digits = torch.cat([dim0.clamp(max=self.head.fsq_levels - 1).unsqueeze(-1),
-                                    dim_lg[:, 1:, :].argmax(-1)], -1)       # [B, fsq_dim]
+                if return_confidence:                                       # the model's OWN emission uncertainty
+                    p0 = torch.softmax(d0_full.float(), -1)                # [B, L+1]
+                    conf_stop.append(p0[:, -1])                            # P(STOP) at this step
+                    conf_dig0.append(p0[:, :-1].max(-1).values)           # digit-0 level certainty
+                    conf_code.append(torch.softmax(dim_lg.float(), -1).max(-1).values.mean(-1))  # mean code certainty
+                digits = torch.cat([dim0.clamp(max=self.head.fsq_levels - 1).unsqueeze(-1), rest], -1)  # [B, fsq_dim]
                 z = self.head.reconstruct(digits)                          # [B, d]
                 cols.append(torch.where(emit_now.unsqueeze(1), z, torch.zeros_like(z)))
                 lengths = lengths + emit_now.long()
@@ -347,8 +368,16 @@ class LangSetModel(nn.Module):
         if was_training:
             self.train()
         lat = torch.stack(cols, 1) if cols else seq.new_zeros(b, 0, self.latent_dim)   # [B, L, d]
+        if return_confidence:                                              # per-step native confidences [B, L]
+            def _st(xs: list[torch.Tensor]) -> torch.Tensor:
+                return torch.stack(xs, 1) if xs else lat.new_zeros(b, 0)
+            conf = {"code": _st(conf_code), "stop": _st(conf_stop), "dig0": _st(conf_dig0)}
+            if single:
+                conf = {k: v[0, : int(lengths[0])] for k, v in conf.items()}
         if single:
             lat = lat[0, : int(lengths[0])]
+        if return_confidence:
+            return lat, lengths, conf
         if return_lengths:
             return lat, lengths
         return lat

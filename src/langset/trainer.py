@@ -33,6 +33,29 @@ def _columns(dataset: Any) -> dict[str, list[Any]]:
     return {k: [r[k] for r in rows] for k in rows[0]}
 
 
+def supcon_loss(z: torch.Tensor, labels: list[str], tau: float) -> torch.Tensor:
+    """Supervised-contrastive (Khosla et al.) over emitted latents: same-label items are positives (pulled together),
+    all others negatives (pushed apart) — a few group labels SHAPE the geometry into SEPARATE REGIONS. Being a proper
+    contrastive loss (each anchor has both positives and negatives) it separates without collapsing. Items whose label
+    is ''/'unknown'/'none'/'nan' are dropped. Returns 0 if fewer than two labelled items or no positive pair exists."""
+    dev = z.device
+    keep = [k for k, l in enumerate(labels) if str(l).strip().lower() not in ("", "unknown", "none", "nan")]
+    if len(keep) < 2:
+        return z.new_zeros(())
+    zz = F.normalize(z[keep], p=2, dim=-1)
+    lab = [labels[k] for k in keep]
+    b = len(keep)
+    sim = (zz @ zz.t() / tau).masked_fill(torch.eye(b, device=dev, dtype=torch.bool), -1e9)
+    logp = sim - torch.logsumexp(sim, dim=1, keepdim=True)
+    pos = torch.tensor([[1.0 if (i != j and lab[i] == lab[j]) else 0.0 for j in range(b)] for i in range(b)],
+                       device=dev)
+    npos = pos.sum(1)
+    has = npos > 0
+    if not bool(has.any()):
+        return z.new_zeros(())
+    return (-(pos * logp).sum(1)[has] / npos[has]).mean()
+
+
 class Trainer:
     def __init__(self, model: LangSetModel, args: TrainingArguments, train_dataset: Any,
                  eval_dataset: Optional[Any] = None, column_mapping: Optional[dict[str, str]] = None,
@@ -67,9 +90,18 @@ class Trainer:
                     [str(x) for x in (v if isinstance(v, (list, tuple)) else ([v] if v not in (None, "") else []))]
                     for v in raw_hn
                 ]
+            # optional MULTI-latent supervised-contrastive: a per-row LIST of group labels aligned 1:1 with
+            # target_texts (each emitted item's stage/group). Shapes emissions into separate regions (weight lam_sup).
+            self.sup_labels: Optional[list[list[str]]] = None
+            if getattr(args, "sup_field", None) is not None:
+                raw_sup = cols[inv.get(args.sup_field, args.sup_field)]
+                self.sup_labels = [
+                    [str(x) for x in (v if isinstance(v, (list, tuple)) else [v])] for v in raw_sup
+                ]
             if args.verbose:
                 hn = "" if not self.hard_neg_texts else " (+hard-neg)"
-                print(f"[langset] {len(self.input_text)} rows (multi-latent){hn}", flush=True)
+                sp = "" if not self.sup_labels else " (+supcon)"
+                print(f"[langset] {len(self.input_text)} rows (multi-latent){hn}{sp}", flush=True)
             return
         self.target_text = [str(x) for x in get("target_text")]
         # optional false-negative masking: per-row set of facet keys; in-batch pairs sharing any key are masked.
@@ -343,12 +375,14 @@ class Trainer:
                     bank_chain.append(ci)
             if not bank_texts:
                 m.train()
-                return {"retr_mrr": 0.0, "n_distinct": 0, "avg_emitted": 0.0}
+                return {"retr_mrr": 0.0, "purity": 0.0, "n_distinct": 0, "avg_emitted": 0.0}
             zb = F.normalize(ema_model.emit(bank_texts).to(dev).float(), dim=-1)   # [Nbank, d] target-space bank
             chain_t = torch.tensor(bank_chain, device=dev)
             rr: list[float] = []
             produced: set[int] = set()
             n_emit = 0
+            emit_vecs: list[torch.Tensor] = []                       # emitted val latents (for stage kNN-purity)
+            emit_labs: list[str] = []                                # position-aligned sup label of each emission
             for i in range(0, len(val_idx), a.batch_size):
                 chunk = val_idx[i:i + a.batch_size]
                 out = m.rollout([seeds[c] for c in chunk], max_steps=a.max_steps, return_lengths=True)
@@ -360,13 +394,18 @@ class Trainer:
                         sims = zb @ v                                 # [Nbank]
                         produced.add(int(sims.argmax()))
                         n_emit += 1
+                        if self.sup_labels is not None and j < len(self.sup_labels[ci]):
+                            emit_vecs.append(v.detach().cpu())        # emission j <- true stage of target item j
+                            emit_labs.append(self.sup_labels[ci][j])
                         if bool(own.any()):                          # MRR: rank of the best OWN-chain target
                             order = torch.argsort(sims, descending=True)
                             hit = torch.nonzero(own[order], as_tuple=False)
                             if hit.numel() > 0:
                                 rr.append(1.0 / (int(hit[0].item()) + 1))
             m.train()
-            return {"retr_mrr": float(np.mean(rr)) if rr else 0.0,
+            purity = (selection.knn_purity(torch.stack(emit_vecs).numpy(), emit_labs)
+                      if len(emit_vecs) > 6 else 0.0)                # stage-separation of the emitted geometry
+            return {"retr_mrr": float(np.mean(rr)) if rr else 0.0, "purity": purity,
                     "n_distinct": len(produced), "avg_emitted": n_emit / max(len(val_idx), 1)}
 
         rng_t = torch.Generator().manual_seed(a.seed)
@@ -425,6 +464,13 @@ class Trainer:
                             logits_hn, torch.zeros(logits_hn.size(0), dtype=torch.long, device=dev))
                         loss = loss + a.lam_hard_neg * loss_hn
                         agg["loss_hard_neg"] = agg.get("loss_hard_neg", 0.0) + float(loss_hn.detach())
+                if self.sup_labels is not None and a.lam_sup > 0:
+                    # per-item group labels flattened in the SAME row-major order as recon[valid] (row r, items 0..nl)
+                    sup_flat = [(self.sup_labels[k][j] if j < len(self.sup_labels[k]) else "unknown")
+                                for r, k in enumerate(bidx) for j in range(lens_l[r])]
+                    loss_sup = supcon_loss(recon[valid], sup_flat, a.sup_tau)   # pull same-stage, push different-stage
+                    loss = loss + a.lam_sup * loss_sup
+                    agg["loss_sup"] = agg.get("loss_sup", 0.0) + float(loss_sup.detach())
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
@@ -439,14 +485,18 @@ class Trainer:
                 continue
             metrics = evaluate()
             row = {"loss": tot / max(nb, 1), **{kk: vv / max(nb, 1) for kk, vv in agg.items()}}
-            sel = metrics["retr_mrr"]
+            mrr, pur = metrics["retr_mrr"], metrics.get("purity", 0.0)
+            sel = pur if a.select == "purity" else (mrr + pur) if a.select == "blend" else mrr
             if a.verbose:
                 hn_s = f" hn={row['loss_hard_neg']:.3f}" if "loss_hard_neg" in row else ""
+                sup_s = f" sup={row['loss_sup']:.3f}" if "loss_sup" in row else ""
+                pur_s = f" purity={pur:.3f}" if self.sup_labels is not None else ""
                 print(f"ep{ep:02d} loss={row['loss']:.3f} stop={row['loss_stop']:.3f} dims={row['loss_dims']:.3f} "
-                      f"recon={row['recon_loss']:.3f}{hn_s} | retr_mrr={sel:.3f} distinct={metrics['n_distinct']} "
+                      f"recon={row['recon_loss']:.3f}{hn_s}{sup_s} | retr_mrr={mrr:.3f}{pur_s} "
+                      f"[sel:{a.select}={sel:.3f}] distinct={metrics['n_distinct']} "
                       f"avg_emit={metrics['avg_emitted']:.2f}", flush=True)
             if run is not None:
-                run.log({**row, "epoch": ep, "eval/retr_mrr": sel,
+                run.log({**row, "epoch": ep, "eval/retr_mrr": mrr, "eval/purity": pur, "eval/sel": sel,
                          "eval/n_distinct": metrics["n_distinct"], "eval/avg_emitted": metrics["avg_emitted"]})
             if sel > best:
                 best = sel
@@ -458,7 +508,7 @@ class Trainer:
                 if self.on_checkpoint is not None:
                     self.on_checkpoint()
                 if a.verbose:
-                    print(f"        <- best retr_mrr={best:.3f}, saved to {a.output_dir}", flush=True)
+                    print(f"        <- best {a.select}={best:.3f}, saved to {a.output_dir}", flush=True)
 
         if best_state is not None:                                  # restore best into memory (matches single-latent)
             m.head.load_state_dict(best_state["head"])
@@ -469,5 +519,5 @@ class Trainer:
         if run is not None:
             run.finish()
         if a.verbose:
-            print(f"[langset] done (multi-latent). best retr_mrr={best:.3f} -> {a.output_dir}", flush=True)
+            print(f"[langset] done (multi-latent). best {a.select}={best:.3f} -> {a.output_dir}", flush=True)
         return m

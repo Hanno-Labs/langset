@@ -34,6 +34,16 @@ class TrainingArguments:
     # Encoded under no_grad (memory-safe: no extra backward). None = no hard negs (byte-identical to before).
     hard_neg_field: Optional[str] = None
 
+    # supervised-contrastive label shaping (Khosla et al.): name a dataset column of GROUP LABELS the emitted latents
+    # should organize into SEPARATE REGIONS by. SINGLE-latent: one scalar label per row. MULTI-latent: a per-row LIST
+    # of labels aligned 1:1 with `target_texts` (each emitted item's group, e.g. its lifecycle STAGE). Within a batch,
+    # same-label emissions are pulled together and different-label pushed apart at weight `lam_sup` / temperature
+    # `sup_tau`. Being proper SupCon (positives + negatives) it separates without collapsing. Labels "unknown"/""/"none"
+    # are dropped from the term. None / lam_sup=0 = off (byte-identical to before). This is the region lever.
+    sup_field: Optional[str] = None
+    lam_sup: float = 0.0
+    sup_tau: float = 0.1
+
     # knowledge-injection ([LEARN] rows): name a column tagging each row's task. Rows tagged "learn" are trained with
     # next-token CE (generate `target_text` given `input_text`, via the tied embedding — teaches the backbone domain
     # SUBSTANCE) instead of contrastive emit; all other rows stay the self-contrastive retrieval objective. Mixed in
@@ -55,6 +65,11 @@ class TrainingArguments:
     eval_every: int = 1
     patience: int = 10
     seed: int = 0
+    # checkpoint-selection signal (multi-latent). "retr_mrr" = event-identity retrieval (default, unchanged).
+    # "purity" = kNN-purity of the emitted geometry by the SupCon `sup_field` label (selects the most STAGE-SEPARATED
+    # epoch — required when lam_sup>0, since SupCon suppresses retr_mrr by pulling same-label items together).
+    # "blend" = retr_mrr + purity (keep event identity AND gain stage-geometry). purity/blend need sup labels.
+    select: str = "retr_mrr"
 
     # io / logging
     output_dir: str = "langset-out"

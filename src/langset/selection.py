@@ -21,3 +21,27 @@ def collapse_score(X: np.ndarray) -> float:
     s = Xn @ Xn.T
     np.fill_diagonal(s, np.nan)
     return float(np.nanmean(s))
+
+
+def knn_purity(X: np.ndarray, labels: list[str], k: int = 5) -> float:
+    """Leave-one-out kNN majority-vote accuracy by label: does the EMITTED geometry organize into separate regions by
+    this attribute? The selection signal for label-shaping (SupCon) runs — retrieval MRR measures event IDENTITY and is
+    suppressed when same-label items are pulled together, so it can't select a stage-separated checkpoint; this can.
+    Labels ''/'unknown'/'none'/'nan' are dropped. Returns the fraction of held-out items whose kNN majority matches."""
+    keep = [i for i, l in enumerate(labels) if str(l).strip().lower() not in ("", "unknown", "none", "nan")]
+    if len(keep) < k + 1:
+        return 0.0
+    Xk = X[keep]
+    Xn = Xk / (np.linalg.norm(Xk, axis=1, keepdims=True) + 1e-9)
+    lab = [labels[i] for i in keep]
+    sims = Xn @ Xn.T
+    np.fill_diagonal(sims, -1e9)                                # leave-one-out: never vote for yourself
+    nbr = np.argsort(-sims, axis=1)[:, :k]                      # k nearest by cosine
+    correct = 0
+    for i in range(len(lab)):
+        votes: dict[str, int] = {}
+        for j in nbr[i]:
+            votes[lab[j]] = votes.get(lab[j], 0) + 1
+        if max(votes, key=lambda kk: votes[kk]) == lab[i]:
+            correct += 1
+    return float(correct / len(lab))
