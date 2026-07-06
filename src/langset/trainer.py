@@ -33,6 +33,39 @@ def _columns(dataset: Any) -> dict[str, list[Any]]:
     return {k: [r[k] for r in rows] for k in rows[0]}
 
 
+def _fuse_views(ids_a: torch.Tensor, mask_a: torch.Tensor, ids_b: torch.Tensor, mask_b: torch.Tensor,
+                pad_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """FUSE two views for ONE forward: pad both to the batch's common real max-len, stack on the batch dim.
+    RIGHT-padded -> real tokens lead; the padded columns are masked so each row's emit is IDENTICAL to a separate
+    per-view forward. Halves kernel launches and grad-ckpt recomputes. Split the output back at row B."""
+    L = int(max(mask_a.sum(dim=1).max().item(), mask_b.sum(dim=1).max().item()))
+
+    def _fit(x: torch.Tensor, mk: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        cur = x.size(1)
+        if cur == L:
+            return x, mk
+        if cur > L:
+            return x[:, :L], mk[:, :L]
+        xp = x.new_full((x.size(0), L - cur), pad_id)
+        mp = mk.new_zeros((mk.size(0), L - cur))
+        return torch.cat([x, xp], dim=1), torch.cat([mk, mp], dim=1)
+
+    ia, ma = _fit(ids_a, mask_a)
+    ib, mb = _fit(ids_b, mask_b)
+    return torch.cat([ia, ib], dim=0), torch.cat([ma, mb], dim=0)
+
+
+def _dyn_trim(ids: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """DYNAMIC PADDING: sequences are pre-tokenized/padded to the DATASET max, so short batches still forward at
+    full width. Trim each batch to its own real max length (RIGHT-padded, so real tokens are the leading columns).
+    The dropped columns are pure padding the attention mask already zeros -> forward output on the kept tokens is
+    IDENTICAL. Big saving when doc lengths vary (legal corpora do). Guarded by test_train_identity."""
+    n = int(mask.sum(dim=1).max().item())
+    if n <= 0 or n >= ids.size(1):
+        return ids, mask
+    return ids[:, :n], mask[:, :n]
+
+
 def supcon_loss(z: torch.Tensor, labels: list[str], tau: float) -> torch.Tensor:
     """Supervised-contrastive (Khosla et al.) over emitted latents: same-label items are positives (pulled together),
     all others negatives (pushed apart) — a few group labels SHAPE the geometry into SEPARATE REGIONS. Being a proper
@@ -208,9 +241,58 @@ class Trainer:
             run = wandb.init(project=a.wandb_project, config=vars(a))
 
         best_score, best_state, no_improve = -1e9, None, 0
-        for ep in range(a.epochs):
+
+        # ---- preempt-resume: reload full training state from a durable checkpoint if one exists (else start fresh) ----
+        start_ep = 0
+        _ckpt = (Path(a.resume_dir) / "resume.pt") if a.resume_dir else None
+        ck = torch.load(_ckpt, map_location="cpu") if (_ckpt is not None and _ckpt.exists()) else None
+        if ck is not None and a.run_sig is not None and ck.get("run_sig") != a.run_sig:
+            print(f"[langset] IGNORING {_ckpt}: run_sig mismatch (ckpt={ck.get('run_sig')!r} != this run "
+                  f"{a.run_sig!r}) -> starting FRESH", flush=True)   # a DIFFERENT model/data/config can never resume us
+            ck = None
+        if ck is not None:
+            _params = dict(m.named_parameters())
+            for nm, t in ck["trainable"].items():
+                if nm in _params:
+                    _params[nm].data.copy_(t.to(_params[nm].device, _params[nm].dtype))
+            connector.load_state_dict({k: v.to(dev) for k, v in ck["connector"].items()})
+            opt.load_state_dict(ck["opt"])
+            for stt in opt.state.values():                     # optimizer state tensors must live on the model's device
+                for k, v in stt.items():
+                    if torch.is_tensor(v):
+                        stt[k] = v.to(dev)
+            start_ep = int(ck["ep"]); best_score = float(ck["best_score"]); no_improve = int(ck["no_improve"])
+            best_state = ck.get("best_state")
+            try:                                               # rng restore is best-effort (robust, not bit-exact)
+                rng.bit_generator.state = ck["np_rng"]; torch.set_rng_state(ck["torch_rng"])
+            except Exception:
+                pass
+            print(f"[langset] RESUMED from {_ckpt} -> start ep{start_ep}/{a.epochs} best={best_score:.3f}", flush=True)
+
+        def save_resume(next_ep: int) -> None:
+            """Atomically persist FULL training state (weights+opt+connector+epoch+best+rng) so a preempt/retry resumes
+            from the last epoch boundary instead of ep0. tmp+rename => a mid-write preempt cannot corrupt the good file."""
+            if not a.resume_dir:
+                return
+            d = Path(a.resume_dir); d.mkdir(parents=True, exist_ok=True)
+            tmp = d / "resume.pt.tmp"
+            torch.save({
+                "trainable": {nm: p.detach().cpu() for nm, p in m.named_parameters() if p.requires_grad},
+                "connector": {k: v.detach().cpu() for k, v in connector.state_dict().items()},
+                "opt": opt.state_dict(),
+                "ep": int(next_ep), "best_score": float(best_score), "no_improve": int(no_improve),
+                "best_state": best_state, "np_rng": rng.bit_generator.state, "torch_rng": torch.get_rng_state(),
+                "run_sig": a.run_sig,          # identity fingerprint: resume REFUSES to load this into a different run
+            }, tmp)
+            tmp.replace(d / "resume.pt")
+            if self.on_checkpoint is not None:
+                self.on_checkpoint()                           # e.g. Volume.commit() -> durable across preempt
+
+        for ep in range(start_ep, a.epochs):
             m.train()
             order = tr_idx[rng.permutation(len(tr_idx))]
+            if a.max_steps_per_epoch:                          # SMALL epochs: cap steps so each <= ~30min (natural save pt)
+                order = order[:a.max_steps_per_epoch * a.batch_size]
             tot = nb = 0.0
             for i in range(0, len(order), a.batch_size):
                 if learn_pool and rng.random() < a.learn_ratio:   # KNOWLEDGE step: teach substance before the retrieval step
@@ -219,12 +301,21 @@ class Trainer:
                     lloss = learn_loss(lp)
                     opt.zero_grad(); lloss.backward(); opt.step()
                 idx = torch.tensor(order[i:i + a.batch_size], device=dev)
-                pred = m(ids[idx], mask[idx])
-                target = m(t2_ids[idx], t2_mask[idx])            # self-contrastive: emit(target_text), same space
+                if a.fuse_views and not a.stop_grad_target:      # FUSE input+target in ONE forward (1 launch + 1
+                    fi, fm = _fuse_views(ids[idx], mask[idx], t2_ids[idx], t2_mask[idx], tok.pad_token_id)  # recompute)
+                    both = m(fi, fm); _nb = len(idx)             # math identical (padding masked); split back at row B
+                    pred, target = both[:_nb], both[_nb:]
+                else:
+                    pred = m(*_dyn_trim(ids[idx], mask[idx]))
+                    if a.stop_grad_target:                       # BYOL/MoCo: target anchors geometry, no backward
+                        with torch.no_grad():
+                            target = m(*_dyn_trim(t2_ids[idx], t2_mask[idx]))
+                    else:
+                        target = m(*_dyn_trim(t2_ids[idx], t2_mask[idx]))   # self-contrastive: emit(target_text)
                 tmat = target
                 if hn_ids is not None:                          # HARD NEGATIVES: mined near-miss targets as extra
                     with torch.no_grad():                       # negative columns. no_grad -> memory-safe (no 4th backward);
-                        hn = m(hn_ids[idx], hn_mask[idx])        # gradient still flows to `pred`, pushing it off the hard negs.
+                        hn = m(*_dyn_trim(hn_ids[idx], hn_mask[idx]))  # gradient still flows to `pred`, off the hard negs.
                     tmat = torch.cat([target, hn], dim=0)        # [2B, d]: cols [0:B]=in-batch targets, [B:2B]=hard negs
                 logits = (pred @ tmat.t()) / a.tau              # in-batch negatives force separation (no collapse)
                 B = len(idx)
@@ -296,6 +387,7 @@ class Trainer:
                     if a.verbose:
                         print(f"[langset] early stop at ep{ep} (best {best_score:.3f})", flush=True)
                     break
+            save_resume(ep + 1)          # epoch boundary: durable full-state checkpoint so a preempt resumes HERE, not ep0
 
         if best_state is not None:                            # restore best
             m.head.load_state_dict(best_state["head"])
@@ -329,6 +421,14 @@ class Trainer:
 
         seeds = self.input_text
         futs = [lst[:a.max_target_items] for lst in self.target_texts]   # cap targets per row
+        if a.emit_seed:
+            # PHASE-0 as an emitted node: prepend each seed's OWN text as target position 0, so the emitter learns to
+            # produce its start-state latent before the futures. Everything downstream (digits/STOP/recon/phase head/
+            # eval bank) shifts by one automatically; sup_labels gets a leading "phase0" class. Must happen HERE —
+            # before evaluate() closes over `futs` and before the phase_head label set is built from self.sup_labels.
+            futs = [[seeds[i], *futs[i]] for i in range(len(futs))]
+            if self.sup_labels is not None:
+                self.sup_labels = [["phase0", *self.sup_labels[i]] for i in range(len(self.sup_labels))]
         n = len(seeds)
         perm = rng.permutation(n)
         cut = max(1, int(n * (1 - a.val_frac)))
@@ -349,13 +449,32 @@ class Trainer:
                 torch._foreach_add_(ema_e, ema_o, alpha=1.0 - a.ema_m)
 
         def emit_texts(texts: list[str], mdl: Any) -> torch.Tensor:
-            """Single-latent emission of each text -> [N, d] on device (normalized), no_grad — the target latents."""
-            e = tok(texts, padding=True, truncation=True, max_length=64, return_tensors="pt").to(dev)
+            """Single-latent emission of each text -> [N, d] on device (normalized), no_grad — the target latents.
+            Truncated to `target_max_len` (default 64: targets are short descriptors). Raise it when a target is a
+            DOCUMENT not a label — e.g. emit_seed's phase-0 target is a full science abstract; 64 tokens keeps only
+            the boilerplate-y intro, blurring phase-0 identity (self-retrieval top1 0.10). Short targets (futures)
+            are unaffected (already < 64)."""
+            e = tok(texts, padding=True, truncation=True, max_length=a.target_max_len, return_tensors="pt").to(dev)
             with torch.no_grad():
                 z = mdl(e["input_ids"], e["attention_mask"])
             return F.normalize(z.float(), dim=-1)
 
-        opt = torch.optim.AdamW([p for p in m.parameters() if p.requires_grad], lr=a.lr)
+        # PHASE HEAD (the non-collapsing alternative to SupCon): a transient linear classifier hidden->phase trained
+        # with CE on the emitted reconstruction. CE only needs a separating hyperplane, so it makes phase LINEARLY
+        # decodable WITHOUT pulling same-phase events together (SupCon's identity collapse). Grad flows into up/down_proj
+        # + LoRA, shaping the FSQ geometry to be phase-separable while retr_mrr (event identity) survives. Not persisted
+        # (its job is to inject phase gradient; eval re-fits its own probe on the now phase-informative emissions).
+        phase_head: Optional[torch.nn.Module] = None
+        phase_ids: dict[str, int] = {}
+        if self.sup_labels is not None and a.lam_phase > 0:
+            labs = sorted({lb for row2 in self.sup_labels for lb in row2
+                           if lb and lb.lower() not in ("unknown", "none", "nan", "")})
+            phase_ids = {lb: i for i, lb in enumerate(labs)}
+            phase_head = torch.nn.Linear(d, len(phase_ids)).to(dev)
+        params = [p for p in m.parameters() if p.requires_grad]
+        if phase_head is not None:
+            params = params + list(phase_head.parameters())
+        opt = torch.optim.AdamW(params, lr=a.lr)
         run = None
         if a.report_to == "wandb":
             import wandb  # type: ignore[import-untyped]
@@ -412,9 +531,60 @@ class Trainer:
         best = -1.0
         best_state: Optional[dict[str, Any]] = None
         metrics: dict[str, float] = {}
-        for ep in range(a.epochs):
+
+        # ---- preempt-resume (multi-latent): reload full state (LoRA+head+phase_head+opt+epoch+best+rng) if present ----
+        start_ep = 0
+        _ckpt = (Path(a.resume_dir) / "resume.pt") if a.resume_dir else None
+        ck = torch.load(_ckpt, map_location="cpu") if (_ckpt is not None and _ckpt.exists()) else None
+        if ck is not None and a.run_sig is not None and ck.get("run_sig") != a.run_sig:
+            print(f"[langset] IGNORING {_ckpt}: run_sig mismatch (ckpt={ck.get('run_sig')!r} != this run "
+                  f"{a.run_sig!r}) -> starting FRESH", flush=True)
+            ck = None
+        if ck is not None:
+            _params = dict(m.named_parameters())
+            for nm, t in ck["trainable"].items():
+                if nm in _params:
+                    _params[nm].data.copy_(t.to(_params[nm].device, _params[nm].dtype))
+            if phase_head is not None and ck.get("phase_head") is not None:
+                phase_head.load_state_dict({k: v.to(dev) for k, v in ck["phase_head"].items()})
+            opt.load_state_dict(ck["opt"])
+            for stt in opt.state.values():                     # optimizer state tensors must live on the model's device
+                for k, v in stt.items():
+                    if torch.is_tensor(v):
+                        stt[k] = v.to(dev)
+            start_ep = int(ck["ep"]); best = float(ck["best"]); best_state = ck.get("best_state")
+            try:                                               # rng restore is best-effort (robust, not bit-exact)
+                rng.bit_generator.state = ck["np_rng"]; torch.set_rng_state(ck["torch_rng"]); rng_t.set_state(ck["gen_rng"])
+            except Exception:
+                pass
+            print(f"[langset] RESUMED (multi) from {_ckpt} -> start ep{start_ep}/{a.epochs} best={best:.3f}", flush=True)
+
+        def save_resume(next_ep: int) -> None:
+            """Atomically persist FULL multi-latent training state so a preempt/retry resumes from the last epoch
+            boundary instead of ep0. tmp+rename => a mid-write preempt cannot corrupt the good file."""
+            if not a.resume_dir:
+                return
+            d = Path(a.resume_dir); d.mkdir(parents=True, exist_ok=True)
+            tmp = d / "resume.pt.tmp"
+            payload: dict[str, Any] = {
+                "trainable": {nm: p.detach().cpu() for nm, p in m.named_parameters() if p.requires_grad},
+                "opt": opt.state_dict(),
+                "ep": int(next_ep), "best": float(best), "best_state": best_state,
+                "np_rng": rng.bit_generator.state, "torch_rng": torch.get_rng_state(),
+                "gen_rng": rng_t.get_state(), "run_sig": a.run_sig,
+            }
+            if phase_head is not None:
+                payload["phase_head"] = {k: v.detach().cpu() for k, v in phase_head.state_dict().items()}
+            torch.save(payload, tmp)
+            tmp.replace(d / "resume.pt")
+            if self.on_checkpoint is not None:
+                self.on_checkpoint()                           # e.g. Volume.commit() -> durable across preempt
+
+        for ep in range(start_ep, a.epochs):
             m.train()
             order = torch.randperm(len(tr_idx), generator=rng_t).tolist()
+            if a.max_steps_per_epoch:                          # SMALL epochs: cap steps so each <= ~30min (natural save pt)
+                order = order[:a.max_steps_per_epoch * a.batch_size]
             tot = 0.0
             nb = 0
             agg = {"loss_stop": 0.0, "loss_dims": 0.0, "recon_loss": 0.0}
@@ -438,8 +608,10 @@ class Trainer:
                     valid[r, :nl] = True
                     k += nl
                 # token-native FSQ: predict each item's per-dim digits, then a STOP folded into dim-0's softmax.
+                eff_ss = a.ss_prob if a.ss_warmup <= 0 else a.ss_prob * min(1.0, ep / a.ss_warmup)
                 dim_lg, stop_lg, digits, recon = m.rollout_train_codebook(
-                    se["input_ids"], se["attention_mask"], target_lat, a.tau)
+                    se["input_ids"], se["attention_mask"], target_lat, a.tau,
+                    train_hops=a.train_hops, ss_prob=eff_ss, ss_sample=a.ss_sample)
                 dim0 = torch.cat([dim_lg[:, :, 0, :], stop_lg], -1)  # [b, lmax+1, L+1] — digit-0 + STOP
                 lab0 = torch.full((b, lmax + 1), -100, dtype=torch.long, device=dev)
                 lab_rest = torch.full((b, lmax, fsq_dim - 1), -100, dtype=torch.long, device=dev)
@@ -451,7 +623,31 @@ class Trainer:
                 loss_dims = F.cross_entropy(dim_lg[:, :lmax, 1:, :].reshape(-1, fsq_levels),
                                             lab_rest.reshape(-1), ignore_index=-100)
                 recon_loss = (1.0 - F.cosine_similarity(recon[valid], target_lat[valid], dim=-1)).mean()
-                loss = loss_stop + loss_dims + recon_loss           # base objective (+ optional hard-neg InfoNCE)
+                loss = loss_stop + loss_dims + recon_loss           # base objective (recon-only) + separation below
+                if a.lam_multi_nce > 0 and int(valid.sum()) > 1:
+                    # IN-BATCH-NEGATIVE InfoNCE — the separation term the multi-latent path was missing (ported from
+                    # the single-latent self-contrastive loss). Each emitted recon vs the batch's EMA targets: own
+                    # target = positive (diagonal), all OTHER items = in-batch negatives -> pushes DIFFERENT events
+                    # apart so the geometry separates rather than just reproducing codes. Identical target text (same
+                    # true geometry) is masked as a false-negative, mirroring the single-latent mask_keys path.
+                    rvn = F.normalize(recon[valid], dim=-1)          # [N, d] emitted (gradient flows here)
+                    tvn = F.normalize(target_lat[valid], dim=-1)     # [N, d] EMA targets (already stop-grad)
+                    nce_logits = (rvn @ tvn.t()) / a.tau             # [N, N] query x key cosine / temp
+                    n_nce = rvn.size(0)
+                    fn_mask = torch.zeros(n_nce, n_nce, dtype=torch.bool, device=dev)
+                    grp: dict[str, list[int]] = {}
+                    for ii, tx in enumerate(flat_texts):             # flat_texts is row-major aligned with recon[valid]
+                        grp.setdefault(tx, []).append(ii)
+                    for mem in grp.values():                         # identical target text -> not a negative of itself
+                        if len(mem) > 1:
+                            for aa in mem:
+                                for bb in mem:
+                                    if aa != bb:
+                                        fn_mask[aa, bb] = True
+                    nce_logits = nce_logits.masked_fill(fn_mask, float("-inf"))   # diagonal (positive) never masked
+                    loss_nce = F.cross_entropy(nce_logits, torch.arange(n_nce, device=dev))
+                    loss = loss + a.lam_multi_nce * loss_nce
+                    agg["loss_multi_nce"] = agg.get("loss_multi_nce", 0.0) + float(loss_nce.detach())
                 if self.hard_neg_texts is not None and a.lam_hard_neg > 0:
                     hn_flat = [t for k in bidx for t in self.hard_neg_texts[k]]
                     if hn_flat:                                     # each emitted recon: own EMA target vs a shared bank
@@ -471,6 +667,15 @@ class Trainer:
                     loss_sup = supcon_loss(recon[valid], sup_flat, a.sup_tau)   # pull same-stage, push different-stage
                     loss = loss + a.lam_sup * loss_sup
                     agg["loss_sup"] = agg.get("loss_sup", 0.0) + float(loss_sup.detach())
+                if phase_head is not None:
+                    # CE phase classifier on the emitted reconstruction (non-collapsing SupCon alternative). Same
+                    # row-major order as recon[valid]; labels not in phase_ids -> ignored (-100).
+                    pf = [(self.sup_labels[k][j] if j < len(self.sup_labels[k]) else "")
+                          for r, k in enumerate(bidx) for j in range(lens_l[r])]
+                    pid = torch.tensor([phase_ids.get(x, -100) for x in pf], device=dev)
+                    loss_phase = F.cross_entropy(phase_head(recon[valid]), pid, ignore_index=-100)
+                    loss = loss + a.lam_phase * loss_phase
+                    agg["loss_phase"] = agg.get("loss_phase", 0.0) + float(loss_phase.detach())
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
@@ -490,9 +695,10 @@ class Trainer:
             if a.verbose:
                 hn_s = f" hn={row['loss_hard_neg']:.3f}" if "loss_hard_neg" in row else ""
                 sup_s = f" sup={row['loss_sup']:.3f}" if "loss_sup" in row else ""
+                ph_s = f" phase={row['loss_phase']:.3f}" if "loss_phase" in row else ""
                 pur_s = f" purity={pur:.3f}" if self.sup_labels is not None else ""
                 print(f"ep{ep:02d} loss={row['loss']:.3f} stop={row['loss_stop']:.3f} dims={row['loss_dims']:.3f} "
-                      f"recon={row['recon_loss']:.3f}{hn_s}{sup_s} | retr_mrr={mrr:.3f}{pur_s} "
+                      f"recon={row['recon_loss']:.3f}{hn_s}{sup_s}{ph_s} | retr_mrr={mrr:.3f}{pur_s} "
                       f"[sel:{a.select}={sel:.3f}] distinct={metrics['n_distinct']} "
                       f"avg_emit={metrics['avg_emitted']:.2f}", flush=True)
             if run is not None:
@@ -509,6 +715,7 @@ class Trainer:
                     self.on_checkpoint()
                 if a.verbose:
                     print(f"        <- best {a.select}={best:.3f}, saved to {a.output_dir}", flush=True)
+            save_resume(ep + 1)          # epoch boundary: durable full-state checkpoint so a preempt resumes HERE, not ep0
 
         if best_state is not None:                                  # restore best into memory (matches single-latent)
             m.head.load_state_dict(best_state["head"])

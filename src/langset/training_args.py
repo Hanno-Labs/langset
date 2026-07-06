@@ -19,6 +19,31 @@ class TrainingArguments:
     lam_recon: float = 0.3                # aux: the latent must also DECODE target_text
     lam_uniform: float = 0.1              # aux: light uniformity (spread latents on the sphere)
     lam_hard_neg: float = 0.0             # MULTI-LATENT hard-neg InfoNCE weight (0 = off, byte-identical to before)
+    # MULTI-LATENT in-batch-negative InfoNCE — the separation term the multi-latent path was MISSING. The base
+    # multi-latent loss (loss_stop + loss_dims + recon) is pure reconstruction: it MATCHES each emitted latent to
+    # its EMA target but never pushes DIFFERENT items apart, so the geometry is capped by the base embedding and
+    # organizes by whatever dominates the target text (boilerplate). This ports single-latent's primary objective:
+    # each emitted recon vs the batch's targets, own target = positive, others = in-batch negatives (identical target
+    # text masked as false-neg). ON by default — this is the fix, not an opt-in. Set 0.0 for the old behavior.
+    # WEIGHT: unlike single-latent (where InfoNCE IS the whole loss, weight 1.0), here it COMPETES with the FSQ-recon
+    # base (loss_stop+loss_dims+recon ~0.9); at 1.0 the InfoNCE (~ln(N_inbatch)≈4.85) overwhelms recon and SCRAMBLES
+    # the geometry (retr_mrr stuck at chance, nce loss never descends). 0.3 balances the two → healthy geometry that
+    # organizes by real structure (FDA smol: disease decodes held-out, area_fsq +0.58 / indication_fsq +0.82, no labels).
+    lam_multi_nce: float = 0.3
+
+    # SPEED (big models): stop_grad_target forwards the target view under no_grad (BYOL/MoCo-style) so it anchors
+    # the geometry but takes NO backward -> drops one full backbone backward+recompute per step (~30%). Behavioral
+    # (only the input view gets gradient); default False = byte-identical to before. SINGLE-latent path only; the
+    # MULTI-latent path already sources targets from the no_grad EMA twin, so it is inherently stop-grad.
+    stop_grad_target: bool = False
+
+    # SPEED (INCOMPLETE - NOT numerically identical, do not use as-is): fuse input+target into ONE backbone call over
+    # [input;target]. Intent = 1 launch + 1 grad-ckpt recompute instead of two. BUT the emit query is appended AFTER
+    # the tokens, so its RoPE position depends on the PADDED length; padding the shorter view up to the common max
+    # shifts its query -> emit differs (identity test: param delta ~2e-3 >> 1e-4 tol). A correct fuse needs per-sequence
+    # position RESET (cu_seqlens / reset position_ids, like FlashAttention varlen packing) in the emit path = a model
+    # change, not this trainer concat. Left off by default; flag kept only to document the dead end.
+    fuse_views: bool = False
 
     # false-negative masking: when many rows share the same true geometry (e.g. two cases on the same legal
     # issue), in-batch contrastive would wrongly push them apart. Name a dataset column of group keys (a string
@@ -44,6 +69,33 @@ class TrainingArguments:
     lam_sup: float = 0.0
     sup_tau: float = 0.1
 
+    # PHASE HEAD — the non-collapsing alternative to SupCon. Reuses the same `sup_field` per-item labels but trains a
+    # transient linear CE classifier (emitted recon -> phase) at weight `lam_phase`, instead of the contrastive pull.
+    # CE only carves a separating hyperplane, so phase becomes linearly decodable WITHOUT collapsing within-phase
+    # event identity (retr_mrr survives). lam_phase=0 = off. Use INSTEAD of lam_sup (set lam_sup=0).
+    lam_phase: float = 0.0
+
+    # MULTI-HOP training (scheduled sampling). ss_prob=0 = pure teacher forcing, gradients flow 1 hop (default,
+    # byte-identical). ss_prob>0: for the first `train_hops` emitted positions (None = ALL), feed the model's OWN
+    # predicted latent back with probability ss_prob instead of ground truth — the exposure-bias fix that makes
+    # multi-hop rollout trained rather than emergent. ss_sample samples the self-fed digits instead of argmax.
+    train_hops: Optional[int] = None
+    ss_prob: float = 0.0
+    ss_sample: bool = False
+    # scheduled-sampling WARMUP: linearly ramp the effective ss_prob 0 -> ss_prob over the first `ss_warmup` epochs.
+    # 0 = constant ss_prob (no warmup). REQUIRED for deep train_hops (feeding own predictions for many hops from
+    # epoch 0, when they're garbage, destabilizes training — the phase head sticks at chance). Ramp lets the model
+    # learn 1-hop first (teacher-forced), then phase in self-feeding as its predictions become worth feeding.
+    ss_warmup: int = 0
+
+    # EMIT SEED as step-0 (phase-0 as a generated node). Off (default) = byte-identical: the model only emits latents
+    # for the FUTURE events (the first emission is the first future). On: each seed's OWN text is prepended as target
+    # position 0, so the emitter learns to produce its start-state latent (head.encode(emit(seed))) BEFORE the futures.
+    # This puts phase-0 into the emitted geometry as a real generated node (the rollout's step 0 becomes phase-0, the
+    # futures shift to steps 1..L). sup_field labels get a leading "phase0" class (so phase-0 is phase-decodable too).
+    # NOTE: downstream evals that assume "emission step 0 = first future" must offset by one when this is on.
+    emit_seed: bool = False
+
     # knowledge-injection ([LEARN] rows): name a column tagging each row's task. Rows tagged "learn" are trained with
     # next-token CE (generate `target_text` given `input_text`, via the tied embedding — teaches the backbone domain
     # SUBSTANCE) instead of contrastive emit; all other rows stay the self-contrastive retrieval objective. Mixed in
@@ -59,6 +111,25 @@ class TrainingArguments:
     ema_m: float = 0.99                   # EMA-twin momentum supplying the (stop-grad) target latents
     max_target_items: int = 12            # cap on target latents emitted/supervised per row
     max_steps: int = 16                   # free-rollout cap used in multi-latent eval
+    # target-text encode length for the EMA target latents. 64 (default) suits SHORT targets (labels/tags/one-liners
+    # — the library's premise). Raise it when a target is a DOCUMENT: emit_seed's phase-0 target is a full science
+    # abstract, and 64 tokens keeps only its (often boilerplate) intro -> blurry phase-0 identity. Short targets
+    # (e.g. future-event strings) are already < 64 so a higher cap only enriches the long ones (mild padding cost).
+    target_max_len: int = 64
+
+    # PREEMPT-RESUME (long big-model runs on preemptible GPUs). Epochs are the natural checkpoint boundary, so instead of
+    # fragile mid-epoch state we make epochs SMALL: `max_steps_per_epoch` caps each epoch to N steps (~<=30min of wall
+    # clock); run proportionally MORE epochs to cover the same data (optimization is identical — the optimizer only sees
+    # batches, "epoch" is just when we stop to eval+save). Each mini-epoch draws a fresh random subset (standard minibatch
+    # SGD). When resume_dir is set (a PERSISTENT path, e.g. a Modal Volume) the trainer writes a FULL training-state
+    # checkpoint (trainable weights + optimizer + epoch + best-so-far + rng) to {resume_dir}/resume.pt at every epoch
+    # boundary and LOADS it at train() start -> a preempt/retry continues from the last mini-epoch instead of restarting
+    # from ep0. Atomic (tmp+rename) so a mid-write preempt can't corrupt it. Works on BOTH the single- and multi-latent
+    # paths. None/0 = OFF (byte-identical).
+    resume_dir: Optional[str] = None
+    max_steps_per_epoch: int = 0          # >0: cap each epoch to N steps (bound the max work lost on preempt to ~N*step_s)
+    run_sig: Optional[str] = None         # identity fingerprint (base+data+config); resume REFUSES on mismatch -> fresh,
+                                          # so a DIFFERENT model/run can never wrongly load THIS run's checkpoint
 
     # validation / early-stop
     val_frac: float = 0.2

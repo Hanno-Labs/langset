@@ -114,7 +114,7 @@ def _text_tower(model: Any) -> Any:
 
 
 def build_backbone(llm_model: str, lora_r: int, dropout: float, bf16: bool, dev: str,
-                   attn_implementation: str = "sdpa") -> Any:
+                   attn_implementation: str = "sdpa", train_base: bool = False, grad_ckpt: bool = False) -> Any:
     if llm_model.startswith("unsloth/"):        # Unsloth patches Gemma-4 clippable-linears so PEFT LoRA can attach
         from unsloth import FastModel  # type: ignore[import-untyped]  # (must be imported before transformers)
         base, _ = FastModel.from_pretrained(model_name=llm_model, dtype=None, max_seq_length=4096,
@@ -166,7 +166,21 @@ def build_backbone(llm_model: str, lora_r: int, dropout: float, bf16: bool, dev:
                                       "gate_proj", "up_proj", "down_proj"])
     # strip the lm_head (like the Unsloth path): we only read hidden states, and computing the full-vocab logits
     # ([B,S,vocab]) every forward OOMs — a 0.6B at bs48/384 hit 78GB purely on Qwen3's 152k-vocab projection.
-    return _text_tower(get_peft_model(base, lora))
+    peft = get_peft_model(base, lora)
+    if train_base:
+        # KNOWLEDGE INJECTION: rank-16 LoRA on a FROZEN base can't STORE new facts (only re-style existing ones) —
+        # facts live in the base MLP weights. Unfreeze the whole base so next-token [LEARN] can actually rewrite
+        # "GrEStG=Grundgesetz" -> the real statute. Full-FT capacity; default off (frozen-LoRA, unchanged).
+        for p in peft.parameters():
+            p.requires_grad_(True)
+    if grad_ckpt:
+        # trade compute for activation memory so a LARGE InfoNCE batch (= more in-batch negatives, the dominant lever)
+        # fits — a 4B at batch 4 was negative-starved. use_cache off is required; input-require-grads lets grad reach
+        # checkpointed segments when only LoRA trains (frozen embeddings).
+        base.config.use_cache = False
+        peft.gradient_checkpointing_enable()
+        peft.enable_input_require_grads()
+    return _text_tower(peft)
 
 
 class LangSetModel(nn.Module):
@@ -207,13 +221,15 @@ class LangSetModel(nn.Module):
     def from_pretrained(cls, llm_model: str, *, latent_dim: Optional[int] = None, n_latents: int = 1,
                         lora_r: int = 16, dropout: float = 0.0, bf16: bool = False, max_len: int = 512,
                         multi_latent: bool = False, fsq_dim: int = 128, fsq_levels: int = 8,
-                        device: Optional[str] = None, attn_implementation: str = "sdpa") -> "LangSetModel":
+                        device: Optional[str] = None, attn_implementation: str = "sdpa",
+                        train_base: bool = False, grad_ckpt: bool = False) -> "LangSetModel":
         from transformers import AutoTokenizer  # type: ignore[import-untyped]
         dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
         tok = AutoTokenizer.from_pretrained(llm_model)
         if tok.pad_token_id is None:
             tok.pad_token = tok.eos_token
-        backbone = build_backbone(llm_model, lora_r, dropout, bf16, dev, attn_implementation)
+        backbone = build_backbone(llm_model, lora_r, dropout, bf16, dev, attn_implementation,
+                                  train_base=train_base, grad_ckpt=grad_ckpt)
         if latent_dim is None:                                   # default: emit in the backbone's own hidden space
             latent_dim = _cfg_int(backbone.config, "hidden_size")
         model = cls(backbone, tok, latent_dim, n_latents, llm_model, dropout, max_len,
@@ -400,26 +416,67 @@ class LangSetModel(nn.Module):
         return preds, stop
 
     def rollout_train_codebook(self, input_ids: torch.Tensor, attention_mask: torch.Tensor,
-                               target_latents: torch.Tensor, tau: float = 0.07
+                               target_latents: torch.Tensor, tau: float = 0.07,
+                               train_hops: Optional[int] = None, ss_prob: float = 0.0, ss_sample: bool = False
                                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Token-native teacher-forced AR pass (multi-latent, FSQ). Quantizes the TRUE target latents to per-dim
-        digits, feeds the clean reconstruction back, and predicts the digits at each of L+1 positions (targets
-        0..L-1 then a STOP at position L). Returns (dim_logits [B, L+1, fsq_dim, fsq_levels], stop_logits
-        [B, L+1, 1], digits [B, L, fsq_dim], recon [B, L, d]) — predictions, the target digits, and the FSQ
-        reconstruction (whose grad trains down/up_proj). The STOP label is appended by the trainer."""
+        """Token-native AR pass (multi-latent, FSQ). Quantizes the TRUE target latents to per-dim digits and predicts
+        the digits at each of L+1 positions (targets 0..L-1 then a STOP at position L). Returns (dim_logits
+        [B, L+1, fsq_dim, fsq_levels], stop_logits [B, L+1, 1], digits [B, L, fsq_dim], recon [B, L, d]) — the STOP
+        label is appended by the trainer.
+
+        `ss_prob`=0 (default): pure TEACHER FORCING in ONE forward pass — every position predicted from the true
+        prefix, gradients flow at most ONE hop (byte-identical to before). `ss_prob`>0: SCHEDULED SAMPLING for the
+        first `train_hops` positions (None = all) — with prob `ss_prob` each of those positions is fed the model's
+        OWN emitted latent instead of the ground truth, so the emitter learns to consume its own (imperfect)
+        predictions. This is the exposure-bias fix that makes MULTI-HOP rollout trained rather than emergent. Self-
+        fed latents are DETACHED (standard scheduled sampling; no BPTT through FSQ argmax). Cost = train_hops+1
+        backbone passes (positions past train_hops are teacher-forced in one pass). `ss_sample` samples the self-fed
+        digits instead of argmax."""
         assert self.head.multi_latent
         bsz, s_len = input_ids.size(0), input_ids.size(1)
         n = target_latents.size(1)
         digits, recon = self.head.encode(target_latents.reshape(-1, target_latents.size(-1)))
         digits = digits.view(bsz, n, -1)                                    # [B, L, fsq_dim]
         recon = recon.view(bsz, n, -1)                                      # [B, L, d] — clean feedback + recon target
-        seed = self.embed(input_ids)
-        fb = self.head.feedback(recon.detach().to(seed.dtype))             # [B, L, h] — feedback (no grad through fb)
-        seq = torch.cat([seed, fb], 1)
-        am = torch.cat([attention_mask, attention_mask.new_ones(bsz, n)], 1)
-        hid = self._last_hidden(self._run_backbone(seq, am, input_ids, 0))   # PLE-safe teacher-forced read
-        hf = hid[:, s_len - 1: s_len - 1 + n + 1]                           # [B, L+1, h] — +1 to predict the STOP
-        dim_lg, stop_lg = self.head.emit_logits(hf)                        # [B, L+1, fsq_dim, L], [B, L+1, 1]
+        if ss_prob <= 0 or n == 0:                                          # TEACHER-FORCED one-shot (default, fast)
+            seed = self.embed(input_ids)
+            fb = self.head.feedback(recon.detach().to(seed.dtype))         # [B, L, h] — feedback (no grad through fb)
+            seq = torch.cat([seed, fb], 1)
+            am = torch.cat([attention_mask, attention_mask.new_ones(bsz, n)], 1)
+            hid = self._last_hidden(self._run_backbone(seq, am, input_ids, 0))   # PLE-safe teacher-forced read
+            hf = hid[:, s_len - 1: s_len - 1 + n + 1]                       # [B, L+1, h] — +1 to predict the STOP
+            dim_lg, stop_lg = self.head.emit_logits(hf)                    # [B, L+1, fsq_dim, L], [B, L+1, 1]
+            return dim_lg, stop_lg, digits, recon
+        # SCHEDULED-SAMPLING multi-hop path
+        H = n if train_hops is None else max(0, min(int(train_hops), n))
+        dev = recon.device
+        Lv = self.head.fsq_levels
+        seq = self.embed(input_ids)
+        am = attention_mask
+        dim_parts: list[torch.Tensor] = []
+        stop_parts: list[torch.Tensor] = []
+        for h in range(H):                                                  # AR self-feed region
+            hid = self._last_hidden(self._run_backbone(seq, am, input_ids, 0))[:, -1]
+            dl, sl = self.head.emit_logits(hid)                            # [B, fsq_dim, L], [B, 1]
+            dim_parts.append(dl.unsqueeze(1)); stop_parts.append(sl.unsqueeze(1))
+            if ss_sample:
+                pred_dig = torch.multinomial(torch.softmax(dl.float(), -1).reshape(-1, Lv), 1).reshape(bsz, -1)
+            else:
+                pred_dig = dl.argmax(-1)                                   # [B, fsq_dim] (own emission, never STOP)
+            recon_pred = self.head.reconstruct(pred_dig).detach()          # own emitted latent (detached)
+            use_own = (torch.rand(bsz, device=dev) < ss_prob).unsqueeze(1)
+            feed_h = torch.where(use_own, recon_pred, recon[:, h].detach())
+            seq = torch.cat([seq, self.head.feedback(feed_h.to(seq.dtype)).unsqueeze(1)], 1)
+            am = torch.cat([am, am.new_ones(bsz, 1)], 1)
+        if H < n:                                                          # teacher-force positions H..n-1 in one pass
+            fb_rest = self.head.feedback(recon[:, H:].detach().to(seq.dtype))
+            seq = torch.cat([seq, fb_rest], 1)
+            am = torch.cat([am, am.new_ones(bsz, n - H)], 1)
+        hid_all = self._last_hidden(self._run_backbone(seq, am, input_ids, 0))
+        hf_rest = hid_all[:, s_len - 1 + H: s_len - 1 + n + 1]              # positions H..n (incl STOP at n)
+        dl_rest, sl_rest = self.head.emit_logits(hf_rest)                  # [B, n-H+1, fsq_dim, L], [B, n-H+1, 1]
+        dim_lg = torch.cat(dim_parts + [dl_rest], 1) if dim_parts else dl_rest    # [B, n+1, fsq_dim, L]
+        stop_lg = torch.cat(stop_parts + [sl_rest], 1) if stop_parts else sl_rest  # [B, n+1, 1]
         return dim_lg, stop_lg, digits, recon
 
     def get_sentence_embedding_dimension(self) -> int:
