@@ -33,7 +33,8 @@ class EmitHead(nn.Module):
     """
 
     def __init__(self, h: int, d: int, n_latents: int = 1, dropout: float = 0.0, eos_id: int = 0,
-                 multi_latent: bool = False, fsq_dim: int = 128, fsq_levels: int = 8) -> None:
+                 multi_latent: bool = False, fsq_dim: int = 128, fsq_levels: int = 8,
+                 fsq_emit: bool = False) -> None:
         super().__init__()
         self.n_latents = n_latents
         self.q = nn.Parameter(torch.randn(n_latents, h) * 0.02)   # one query token per emitted latent
@@ -42,13 +43,25 @@ class EmitHead(nn.Module):
         self.in_proj = nn.Linear(d, h)                            # latent -> hidden (inverse projection)
         self.eos_id = eos_id
         self.multi_latent = multi_latent
+        # fsq_emit: SINGLE-vector retrieval, but the embedding is GENERATED via the FSQ digit head (level_proj -> soft
+        # code -> up_proj) instead of the linear out_proj — so it's produced through the same generative machinery CPT
+        # rewrites, letting injected knowledge reach the retrieval vector. Trainer routing stays on multi_latent (off).
+        # Default False => byte-identical: forward() uses out_proj and the FSQ projections match `multi_latent` alone.
+        self.fsq_emit = fsq_emit
         self.fsq_dim, self.fsq_levels = fsq_dim, fsq_levels
-        self.down_proj = nn.Linear(d, fsq_dim) if multi_latent else None        # d -> FSQ bottleneck (learned)
-        self.up_proj = nn.Linear(fsq_dim, d) if multi_latent else None          # FSQ -> d (learned decoder)
-        self.level_proj = nn.Linear(h, fsq_dim * fsq_levels) if multi_latent else None   # per-dim digit logits
-        self.stop_proj = nn.Linear(h, 1) if multi_latent else None              # STOP logit (folded into dim-0 softmax)
+        _mk_fsq = multi_latent or fsq_emit
+        self.down_proj = nn.Linear(d, fsq_dim) if _mk_fsq else None             # d -> FSQ bottleneck (learned)
+        self.up_proj = nn.Linear(fsq_dim, d) if _mk_fsq else None               # FSQ -> d (learned decoder)
+        self.level_proj = nn.Linear(h, fsq_dim * fsq_levels) if _mk_fsq else None   # per-dim digit logits
+        self.stop_proj = nn.Linear(h, 1) if _mk_fsq else None                   # STOP logit (folded into dim-0 softmax)
 
     def forward(self, hid_emit: torch.Tensor) -> torch.Tensor:    # [B, n_latents, h] -> [B, n_latents, d]
+        if self.fsq_emit:
+            lg, _ = self.emit_logits(hid_emit)                    # [B, nl, fsq_dim, fsq_levels] digit logits
+            levels = torch.arange(self.fsq_levels, device=lg.device, dtype=torch.float32)
+            soft = (lg.float().softmax(-1) * levels).sum(-1)      # [B, nl, fsq_dim] expected digit (differentiable)
+            assert self.up_proj is not None
+            return F.normalize(self.up_proj(soft), p=2, dim=-1)   # generated-FSQ retrieval vector
         return F.normalize(self.out_proj(self.drop(hid_emit.float())), p=2, dim=-1)
 
     def feedback(self, latent: torch.Tensor) -> torch.Tensor:     # [B, ..., d] -> [B, ..., h]
@@ -114,21 +127,12 @@ def _text_tower(model: Any) -> Any:
 
 
 def build_backbone(llm_model: str, lora_r: int, dropout: float, bf16: bool, dev: str,
-                   attn_implementation: str = "sdpa", train_base: bool = False, grad_ckpt: bool = False) -> Any:
-    if llm_model.startswith("unsloth/"):        # Unsloth patches Gemma-4 clippable-linears so PEFT LoRA can attach
-        from unsloth import FastModel  # type: ignore[import-untyped]  # (must be imported before transformers)
-        base, _ = FastModel.from_pretrained(model_name=llm_model, dtype=None, max_seq_length=4096,
-                                            load_in_4bit=True, full_finetuning=False)
-        # Gemma-4 E-series shares K/V module-scoped: with grad-checkpointing, our 2+ forwards-before-backward
-        # (contrastive + recon) corrupt the first graph on recompute -> GC OFF for it. Every other model is fine
-        # with GC and NEEDS it to fit (3 no-GC forwards on a 4B model exceed 178GB) -> keep GC ON.
-        use_gc = False if "gemma-4-e" in llm_model.lower() else "unsloth"
-        peft_model = FastModel.get_peft_model(
-            base, finetune_vision_layers=False, finetune_language_layers=True,
-            finetune_attention_modules=True, finetune_mlp_modules=True,
-            r=lora_r, lora_alpha=lora_r, lora_dropout=dropout, bias="none", random_state=3407,
-            use_gradient_checkpointing=use_gc)
-        return _text_tower(peft_model)          # hidden states w/o the 262k-vocab lm_head (OOM) or vision path
+                   attn_implementation: str = "sdpa", train_base: bool = False, grad_ckpt: bool = False,
+                   lora_top_k: int = 0) -> Any:
+    def _top_k_layers(n_layers: int) -> Optional[list[int]]:
+        # LoRA ONLY the top-K transformer layers -> fewer adapters, smaller activation graph -> bigger batch. Emission
+        # reads the FINAL hidden state, so the top layers carry the task-shaping. 0 = all layers (default, unchanged).
+        return list(range(max(0, n_layers - lora_top_k), n_layers)) if lora_top_k and n_layers else None
     from peft import LoraConfig, get_peft_model  # type: ignore[import-untyped]
     from transformers import AutoModelForCausalLM  # type: ignore[import-untyped]
     dt = torch.bfloat16 if bf16 else torch.float32
@@ -152,19 +156,37 @@ def build_backbone(llm_model: str, lora_r: int, dropout: float, bf16: bool, dev:
         except TypeError:
             return _try_load("torch_dtype", attn)
 
+    # A non-default impl (flash_attention_2, flex_attention, ...) is an EXPLICIT performance choice: refuse to silently
+    # downgrade it. sdpa/eager may still fall back (a model that can't do sdpa -> eager) since those are just defaults;
+    # with the default attn_implementation="sdpa", _strict is False so the load path is byte-identical to before.
+    _strict = bool(attn_implementation) and attn_implementation not in ("sdpa", "eager")
     try:
         base = _load(attn_implementation or None)
-    except (ValueError, ImportError, RuntimeError, TypeError):   # this model/transformers version can't do the impl
+    except (ValueError, ImportError, RuntimeError, TypeError) as e:   # this model/transformers version can't do the impl
+        if _strict:
+            raise RuntimeError(
+                f"attn_implementation={attn_implementation!r} was requested but FAILED to load "
+                f"({type(e).__name__}: {e}). Refusing to silently fall back to a slower kernel — install flash-attn "
+                "(and use bf16 + a supported head_dim), or pass attn_implementation='sdpa' explicitly.") from e
         if not attn_implementation:
             raise
-        base = _load(None)                   # fall back to the model's default attention
+        base = _load(None)                   # sdpa/eager only: fall back to the model's default attention
     if hasattr(base, "language_model"):      # unwrap conditional-generation wrapper to the text tower
         base = base.language_model
     base = base.to(dev)
+    _active = getattr(getattr(base, "config", None), "_attn_implementation", None)
+    if _strict and _active != attn_implementation:               # HF loaded but silently downgraded the module
+        raise RuntimeError(
+            f"attn_implementation={attn_implementation!r} requested but model is running {_active!r} (silent "
+            "downgrade) — verify flash-attn install / bf16 dtype / head_dim support.")
+    ltt = _top_k_layers(int(getattr(base.config, "num_hidden_layers", 0) or 0))
+    if ltt is not None:
+        print(f"[langset] LoRA restricted to top-{lora_top_k} layers {ltt}", flush=True)
     lora = LoraConfig(r=lora_r, lora_alpha=2 * lora_r, lora_dropout=dropout, bias="none",
                       target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                                      "gate_proj", "up_proj", "down_proj"])
-    # strip the lm_head (like the Unsloth path): we only read hidden states, and computing the full-vocab logits
+                                      "gate_proj", "up_proj", "down_proj"],
+                      layers_to_transform=ltt)
+    # strip the lm_head: we only read hidden states, and computing the full-vocab logits
     # ([B,S,vocab]) every forward OOMs — a 0.6B at bs48/384 hit 78GB purely on Qwen3's 152k-vocab projection.
     peft = get_peft_model(base, lora)
     if train_base:
@@ -189,7 +211,8 @@ class LangSetModel(nn.Module):
 
     def __init__(self, backbone: Any, tokenizer: Any, latent_dim: int, n_latents: int,
                  llm_model: str, dropout: float = 0.0, max_len: int = 512,
-                 multi_latent: bool = False, fsq_dim: int = 128, fsq_levels: int = 8) -> None:
+                 multi_latent: bool = False, fsq_dim: int = 128, fsq_levels: int = 8,
+                 fsq_emit: bool = False, pool_mode: str = "") -> None:
         super().__init__()
         self.backbone = backbone
         self.tokenizer = tokenizer
@@ -201,8 +224,8 @@ class LangSetModel(nn.Module):
         # so `inputs_embeds` forwards don't crash on the reverse-ID lookup. 0 => not a PLE model (no-op).
         self._ple_dim = int(getattr(backbone.config, "hidden_size_per_layer_input", 0) or 0)
         self._n_layers = int(getattr(backbone.config, "num_hidden_layers", 0) or 0)
-        # The Unsloth path loads a text tower that always returns `last_hidden_state`, so we don't ask the backbone
-        # to collect (and keep) every layer's hidden states — a big memory win. A plain ForCausalLM has no
+        # A text tower (when build_backbone unwrapped to one) always returns `last_hidden_state`, so we don't ask the
+        # backbone to collect (and keep) every layer's hidden states — a big memory win. A plain ForCausalLM has no
         # `last_hidden_state`, so it still needs output_hidden_states to expose the final layer.
         self._need_ohs = hasattr(backbone, "lm_head")   # text tower -> last_hidden_state; raw ForCausalLM -> ohs
         self.latent_dim = latent_dim
@@ -212,9 +235,17 @@ class LangSetModel(nn.Module):
         self.fsq_levels = fsq_levels
         eos_id = int(tokenizer.eos_token_id or 0)
         self.head = EmitHead(self.h, latent_dim, n_latents, dropout, eos_id=eos_id,
-                             multi_latent=multi_latent, fsq_dim=fsq_dim, fsq_levels=fsq_levels)
+                             multi_latent=multi_latent, fsq_dim=fsq_dim, fsq_levels=fsq_levels,
+                             fsq_emit=fsq_emit)
         self.llm_model = llm_model
         self.max_len = max_len
+        self._lora_top_k = 0                                      # overwritten by from_pretrained; persisted in config
+        # pool_mode="last": SKIP the learned emit-query; read the backbone's LAST real-token hidden and project it
+        # (head.out_proj). Lets a FROZEN strong-embedder backbone (e.g. F2LLM) be specialized by training ONLY the
+        # projection head -> nothing is backpropped through the layers (no grad_ckpt, huge batch). "" => emit-head
+        # (default, byte-identical: forward() takes the learned-query path exactly as before).
+        self.pool_mode = pool_mode
+        self._frozen_bb = False        # set by from_pretrained(freeze_backbone=True); gates the no-grad backbone read
 
     # ---- construction ----
     @classmethod
@@ -222,21 +253,29 @@ class LangSetModel(nn.Module):
                         lora_r: int = 16, dropout: float = 0.0, bf16: bool = False, max_len: int = 512,
                         multi_latent: bool = False, fsq_dim: int = 128, fsq_levels: int = 8,
                         device: Optional[str] = None, attn_implementation: str = "sdpa",
-                        train_base: bool = False, grad_ckpt: bool = False) -> "LangSetModel":
+                        train_base: bool = False, grad_ckpt: bool = False,
+                        lora_top_k: int = 0, fsq_emit: bool = False, pool_mode: str = "",
+                        freeze_backbone: bool = False) -> "LangSetModel":
         from transformers import AutoTokenizer  # type: ignore[import-untyped]
         dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
         tok = AutoTokenizer.from_pretrained(llm_model)
         if tok.pad_token_id is None:
             tok.pad_token = tok.eos_token
         backbone = build_backbone(llm_model, lora_r, dropout, bf16, dev, attn_implementation,
-                                  train_base=train_base, grad_ckpt=grad_ckpt)
+                                  train_base=train_base, grad_ckpt=grad_ckpt, lora_top_k=lora_top_k)
         if latent_dim is None:                                   # default: emit in the backbone's own hidden space
             latent_dim = _cfg_int(backbone.config, "hidden_size")
         model = cls(backbone, tok, latent_dim, n_latents, llm_model, dropout, max_len,
-                    multi_latent, fsq_dim, fsq_levels)
-        if llm_model.startswith("unsloth/"):                     # 4bit backbone is already placed; move only the head
-            model.head.to(dev)
-            return model
+                    multi_latent, fsq_dim, fsq_levels, fsq_emit=fsq_emit, pool_mode=pool_mode)
+        model._lora_top_k = int(lora_top_k)                      # persisted in config so load() rebuilds same adapters
+        if pool_mode == "last":                      # WARM-START the pool head at the base's NATIVE embedding: identity
+            torch.nn.init.eye_(model.head.out_proj.weight)   # out_proj -> head_project == normalize(last-token hidden) ==
+            torch.nn.init.zeros_(model.head.out_proj.bias)   # the base's own readout (last-token pool) -> starts at base
+            #  quality and REFINES, instead of a random head destroying the base geometry and relearning it worse.
+        if freeze_backbone:                          # FROZEN base: only the head trains -> backbone read needs no graph
+            for p in model.backbone.parameters():
+                p.requires_grad_(False)
+            model._frozen_bb = True
         return model.to(dev)
 
     @property
@@ -267,8 +306,25 @@ class LangSetModel(nn.Module):
         h = getattr(out, "last_hidden_state", None)          # text tower returns this; a ForCausalLM does not
         return h if h is not None else out.hidden_states[-1]
 
+    def _pool_hidden(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Last real-token hidden of the raw text (frozen-backbone read when _frozen_bb). [B, h]. This is the STATIC
+        feature the frozen-pool fast path caches ONCE; head_project() then turns it into the trainable latent."""
+        if self._frozen_bb:                          # frozen backbone -> read under no_grad (zero activation memory)
+            with torch.no_grad():
+                hid = self._last_hidden(self._run_backbone(self.embed(input_ids), attention_mask, input_ids, 0))
+        else:
+            hid = self._last_hidden(self._run_backbone(self.embed(input_ids), attention_mask, input_ids, 0))
+        last = attention_mask.sum(1).long().clamp(min=1) - 1                    # index of each row's last real token
+        return hid[torch.arange(hid.size(0), device=hid.device), last]         # [B, h]
+
+    def head_project(self, feats: torch.Tensor) -> torch.Tensor:
+        """Project pooled features through the trainable head -> normalized latent. [B, h] -> [B, d]."""
+        return F.normalize(self.head.out_proj(feats.float()), p=2, dim=-1)
+
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """Read input text, emit the latent. Returns [B, d]."""
+        if self.pool_mode == "last":                 # POOL path: no emit query; last real-token hidden -> out_proj
+            return self.head_project(self._pool_hidden(input_ids, attention_mask))
         nl = self.head.n_latents
         rev = self.embed(input_ids)
         q = self.head.q.unsqueeze(0).expand(input_ids.size(0), -1, -1).to(rev.dtype)
@@ -306,6 +362,30 @@ class LangSetModel(nn.Module):
 
     def emit(self, sentences: Union[str, list[str]], **kw: Any) -> torch.Tensor:
         return self.encode(sentences, convert_to_numpy=False, **kw)  # type: ignore[return-value]
+
+    @torch.no_grad()
+    def generate_text(self, prompt: str, max_new: int = 200) -> str:
+        """Greedy text generation via the TIED input embedding (the lm_head is stripped). Used to MEASURE whether
+        [LEARN]/train_base actually injected knowledge — ask the trained model a question and read its answer."""
+        self.eval()
+        tok, dev = self.tokenizer, self.device
+        msgs = [{"role": "user", "content": prompt}]
+        try:
+            enc = tok.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False,
+                                          return_tensors="pt", return_dict=True)
+        except TypeError:
+            enc = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt", return_dict=True)
+        ids = enc["input_ids"].to(dev)
+        eos = int(tok.eos_token_id or 0)
+        out: list[int] = []
+        for _ in range(max_new):
+            hid = self._last_hidden(self._run_backbone(self.embed(ids), torch.ones_like(ids), ids, 0))[:, -1]
+            nxt = int(F.linear(hid.float(), self.embed.weight.float()).argmax(-1))
+            if nxt == eos:
+                break
+            out.append(nxt)
+            ids = torch.cat([ids, torch.tensor([[nxt]], device=dev)], dim=1)
+        return tok.decode(out, skip_special_tokens=True).strip()
 
     # ---- multi-latent autoregressive rollout (drives the feedback / stop_logit seams) ----
     @torch.no_grad()
@@ -497,7 +577,8 @@ class LangSetModel(nn.Module):
         (p / "config.json").write_text(json.dumps({
             "llm_model": self.llm_model, "latent_dim": self.latent_dim,
             "n_latents": self.head.n_latents, "max_len": self.max_len,
-            "multi_latent": self.multi_latent, "fsq_dim": self.fsq_dim, "fsq_levels": self.fsq_levels}))
+            "multi_latent": self.multi_latent, "fsq_dim": self.fsq_dim, "fsq_levels": self.fsq_levels,
+            "lora_top_k": self._lora_top_k, "fsq_emit": self.head.fsq_emit, "pool_mode": self.pool_mode}))
 
     @classmethod
     def load(cls, path: Union[str, Path], *, lora_r: int = 16, device: Optional[str] = None) -> "LangSetModel":
@@ -505,7 +586,9 @@ class LangSetModel(nn.Module):
         p = Path(path); cfg = json.loads((p / "config.json").read_text())
         m = cls.from_pretrained(cfg["llm_model"], latent_dim=cfg["latent_dim"], n_latents=cfg.get("n_latents", 1),
                                 lora_r=lora_r, max_len=cfg["max_len"], multi_latent=cfg.get("multi_latent", False),
-                                fsq_dim=cfg.get("fsq_dim", 128), fsq_levels=cfg.get("fsq_levels", 8), device=device)
+                                fsq_dim=cfg.get("fsq_dim", 128), fsq_levels=cfg.get("fsq_levels", 8),
+                                lora_top_k=int(cfg.get("lora_top_k", 0)), fsq_emit=cfg.get("fsq_emit", False),
+                                pool_mode=cfg.get("pool_mode", ""), device=device)
         sd = torch.load(p / "langset.pt", map_location=m.device, weights_only=False)
         m.backbone.load_state_dict(sd["lora"], strict=False)
         m.head.load_state_dict(sd["head"])

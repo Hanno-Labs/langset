@@ -89,6 +89,142 @@ def supcon_loss(z: torch.Tensor, labels: list[str], tau: float) -> torch.Tensor:
     return (-(pos * logp).sum(1)[has] / npos[has]).mean()
 
 
+# ---- single-latent step engines -----------------------------------------------------------------
+# The real axis of the single-latent path is "where do pred/target/hard-neg features come from, and how is the
+# step run": the LIVE backbone (default) vs. FROZEN-POOL cached vectors (pool_mode="last" + frozen backbone). Both
+# obey ONE interface; train() picks the engine ONCE, so the epoch loop and eval block have no per-feature `if`s.
+
+class _StepEngine:
+    """Strategy for producing the contrastive features of one step. `supports_recon` gates the recon aux — the
+    frozen-pool engine has no backbone in the loop, so recon (which decodes via the backbone) is unavailable there."""
+
+    supports_recon: bool = True
+
+    def precompute(self) -> None:
+        """Called ONCE before the epoch loop (frozen-pool caches all view features here; backbone impl = no-op)."""
+
+    def featurize(self, idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """-> (pred [B,d] grad flows, target [B,d] honoring stop_grad_target, hard_neg [Hn,d] or None)."""
+        raise NotImplementedError
+
+    def recon(self, pred: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        """Recon aux scalar. Only defined/called when supports_recon."""
+        raise NotImplementedError
+
+    def val_embeddings(self, val_idx: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """-> (emit_in, emit_tg) numpy for the eval MRR/retrieval block."""
+        raise NotImplementedError
+
+
+class BackboneStepEngine(_StepEngine):
+    """DEFAULT: runs the LIVE backbone. Owns the fuse_views / stop_grad_target / _dyn_trim variations internally
+    (they are "how to run the backbone", cohesive here). Byte-identical to the historical default path."""
+
+    supports_recon = True
+
+    def __init__(self, model: LangSetModel, args: TrainingArguments, tok: Any,
+                 ids: torch.Tensor, mask: torch.Tensor, t2_ids: torch.Tensor, t2_mask: torch.Tensor,
+                 hn_ids: Optional[torch.Tensor], hn_mask: Optional[torch.Tensor],
+                 recon_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+                 input_text: list[str], target_text: list[str]) -> None:
+        self.m, self.a, self.tok = model, args, tok
+        self.ids, self.mask, self.t2_ids, self.t2_mask = ids, mask, t2_ids, t2_mask
+        self.hn_ids, self.hn_mask = hn_ids, hn_mask
+        self._recon_fn = recon_fn
+        self.input_text, self.target_text = input_text, target_text
+
+    def featurize(self, idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        m, a = self.m, self.a
+        if a.fuse_views and not a.stop_grad_target:      # FUSE input+target in ONE forward (1 launch + 1 recompute);
+            fi, fm = _fuse_views(self.ids[idx], self.mask[idx], self.t2_ids[idx], self.t2_mask[idx],
+                                 self.tok.pad_token_id)  # math identical (padding masked); split back at row B
+            both = m(fi, fm); _nb = len(idx)
+            pred, target = both[:_nb], both[_nb:]
+        else:
+            pred = m(*_dyn_trim(self.ids[idx], self.mask[idx]))
+            if a.stop_grad_target:                       # BYOL/MoCo: target anchors geometry, no backward
+                with torch.no_grad():
+                    target = m(*_dyn_trim(self.t2_ids[idx], self.t2_mask[idx]))
+            else:
+                target = m(*_dyn_trim(self.t2_ids[idx], self.t2_mask[idx]))   # self-contrastive: emit(target_text)
+        hn: Optional[torch.Tensor] = None
+        if self.hn_ids is not None:                      # HARD NEGATIVES: mined near-miss targets; no_grad (memory-safe,
+            with torch.no_grad():                        # no 4th backward) — gradient still flows to `pred`, off the negs.
+                hn = m(*_dyn_trim(self.hn_ids[idx], self.hn_mask[idx]))
+        return pred, target, hn
+
+    def recon(self, pred: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        return self._recon_fn(pred, idx)
+
+    def val_embeddings(self, val_idx: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        emit_in = np.asarray(self.m.encode([self.input_text[j] for j in val_idx], normalize_embeddings=True))
+        emit_tg = np.asarray(self.m.encode([self.target_text[j] for j in val_idx], normalize_embeddings=True))
+        return emit_in, emit_tg
+
+
+class FrozenPoolStepEngine(_StepEngine):
+    """FROZEN-POOL: backbone frozen + pool_mode="last" -> features are STATIC. Encode every view ONCE in precompute()
+    and train only the head on the cached vectors (no backbone in the step loop) => epochs run in seconds. No recon
+    (it needs the frozen-out backbone), so select by retrieval MRR."""
+
+    supports_recon = False
+
+    def __init__(self, model: LangSetModel, args: TrainingArguments,
+                 ids: torch.Tensor, mask: torch.Tensor, t2_ids: torch.Tensor, t2_mask: torch.Tensor,
+                 hn_ids: Optional[torch.Tensor], hn_mask: Optional[torch.Tensor]) -> None:
+        self.m, self.a = model, args
+        self.ids, self.mask, self.t2_ids, self.t2_mask = ids, mask, t2_ids, t2_mask
+        self.hn_ids, self.hn_mask = hn_ids, hn_mask
+        self.feat_in: Optional[torch.Tensor] = None
+        self.feat_tg: Optional[torch.Tensor] = None
+        self.feat_hn: Optional[torch.Tensor] = None
+
+    def precompute(self) -> None:
+        import time as _time
+        m, a = self.m, self.a
+        enc_bs = max(a.batch_size, 2048)          # precompute is no_grad + frozen -> use a BIG encode batch to fill the
+
+        def _pool_all(pid: torch.Tensor, pmask: torch.Tensor) -> torch.Tensor:   # GPU (train batch can stay small)
+            outs = []
+            with torch.no_grad():
+                for s in range(0, pid.size(0), enc_bs):
+                    outs.append(m._pool_hidden(*_dyn_trim(pid[s:s + enc_bs], pmask[s:s + enc_bs])).half())
+            return torch.cat(outs, 0)
+        m.eval(); _t = _time.time()
+        self.feat_in = _pool_all(self.ids, self.mask)
+        self.feat_tg = _pool_all(self.t2_ids, self.t2_mask)
+        self.feat_hn = _pool_all(self.hn_ids, self.hn_mask) if self.hn_ids is not None else None
+        m.train()
+        if a.verbose:
+            fi = self.feat_in
+            print(f"[langset] CACHED {fi.size(0)} frozen features ({fi.size(1)}d, "
+                  f"{fi.element_size()*fi.nelement()/1e6:.0f}MB/view) in {_time.time()-_t:.1f}s "
+                  f"-> head-only training, no backbone in loop", flush=True)
+
+    def featurize(self, idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        m, a = self.m, self.a
+        assert self.feat_in is not None and self.feat_tg is not None
+        pred = m.head_project(self.feat_in[idx].float())
+        if a.stop_grad_target:
+            with torch.no_grad():
+                target = m.head_project(self.feat_tg[idx].float())
+        else:
+            target = m.head_project(self.feat_tg[idx].float())
+        hn: Optional[torch.Tensor] = None
+        if self.feat_hn is not None:
+            with torch.no_grad():
+                hn = m.head_project(self.feat_hn[idx].float())
+        return pred, target, hn
+
+    def val_embeddings(self, val_idx: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        assert self.feat_in is not None and self.feat_tg is not None
+        with torch.no_grad():
+            vi = torch.tensor(val_idx, device=self.m.device)
+            emit_in = self.m.head_project(self.feat_in[vi].float()).cpu().numpy()
+            emit_tg = self.m.head_project(self.feat_tg[vi].float()).cpu().numpy()
+        return emit_in, emit_tg
+
+
 class Trainer:
     def __init__(self, model: LangSetModel, args: TrainingArguments, train_dataset: Any,
                  eval_dataset: Optional[Any] = None, column_mapping: Optional[dict[str, str]] = None,
@@ -131,6 +267,42 @@ class Trainer:
                 self.sup_labels = [
                     [str(x) for x in (v if isinstance(v, (list, tuple)) else [v])] for v in raw_sup
                 ]
+            # optional FSQ LABEL SUBSPACE: per-item label columns -> reserved-dim codeword targets (a formal, head-free
+            # label space in the emitted code). Builds a class->codeword map per facet and a flat "plan" of which
+            # rest-dim column carries which facet's k-th codeword digit.
+            self.label_cols: Optional[dict[str, list[list[str]]]] = None
+            self.label_codewords: dict[str, dict[str, list[int]]] = {}
+            self.label_plan: Optional[list[tuple[int, str, int]]] = None   # (rest_col = dim-1, field, digit_pos)
+            if getattr(args, "label_dims", None):
+                fsq_levels = int(model.head.fsq_levels)
+                self.label_cols = {}
+                plan: list[tuple[int, str, int]] = []
+                for field, dims in args.label_dims.items():
+                    raw = cols[inv.get(field, field)]
+                    seqs = [[str(x) for x in (v if isinstance(v, (list, tuple)) else [v])] for v in raw]
+                    self.label_cols[field] = seqs
+                    classes = sorted({c for s in seqs for c in s
+                                      if str(c).lower() not in ("", "unknown", "none", "na", "nan")})
+                    m_dims = len(dims)
+                    if len(classes) > fsq_levels ** m_dims:
+                        raise ValueError(f"label_dims[{field}]: {len(classes)} classes > {fsq_levels}^{m_dims} "
+                                         f"codewords — reserve more digits")
+                    cw: dict[str, list[int]] = {}
+                    for ci, c in enumerate(classes):
+                        x, digs = ci, []
+                        for _ in range(m_dims):
+                            digs.append(x % fsq_levels); x //= fsq_levels    # little-endian base-fsq_levels codeword
+                        cw[c] = digs
+                    self.label_codewords[field] = cw
+                    for pos, dd in enumerate(dims):
+                        if int(dd) < 1:
+                            raise ValueError(f"label_dims dim {dd} must be >=1 (dim 0 is STOP-coupled)")
+                        plan.append((int(dd) - 1, field, pos))
+                self.label_plan = plan
+                if args.verbose:
+                    print(f"[langset] FSQ label subspace: "
+                          + "; ".join(f"{f}->{args.label_dims[f]} ({len(self.label_codewords[f])} cls)"
+                                      for f in args.label_dims), flush=True)
             if args.verbose:
                 hn = "" if not self.hard_neg_texts else " (+hard-neg)"
                 sp = "" if not self.sup_labels else " (+supcon)"
@@ -288,6 +460,16 @@ class Trainer:
             if self.on_checkpoint is not None:
                 self.on_checkpoint()                           # e.g. Volume.commit() -> durable across preempt
 
+        # ---- pick the step engine ONCE (see the _StepEngine classes above): FROZEN-POOL (backbone frozen +
+        # pool_mode="last" -> features static, cached once, head-only training in seconds) vs the LIVE backbone
+        # (default). The epoch loop + eval below then run ONE path with no per-feature `if`s. ----
+        if getattr(m, "pool_mode", "") == "last" and getattr(m, "_frozen_bb", False):
+            engine: _StepEngine = FrozenPoolStepEngine(m, a, ids, mask, t2_ids, t2_mask, hn_ids, hn_mask)
+        else:
+            engine = BackboneStepEngine(m, a, tok, ids, mask, t2_ids, t2_mask, hn_ids, hn_mask,
+                                        recon_loss, self.input_text, self.target_text)
+        engine.precompute()          # no-op for the backbone; frozen-pool encodes+caches every view here
+
         for ep in range(start_ep, a.epochs):
             m.train()
             order = tr_idx[rng.permutation(len(tr_idx))]
@@ -301,22 +483,10 @@ class Trainer:
                     lloss = learn_loss(lp)
                     opt.zero_grad(); lloss.backward(); opt.step()
                 idx = torch.tensor(order[i:i + a.batch_size], device=dev)
-                if a.fuse_views and not a.stop_grad_target:      # FUSE input+target in ONE forward (1 launch + 1
-                    fi, fm = _fuse_views(ids[idx], mask[idx], t2_ids[idx], t2_mask[idx], tok.pad_token_id)  # recompute)
-                    both = m(fi, fm); _nb = len(idx)             # math identical (padding masked); split back at row B
-                    pred, target = both[:_nb], both[_nb:]
-                else:
-                    pred = m(*_dyn_trim(ids[idx], mask[idx]))
-                    if a.stop_grad_target:                       # BYOL/MoCo: target anchors geometry, no backward
-                        with torch.no_grad():
-                            target = m(*_dyn_trim(t2_ids[idx], t2_mask[idx]))
-                    else:
-                        target = m(*_dyn_trim(t2_ids[idx], t2_mask[idx]))   # self-contrastive: emit(target_text)
-                tmat = target
-                if hn_ids is not None:                          # HARD NEGATIVES: mined near-miss targets as extra
-                    with torch.no_grad():                       # negative columns. no_grad -> memory-safe (no 4th backward);
-                        hn = m(*_dyn_trim(hn_ids[idx], hn_mask[idx]))  # gradient still flows to `pred`, off the hard negs.
-                    tmat = torch.cat([target, hn], dim=0)        # [2B, d]: cols [0:B]=in-batch targets, [B:2B]=hard negs
+                pred, target, hn = engine.featurize(idx)        # engine owns WHERE features come from (backbone vs cached)
+                # HARD NEGATIVES (if any): mined near-miss targets as extra negative columns [B:2B] (in-batch targets
+                # stay cols [0:B]); the engine computed them under no_grad so gradient still flows only to `pred`.
+                tmat = target if hn is None else torch.cat([target, hn], dim=0)
                 logits = (pred @ tmat.t()) / a.tau              # in-batch negatives force separation (no collapse)
                 B = len(idx)
                 neg_mask = torch.zeros(B, logits.size(1), dtype=torch.bool, device=dev)   # NB: not `mask` (that's the attn mask)
@@ -341,7 +511,11 @@ class Trainer:
                 if bool(neg_mask.any()):
                     logits = logits.masked_fill(neg_mask, float("-inf"))   # diagonal (positive) always kept
                 loss = F.cross_entropy(logits, torch.arange(B, device=dev))                 # primary
-                loss = loss + a.lam_recon * recon_loss(pred, idx)                            # aux: grounding
+                if engine.supports_recon and a.lam_recon > 0:                                # aux: grounding. At 0 the
+                    loss = loss + a.lam_recon * engine.recon(pred, idx)                      # term is zero anyway; SKIP so
+                    #  recon's fp32 full-vocab ([B,S,vocab]) projection graph is NOT built every step (that graph, not
+                    #  the stripped lm_head, is what OOM'd a 0.6B at 84GB without grad_ckpt). Also lets frozen-pool run
+                    #  (recon needs the backbone that pool_mode deliberately freezes out). Default 0.3 -> unchanged.
                 if a.lam_uniform > 0 and len(idx) > 1:                                       # aux: uniformity
                     sq = torch.pdist(F.normalize(pred, p=2, dim=-1), p=2).pow(2)
                     loss = loss + a.lam_uniform * sq.mul(-2.0).exp().mean().log()
@@ -351,19 +525,22 @@ class Trainer:
             if ep % a.eval_every:
                 continue
             # validate in the CURRENT geometry: input-view vs target-view retrieval + collapse + held-out recon.
-            emit_in = np.asarray(m.encode([self.input_text[j] for j in val_idx], normalize_embeddings=True))
-            emit_tg = np.asarray(m.encode([self.target_text[j] for j in val_idx], normalize_embeddings=True))
+            emit_in, emit_tg = engine.val_embeddings(val_idx)   # engine owns HOW val embeddings are produced
             mrr = selection.retrieval_mrr(emit_in, emit_tg)["mrr"]
             collapse = selection.collapse_score(emit_in)
-            with torch.no_grad():
-                rv, tot_v = 0.0, 0
-                for s in range(0, len(val_idx), a.batch_size):
-                    vb = torch.tensor(val_idx[s:s + a.batch_size], device=dev)
-                    rv += float(recon_loss(m(ids[vb], mask[vb]), vb)) * len(vb); tot_v += len(vb)
-                recon_val = rv / tot_v
-            # recon_val is teacher-forced -> blind to collapse; hard-penalize high collapse so a collapsed epoch
-            # can never win.
-            sel_score = -recon_val - _COLLAPSE_PENALTY * max(0.0, collapse - _COLLAPSE_FLOOR)
+            if not engine.supports_recon or a.lam_recon == 0.0:  # recon not the objective (frozen-pool OR lam_recon=0) ->
+                recon_val = 0.0                                 # select by retrieval MRR, and skip the wasteful recon-val
+                sel_score = mrr - _COLLAPSE_PENALTY * max(0.0, collapse - _COLLAPSE_FLOOR)   # fp32 vocab projection
+            else:
+                with torch.no_grad():
+                    rv, tot_v = 0.0, 0
+                    for s in range(0, len(val_idx), a.batch_size):
+                        vb = torch.tensor(val_idx[s:s + a.batch_size], device=dev)
+                        rv += float(recon_loss(m(ids[vb], mask[vb]), vb)) * len(vb); tot_v += len(vb)
+                    recon_val = rv / tot_v
+                # recon_val is teacher-forced -> blind to collapse; hard-penalize high collapse so a collapsed epoch
+                # can never win.
+                sel_score = -recon_val - _COLLAPSE_PENALTY * max(0.0, collapse - _COLLAPSE_FLOOR)
             if a.verbose:
                 print(f"ep{ep:02d} loss={tot/nb:.3f} mrr={mrr:.3f} collapse={collapse:.3f} "
                       f"recon_val={recon_val:.3f} sel={sel_score:.3f}", flush=True)
@@ -486,9 +663,12 @@ class Trainer:
             of the val `target_texts`. Reports (a) retrieval MRR vs the chain's OWN targets and (b) a NON-COLLAPSE
             diversity count = distinct nearest-bank items produced (FSQ must not mean-collapse to one mode)."""
             m.eval()
+            import time as _et
+            _ev_t0 = _et.perf_counter()
+            veval = val_idx[:a.eval_max_chains] if a.eval_max_chains else val_idx   # bound eval cost to a fixed cohort
             bank_texts: list[str] = []
             bank_chain: list[int] = []
-            for ci in val_idx:
+            for ci in veval:
                 for t in futs[ci]:
                     bank_texts.append(t)
                     bank_chain.append(ci)
@@ -502,8 +682,8 @@ class Trainer:
             n_emit = 0
             emit_vecs: list[torch.Tensor] = []                       # emitted val latents (for stage kNN-purity)
             emit_labs: list[str] = []                                # position-aligned sup label of each emission
-            for i in range(0, len(val_idx), a.batch_size):
-                chunk = val_idx[i:i + a.batch_size]
+            for i in range(0, len(veval), a.batch_size):
+                chunk = veval[i:i + a.batch_size]
                 out = m.rollout([seeds[c] for c in chunk], max_steps=a.max_steps, return_lengths=True)
                 lats, lens = cast("tuple[torch.Tensor, torch.Tensor]", out)   # list input => (lat [B,Lmax,d], len [B])
                 for kk, ci in enumerate(chunk):
@@ -524,8 +704,10 @@ class Trainer:
             m.train()
             purity = (selection.knn_purity(torch.stack(emit_vecs).numpy(), emit_labs)
                       if len(emit_vecs) > 6 else 0.0)                # stage-separation of the emitted geometry
+            print(f"[EVAL] {_et.perf_counter() - _ev_t0:.1f}s | {len(veval)} chains, {len(bank_texts)} bank, "
+                  f"{n_emit} emissions", flush=True)
             return {"retr_mrr": float(np.mean(rr)) if rr else 0.0, "purity": purity,
-                    "n_distinct": len(produced), "avg_emitted": n_emit / max(len(val_idx), 1)}
+                    "n_distinct": len(produced), "avg_emitted": n_emit / max(len(veval), 1)}
 
         rng_t = torch.Generator().manual_seed(a.seed)
         best = -1.0
@@ -580,6 +762,26 @@ class Trainer:
             if self.on_checkpoint is not None:
                 self.on_checkpoint()                           # e.g. Volume.commit() -> durable across preempt
 
+        import os as _os
+        import time as _time
+        from contextlib import nullcontext as _nullctx
+        _prof_steps = int(_os.environ.get("LANGSET_PROFILE_STEPS", "0"))   # diagnostic: profile N steps then STOP
+        _prof = None
+        _gstep = 0
+        _prof_t0 = 0.0
+        _rfn = None
+        if _prof_steps > 0:
+            from torch.profiler import profile as _tp_profile, ProfilerActivity as _PA, record_function as _rfn
+            acts = [_PA.CPU] + ([_PA.CUDA] if torch.cuda.is_available() else [])
+            _prof = _tp_profile(activities=acts, record_shapes=False, with_stack=False)
+            _prof.__enter__()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            _prof_t0 = _time.perf_counter()
+            print(f"[PROFILE] capturing {_prof_steps} training steps then exiting ...", flush=True)
+
+        def _rf(name: str) -> Any:                             # named phase range when profiling, no-op otherwise
+            return _rfn(name) if _prof is not None else _nullctx()
         for ep in range(start_ep, a.epochs):
             m.train()
             order = torch.randperm(len(tr_idx), generator=rng_t).tolist()
@@ -595,7 +797,8 @@ class Trainer:
                 ent_lists = [list(futs[k]) for k in bidx]
                 lmax = max(len(x) for x in ent_lists)
                 flat_texts = [txt for lst in ent_lists for txt in lst]
-                flat_tgt = emit_texts(flat_texts, ema_model)         # [ΣL, d] stop-grad EMA targets
+                with _rf("ema_encode"):
+                    flat_tgt = emit_texts(flat_texts, ema_model)     # [ΣL, d] stop-grad EMA targets
                 b = len(bidx)
                 target_lat = torch.zeros(b, lmax, d, device=dev)
                 valid = torch.zeros(b, lmax, dtype=torch.bool, device=dev)
@@ -609,9 +812,10 @@ class Trainer:
                     k += nl
                 # token-native FSQ: predict each item's per-dim digits, then a STOP folded into dim-0's softmax.
                 eff_ss = a.ss_prob if a.ss_warmup <= 0 else a.ss_prob * min(1.0, ep / a.ss_warmup)
-                dim_lg, stop_lg, digits, recon = m.rollout_train_codebook(
-                    se["input_ids"], se["attention_mask"], target_lat, a.tau,
-                    train_hops=a.train_hops, ss_prob=eff_ss, ss_sample=a.ss_sample)
+                with _rf("rollout"):
+                    dim_lg, stop_lg, digits, recon = m.rollout_train_codebook(
+                        se["input_ids"], se["attention_mask"], target_lat, a.tau,
+                        train_hops=a.train_hops, ss_prob=eff_ss, ss_sample=a.ss_sample)
                 dim0 = torch.cat([dim_lg[:, :, 0, :], stop_lg], -1)  # [b, lmax+1, L+1] — digit-0 + STOP
                 lab0 = torch.full((b, lmax + 1), -100, dtype=torch.long, device=dev)
                 lab_rest = torch.full((b, lmax, fsq_dim - 1), -100, dtype=torch.long, device=dev)
@@ -619,11 +823,28 @@ class Trainer:
                     lab0[r, :nl] = digits[r, :nl, 0]
                     lab0[r, nl] = stop_idx                           # emit digit-0 per item, then STOP after the last
                     lab_rest[r, :nl] = digits[r, :nl, 1:]
+                lab_label = None                                     # FSQ LABEL SUBSPACE: reserved dims -> a SEPARATE
+                if self.label_plan is not None:                      # weighted label CE (NOT diluted inside loss_dims)
+                    lab_label = torch.full((b, lmax, len(self.label_plan)), -100, dtype=torch.long, device=dev)
+                    for s_i, (col_j, field, pos) in enumerate(self.label_plan):
+                        labs, cw = self.label_cols[field], self.label_codewords[field]
+                        for r, kk in enumerate(bidx):
+                            row_labs = labs[kk]
+                            for j in range(lens_l[r]):
+                                code = cw.get(row_labs[j] if j < len(row_labs) else "")
+                                lab_label[r, j, s_i] = code[pos] if code is not None else -100
+                        lab_rest[:, :, col_j] = -100                 # reserved dims leave the reconstruction CE
                 loss_stop = F.cross_entropy(dim0.reshape(-1, fsq_levels + 1), lab0.reshape(-1), ignore_index=-100)
                 loss_dims = F.cross_entropy(dim_lg[:, :lmax, 1:, :].reshape(-1, fsq_levels),
                                             lab_rest.reshape(-1), ignore_index=-100)
                 recon_loss = (1.0 - F.cosine_similarity(recon[valid], target_lat[valid], dim=-1)).mean()
                 loss = loss_stop + loss_dims + recon_loss           # base objective (recon-only) + separation below
+                if lab_label is not None and a.lam_label_dims > 0:  # FSQ LABEL SUBSPACE: full-strength reserved-dim CE
+                    rcols = [cj for (cj, _, _) in self.label_plan]
+                    lab_lg = dim_lg[:, :lmax, 1:, :][:, :, rcols, :]     # [b, lmax, n_reserved, fsq_levels]
+                    loss_label = F.cross_entropy(lab_lg.reshape(-1, fsq_levels), lab_label.reshape(-1), ignore_index=-100)
+                    loss = loss + a.lam_label_dims * loss_label
+                    agg["loss_label"] = agg.get("loss_label", 0.0) + float(loss_label.detach())
                 if a.lam_multi_nce > 0 and int(valid.sum()) > 1:
                     # IN-BATCH-NEGATIVE InfoNCE — the separation term the multi-latent path was missing (ported from
                     # the single-latent self-contrastive loss). Each emitted recon vs the batch's EMA targets: own
@@ -677,14 +898,44 @@ class Trainer:
                     loss = loss + a.lam_phase * loss_phase
                     agg["loss_phase"] = agg.get("loss_phase", 0.0) + float(loss_phase.detach())
                 opt.zero_grad()
-                loss.backward()
-                opt.step()
-                ema_update()                                        # EMA twin tracks the online model
+                with _rf("backward"):
+                    loss.backward()
+                with _rf("opt_ema"):
+                    opt.step()
+                    ema_update()                                    # EMA twin tracks the online model
                 tot += float(loss.detach())
                 nb += 1
                 agg["loss_stop"] += float(loss_stop.detach())
                 agg["loss_dims"] += float(loss_dims.detach())
                 agg["recon_loss"] += float(recon_loss.detach())
+                if _prof is not None:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _gstep += 1
+                    if _gstep >= _prof_steps:
+                        _wall = _time.perf_counter() - _prof_t0
+                        _prof.__exit__(None, None, None)
+                        _ka = _prof.key_averages()
+                        def _sc(e: Any) -> float:            # self-CUDA us across torch versions
+                            return float(getattr(e, "self_cuda_time_total", 0) or getattr(e, "self_device_time_total", 0) or 0)
+                        _cuda_s = sum(_sc(e) for e in _ka) / 1e6
+                        _busy = 100.0 * _cuda_s / _wall if _wall > 0 else 0.0
+                        _phase = {n: sum(_sc(e) for e in _ka if e.key == n) / 1e6
+                                  for n in ("ema_encode", "rollout", "backward", "opt_ema")}
+                        print(f"[PROFILE] ===== SUMMARY over {_prof_steps} steps =====", flush=True)
+                        print(f"[PROFILE] wall={_wall:.1f}s  {_wall/_prof_steps:.2f}s/step  |  GPU-busy={_cuda_s:.1f}s = "
+                              f"{_busy:.0f}% of wall  ({'OVERHEAD-BOUND' if _busy < 65 else 'COMPUTE-BOUND'})", flush=True)
+                        _named = sum(_phase.values())
+                        for _n, _v in _phase.items():
+                            print(f"[PROFILE]   {_n:11s} GPU {_v:5.1f}s = {100*_v/_cuda_s if _cuda_s else 0:4.0f}% of GPU-busy", flush=True)
+                        print(f"[PROFILE]   residual(CPU/py) ~{max(0.0, _wall - _named):.1f}s of wall not in named GPU phases", flush=True)
+                        for _sk in ("self_cuda_time_total", "self_device_time_total", "cuda_time_total", "cpu_time_total"):
+                            try:
+                                print(f"[PROFILE] === sort_by={_sk} ===\n"
+                                      + _ka.table(sort_by=_sk, row_limit=30), flush=True)
+                            except Exception:
+                                continue
+                        return   # diagnostic run: stop after profiling
 
             if ep % a.eval_every:
                 continue

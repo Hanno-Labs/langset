@@ -75,6 +75,19 @@ class TrainingArguments:
     # event identity (retr_mrr survives). lam_phase=0 = off. Use INSTEAD of lam_sup (set lam_sup=0).
     lam_phase: float = 0.0
 
+    # FSQ LABEL SUBSPACE — a FORMAL label space inside the emitted code, with NO head per label. Map each facet to
+    # reserved FSQ digit indices (each >=1; dim 0 is STOP-coupled). Those dims' reconstruction targets are REPLACED
+    # by the label's codeword (one digit if n_classes<=fsq_levels, else little-endian base-fsq_levels across the
+    # group), so the emitter is FORCED to encode the label AS coordinates of the token: reading a label = argmax the
+    # reserved digit (no probe), writing = clamp it (controllable generation). Remaining dims reconstruct as usual.
+    # Needs per-item label columns (lists aligned 1:1 with target_texts) named by the dict keys. Unknown/""/"none"
+    # labels -> those dims ignored (-100) for that item. None = off (byte-identical). e.g. {"label_stage":[1],
+    # "label_area":[2,3], "label_indication":[4,5,6]}.
+    label_dims: Optional[dict[str, list[int]]] = None
+    # weight on the reserved-dim label CE. It's a SEPARATE term (not folded into loss_dims) so the ~9 label dims are
+    # not diluted among the ~1000 free reconstruction dims — at weight 1 it sits at parity with loss_dims/recon.
+    lam_label_dims: float = 1.0
+
     # MULTI-HOP training (scheduled sampling). ss_prob=0 = pure teacher forcing, gradients flow 1 hop (default,
     # byte-identical). ss_prob>0: for the first `train_hops` emitted positions (None = ALL), feed the model's OWN
     # predicted latent back with probability ss_prob instead of ground truth — the exposure-bias fix that makes
@@ -134,6 +147,11 @@ class TrainingArguments:
     # validation / early-stop
     val_frac: float = 0.2
     eval_every: int = 1
+    # In-loop eval cost scales with the val-set size THREE ways: the EMA bank re-encode, the free-rollout over every val
+    # seed, and a Python loop doing a GPU-synced argsort PER emission. On big/long-text val sets that makes eval minutes,
+    # not seconds. Cap the in-loop eval to a fixed cohort so it stays a fast training-time signal (~<=10s). 0 = no cap
+    # (use the full val set). The final/best model is still selected on this proxy; run a full eval offline for the number.
+    eval_max_chains: int = 64
     patience: int = 10
     seed: int = 0
     # checkpoint-selection signal (multi-latent). "retr_mrr" = event-identity retrieval (default, unchanged).
