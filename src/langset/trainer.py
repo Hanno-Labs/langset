@@ -182,7 +182,7 @@ class FrozenPoolStepEngine(_StepEngine):
     def precompute(self) -> None:
         import time as _time
         m, a = self.m, self.a
-        enc_bs = max(a.batch_size, 2048)          # precompute is no_grad + frozen -> use a BIG encode batch to fill the
+        enc_bs = max(8, min(2048, 1_000_000 // max(1, a.max_len)))   # no_grad+frozen -> big encode batch, LENGTH-aware to fill the
 
         def _pool_all(pid: torch.Tensor, pmask: torch.Tensor) -> torch.Tensor:   # GPU (train batch can stay small)
             outs = []
