@@ -7,4 +7,4 @@ from langset.trainer import Trainer
 from langset.training_args import TrainingArguments
 
 __all__ = ["LangSetModel", "EmitHead", "Trainer", "TrainingArguments"]
-__version__ = "0.6.0"
+__version__ = "0.9.0"
