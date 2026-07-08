@@ -13,16 +13,16 @@ import modal
 
 _ROOT = Path(__file__).resolve().parent.parent.parent          # langset repo root
 
-# Unsloth image (CUDA-devel base; let the unsloth wheel pull its own internally-consistent torch/transformers
-# stack, then layer deps on top). Unsloth patches Gemma-4's clippable-linears so LoRA can attach — langset's
-# build_backbone routes any `unsloth/...` model id through FastModel automatically. SmolLM still trains on this
-# image via the plain transformers path.
+# Standard transformers image. langset's build_backbone loads every backbone via AutoModelForCausalLM + plain PEFT
+# LoRA, so no special model-patching wheel is needed. torch is pulled from the cu128 index so the Blackwell (B200)
+# GPU is supported; everything else layers on top.
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.11")
+    modal.Image.debian_slim(python_version="3.11")
     # hf_transfer is ignored by current huggingface_hub -> Xet high-performance is the fast path (law team: 59
     # min/file single-stream -> 91s for all files). Matters for cold-start eval/play containers.
     .env({"HF_XET_HIGH_PERFORMANCE": "1", "HF_HOME": "/cache/hf"})
-    .pip_install("unsloth", "hf_xet", "datasets", "wandb>=0.18", "numpy>=1.26",
+    .pip_install("torch>=2.7.0", extra_index_url="https://download.pytorch.org/whl/cu128")
+    .pip_install("transformers>=4.50", "hf_xet", "datasets", "wandb>=0.18", "numpy>=1.26",
                  "peft>=0.13.2", "sentence-transformers>=3.0")
     .add_local_dir(str(_ROOT / "src"), "/pkg/src")
     .add_local_dir(str(_ROOT / "examples" / "ner-multi-latent"), "/pkg/example")
@@ -41,7 +41,6 @@ def train_ner(limit: int = 0, epochs: int = 15, batch_size: int = 32, max_len: i
               out: str = "/cache/ner-best", llm: str = "HuggingFaceTB/SmolLM2-135M") -> None:
     import os
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"   # anti-fragmentation for 4B backbones
-    from unsloth import FastModel  # type: ignore[import-not-found]  # noqa: F401 — patch before transformers
     import sys
     sys.path.insert(0, "/pkg/src")
     sys.path.insert(0, "/pkg/example")
@@ -63,8 +62,7 @@ def train_ner(limit: int = 0, epochs: int = 15, batch_size: int = 32, max_len: i
 def play(ckpt: str = "/cache/ner-gemma-e2b") -> None:
     """Full entity-bank decode of the current best checkpoint (mirrors the SmolLM play_cpu): roll each sentence
     into entity latents, retrieve each latent's nearest `TYPE: surface` from a bank of gold entities + distractors.
-    Gemma-safe: unsloth is imported before transformers. `modal run ...::play --ckpt /cache/ner-gemma-e2b`."""
-    from unsloth import FastModel  # type: ignore[import-not-found]  # noqa: F401 — patch before transformers
+    `modal run ...::play --ckpt /cache/ner-gemma-e2b`."""
     import sys
     sys.path.insert(0, "/pkg/src")
     import torch.nn.functional as F  # noqa: F401
@@ -155,7 +153,6 @@ _SPACE_ENTITIES = [
 def embed_space(ckpt: str) -> dict:
     """Emit the curated entity bank as latents (the space the model retrieves against) and return them for
     local 2D projection. Emits the faithful `TYPE: surface` bank form; within-type geometry is prefix-independent."""
-    from unsloth import FastModel  # type: ignore[import-not-found]  # noqa: F401 — patch before transformers
     import sys
     sys.path.insert(0, "/pkg/src")
     import torch.nn.functional as F  # noqa: F401
