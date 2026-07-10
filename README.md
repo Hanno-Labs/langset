@@ -175,6 +175,41 @@ Under the hood each latent is finite-scalar-quantized (FSQ) into per-dimension d
 EMA target twin (stop-grad) supplies the target latents so the set can't collapse, and every emitted latent is
 fed back into the stream so the next one is conditioned on those already emitted.
 
+### Anti-collapse: EMA twin (default) vs SIGReg (LeJEPA)
+
+By default the multi-latent path prevents representation collapse with an **EMA target twin** — a stop-grad
+copy of the model whose slowly-moving latents are the targets, so the online model can't trivially match a
+target that moves with it. Injecting `target_source=SIGRegTarget` swaps this for **SIGReg** (Sketched Isotropic Gaussian
+Regularization, from LeJEPA, [Balestriero & LeCun 2025, arXiv:2511.08544](https://arxiv.org/abs/2511.08544)):
+no twin, no stop-grad — targets come from the *live* encoder, and collapse is prevented instead by
+regularizing the pre-quantization latent `z = down_proj(·)` toward an isotropic Gaussian (an Epps–Pulley
+goodness-of-fit test over random 1-D projections). The isotropic Gaussian is the distribution LeJEPA proves is
+uniquely privileged for downstream identifiability ([arXiv:2605.26379](https://arxiv.org/abs/2605.26379)).
+
+```python
+from langset.strategies import SIGRegTarget
+Trainer(model, TrainingArguments(target_source=SIGRegTarget, sigreg_lambda=0.3), rows).train()
+```
+
+Anti-collapse is chosen by *injecting a different target-source strategy*, not a boolean flag — the default
+`target_source=EMATwinTarget` and `SIGRegTarget` are interchangeable implementations (see `strategies.py`).
+
+**Trade-offs:**
+
+| | EMA twin (default) | SIGReg (`target_source=SIGRegTarget`) |
+|---|---|---|
+| memory | a full frozen copy of the backbone in VRAM | none — no twin |
+| per-step cost | one extra target forward | one Gaussian-regularizer pass (cheap) |
+| anti-collapse | stop-grad target | isotropic-Gaussian penalty on pre-quant `z` |
+| separation term | pairs with in-batch InfoNCE (`lam_multi_nce`) | replaces it (InfoNCE auto-gated off) |
+
+Empirically SIGReg **matches or beats** the twin on *local* calibration but retains a small gap on *global*
+structure at high `sigreg_lambda`; **tune `sigreg_lambda` ≈ 0.3** (over-diversification washes out global
+structure; too small under-constrains). Implementation note (see `sigreg.py`): the test is **center-only, not
+standardized** — standardizing per-dim before the Gaussianity test is scale-invariant and silently defeats
+anti-collapse (a collapsed batch passes with zero gradient). SIGReg is research-grade; the EMA twin remains
+the validated default.
+
 ## Status
 
 v0.4 — **multi-latent is now first-class in `Trainer`** (`{input_text, target_texts: [...]}` rows), plus sdpa
