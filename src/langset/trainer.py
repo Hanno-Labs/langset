@@ -235,40 +235,50 @@ class FrozenPoolStepEngine(_StepEngine):
 
 @dataclass
 class MultiStepCtx:
-    """Everything a multi-latent aux loss term reads for one step. Assembled once per step after the emission
-    forward; terms pull what they need and return their contribution (or None to skip)."""
-    trainer: Trainer                    # for self.sup_labels / hard_neg_texts / label_plan+cols+codewords
-    args: TrainingArguments
-    model: LangSetModel
-    dev: torch.device
-    bidx: list[int]
-    lens_l: list[int]
-    flat_texts: list[str]
-    valid: torch.Tensor
-    target_lat: torch.Tensor
-    recon: torch.Tensor
-    dim_lg: Optional[torch.Tensor]      # FSQ per-dim digit logits (None for a non-FSQ objective)
-    lmax: int
-    fsq_levels: int
-    lab_label: Optional[torch.Tensor]   # reserved-dim label targets (None unless FSQ label subspace active)
-    target_source: _TargetSource        # encode() the hard-neg bank, twin for eval
-    phase_head: Optional[torch.nn.Module]
-    phase_ids: dict[str, int]
+    """Read-only snapshot of ONE multi-latent training step, handed to every aux `_LossTerm`. Assembled right
+    after the emission forward; a term pulls the few fields it needs and returns its contribution (or None).
+
+    Shape legend used below: B = rows in this batch · L = `lmax` (max emitted items across the batch's rows,
+    the padded time dim) · N = number of VALID emissions in the batch (= Σ lens_l, since rows differ in length)
+    · d = latent dim · V = `fsq_levels`. The canonical flattened view a term works in is `recon[valid]` -> [N, d],
+    and `flat_texts` / `lens_l` / `bidx` are all aligned to that same row-major order.
+    """
+    trainer: Trainer                    # the owning Trainer; read its PER-ROW data (indexed by dataset row id):
+    #                                     sup_labels / hard_neg_texts / label_plan + label_cols + label_codewords
+    args: TrainingArguments             # the run config — a term reads its own weight/temperature here (a.lam_*, a.tau)
+    model: LangSetModel                 # the online model being trained (rarely needed directly — emit via target_source)
+    dev: torch.device                   # device every tensor below lives on; build new tensors with device=c.dev
+    bidx: list[int]                     # this batch's DATASET ROW IDS (len B) — index trainer.sup_labels[k], etc. with these
+    lens_l: list[int]                   # emitted-item count per row (len B): row r produced lens_l[r] items; Σ = N
+    flat_texts: list[str]               # the N target texts row-major (row0's items, then row1's, ...), aligned to recon[valid]
+    valid: torch.Tensor                 # [B, L] bool mask of real (non-padding) emission slots; recon[valid] -> [N, d]
+    target_lat: torch.Tensor            # [B, L, d] the stop-grad TARGET latents each emission is trained toward
+    recon: torch.Tensor                 # [B, L, d] the model's EMITTED latents this step — gradient flows through these
+    dim_lg: Optional[torch.Tensor]      # [B, L+1, fsq_dim, V] FSQ per-dim digit logits; None for a non-FSQ objective
+    lmax: int                           # L above: the padded emitted-item time dim for this batch
+    fsq_levels: int                     # V above: FSQ quantization levels per digit
+    lab_label: Optional[torch.Tensor]   # [B, L, n_reserved] reserved-dim label targets; None unless FSQ label subspace on
+    target_source: _TargetSource        # the target provider; call .encode(texts) -> [n, d] normalized latents (hard-neg bank)
+    phase_head: Optional[torch.nn.Module]  # transient hidden->phase linear classifier, or None when lam_phase == 0
+    phase_ids: dict[str, int]           # phase-label string -> class index, the CE targets for phase_head
 
 
 class _LossTerm:
-    """Strategy for one weighted, optional term added on top of the base emission loss. `contribute` returns
-    (agg_key, raw_unweighted_loss, weight) or None to skip — the loop applies `loss += weight * raw` and logs
-    `raw` under agg_key, exactly as the historical inline block did."""
-    key: str = ""
+    """Strategy for one weighted, optional term added on top of the base emission loss (one per historical
+    `if a.lam_x > 0:` block). Terms are built once and iterated each step; each self-skips when inapplicable."""
+    key: str = ""                       # this term's log/agg name (e.g. "loss_multi_nce"); set by each subclass
 
     def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
+        """Compute this term for the step described by `c`. Return `(key, raw_unweighted_loss, weight)` — the
+        loop then does `loss += weight * raw` and logs `raw` under `key` — or None to skip this term entirely
+        (e.g. its weight is 0 or its required column/head is absent), which is a no-op for the step."""
         raise NotImplementedError
 
 
 def identical_text_mask(c: MultiStepCtx, fn_mask: torch.Tensor) -> None:
-    """Default NCE negative-mask: two emissions with IDENTICAL target text share the same true geometry, so
-    they are not negatives of each other (mirrors the single-latent mask_keys path)."""
+    """A negative-mask: MUTATES `fn_mask` ([N, N] bool, N = valid emissions) in place, setting [i, j] = True for
+    pairs that must NOT be treated as negatives of each other. Default policy: two emissions with IDENTICAL
+    target text share the same true geometry, so they aren't negatives (mirrors the single-latent mask_keys path)."""
     grp: dict[str, list[int]] = {}
     for ii, tx in enumerate(c.flat_texts):               # flat_texts is row-major aligned with recon[valid]
         grp.setdefault(tx, []).append(ii)
@@ -401,23 +411,36 @@ def multi_seed_texts(trainer: Trainer, seeds: list[str], args: TrainingArguments
 
 @dataclass
 class EmissionOut:
-    """What one emission forward produces: the emitted latents (grad flows), the base emission loss, per-term
-    logs for agg, and — for FSQ — the digit logits + reserved-dim label targets the aux terms consume."""
-    recon: torch.Tensor
-    base_loss: torch.Tensor
-    logs: dict[str, torch.Tensor]       # unweighted scalars for agg: loss_stop / loss_dims / recon_loss
-    dim_lg: Optional[torch.Tensor]      # FSQ per-dim digit logits (None for a non-FSQ objective)
-    lab_label: Optional[torch.Tensor]   # reserved-dim label targets (None unless FSQ label subspace active)
+    """Result of one emission forward (shapes as in MultiStepCtx: B rows · L=lmax · d latent · V=fsq_levels).
+    The trainer sets `loss = base_loss`, folds `logs` into its running averages, and passes `recon`/`dim_lg`/
+    `lab_label` on to the aux terms via MultiStepCtx."""
+    recon: torch.Tensor                 # [B, L, d] the model's emitted latents — gradient flows through these
+    base_loss: torch.Tensor             # scalar: the objective's own loss (FSQ: loss_stop + loss_dims + recon_loss)
+    logs: dict[str, torch.Tensor]       # UNWEIGHTED scalar components for logging (FSQ: loss_stop / loss_dims / recon_loss)
+    dim_lg: Optional[torch.Tensor]      # [B, L+1, fsq_dim, V] FSQ per-dim digit logits; None for a non-FSQ objective
+    lab_label: Optional[torch.Tensor]   # [B, L, n_reserved] reserved-dim label targets; None unless FSQ label subspace on
 
 
 class _EmissionObjective:
     """Strategy for turning the seeded forward into emitted latents + the base emission loss. Default = FSQ
-    (token-native digit CE + folded STOP + cosine recon). `codebook` tells the free-run rollout which head to
-    use. Selected ONCE per run so the step loop has no emission `if`s."""
+    (token-native digit CE + folded STOP + cosine recon). Selected ONCE per run so the step loop has no
+    emission `if`s. `codebook` is a class flag the free-run rollout reads to pick which emission head to use
+    (True = FSQ digit head, False = a raw-vector head)."""
     codebook: bool = True
 
     def emit(self, se: dict[str, torch.Tensor], target_lat: torch.Tensor, valid: torch.Tensor,
              lens_l: list[int], bidx: list[int], b: int, lmax: int, ep: int) -> EmissionOut:
+        """Run the emission forward and its base loss for one step.
+
+        se:         tokenized seed batch (input_ids/attention_mask) already on device — the model reads this.
+        target_lat: [B, L, d] stop-grad target latents to reconstruct toward.
+        valid:      [B, L] bool mask of real (non-padding) emission slots.
+        lens_l:     per-row emitted-item count (len B).
+        bidx:       dataset row ids for this batch (len B) — for objectives that read per-row config.
+        b:          B, the batch row count (== target_lat.size(0)); passed explicitly to size new tensors.
+        lmax:       L, the padded emitted-item time dim.
+        ep:         current epoch index (drives e.g. scheduled-sampling warmup).
+        """
         raise NotImplementedError
 
 
@@ -468,20 +491,25 @@ class FSQObjective(_EmissionObjective):
 
 class _TargetSource:
     """Strategy for the TARGET latents the emission trains toward, plus any anti-collapse regularization.
-    Default = stop-grad EMA twin. `suppresses_nce` lets an alt source (e.g. a live-target + regularizer one)
-    turn the in-batch NCE off; `twin` is the model the eval block encodes its retrieval bank with; `regularizer`
-    contributes an extra anti-collapse loss (None by default). Selected ONCE per run."""
-    suppresses_nce: bool = False
-    twin: Optional[LangSetModel] = None
+    Default = stop-grad EMA twin. Selected ONCE per run."""
+
+    suppresses_nce: bool = False        # if True the trainer skips the in-batch NCE term (a live-target source that
+    #                                     already prevents collapse via `regularizer` doesn't need — and fights — it)
+    twin: Optional[LangSetModel] = None  # the model the EVAL block encodes its retrieval bank with (the EMA copy for the
+    #                                      default; the online model itself for a live-target source). Set by subclasses.
 
     def encode(self, texts: list[str]) -> torch.Tensor:
-        """Emit each text -> [N, d] normalized target latents (no grad for the EMA default)."""
+        """Emit each text -> [n, d] L2-normalized target latents (no grad for the EMA default). Used both for the
+        per-step targets and, via MultiStepCtx.target_source, for the hard-negative bank."""
         raise NotImplementedError
 
     def update(self) -> None:
-        """Post-optimizer-step update (EMA momentum step; no-op for a live/grad target)."""
+        """Called once AFTER each opt.step(). The EMA default nudges the twin toward the online weights; a
+        live-target source has nothing to track, so this is a no-op."""
 
     def regularizer(self, z_pred: torch.Tensor, z_tgt: torch.Tensor) -> Optional[torch.Tensor]:
+        """Optional extra anti-collapse loss on the emitted (`z_pred`) and target (`z_tgt`) latents, added to the
+        step loss. None for the EMA default (the stop-grad twin is what prevents collapse there)."""
         return None
 
 
