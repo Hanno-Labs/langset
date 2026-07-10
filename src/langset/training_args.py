@@ -148,6 +148,13 @@ class TrainingArguments:
     sigreg_knots: int = 17               # Epps-Pulley quadrature knots (>= 2)
     sigreg_slices: int = 256             # random 1-D projection directions, resampled each step (>= 1)
 
+    # Exp-B — CoT-conditioned emission. Activated by INJECTING the pair `loss_terms=build_cot_loss_terms` +
+    # `seed_builder=cot_seed_texts` (see the injection block below) with a `cot_text` dataset column: the model is
+    # co-trained to GENERATE each row's chain-of-thought (its own isolated backward, so the two autograd graphs never
+    # coexist) and the latent forward is conditioned on seed+CoT. No injection / absent cot_text column = OFF
+    # (byte-identical FSQ path). Not a flag — inject the strategies; this scalar just weights the CoT next-token CE.
+    lam_cot: float = 1.0                  # weight on the CoT next-token CE (used only with the CoT strategies)
+
     # ---- MULTI-LATENT STRATEGY INJECTION (dependency injection, not flags) --------------------------------------
     # The multi-latent step is assembled from swappable pieces (see langset/strategies.py). Each field below holds
     # the STRATEGY ITSELF — a class or callable — and the trainer just calls it; there is NO `if use_x:` selection.
