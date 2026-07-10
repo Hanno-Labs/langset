@@ -172,7 +172,6 @@ class TrainingArguments:
     # The defaults reproduce the historical behavior byte-for-byte (guarded by test_trainer_multi_characterization).
     # To change a behavior, INJECT a different implementation, e.g.
     #     TrainingArguments(target_source=SIGRegTarget)          # EMA-free anti-collapse
-    #     TrainingArguments(emission=ContinuousObjective)         # raw-vector emission instead of FSQ digits
     # rather than toggling a boolean the trainer then branches on. See strategies.py for the interface each must meet.
     emission: Callable = FSQObjective              # (model, args, dev, trainer) -> _EmissionObjective : seed->latents + base loss
     target_source: Callable = EMATwinTarget        # (model, args, tok, dev) -> _TargetSource : the target latents + anti-collapse

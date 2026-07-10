@@ -2,9 +2,10 @@
 
 **langset few-shot fine-tunes a pretrained LLM to *predict in latent space*.** Bolt a tiny head onto the
 backbone and it emits a *sequence* of latents in its own token stream — one per step, with a learned STOP —
-where each latent holds a **calibrated superposition** of possible next states. That is a JEPA world model, and
-the LLM **is** it: no separate world model bolted alongside, no pixel simulator, no new architecture. You get
-there few-shot, by describing the states in words.
+where each latent holds a **calibrated superposition** of possible next states. Language models and world
+models are usually posed as a choice between them; this is the other answer — the *same* pretrained LLM
+predicts its own latent futures, with **no new primitive** required. You get there few-shot, by describing the
+states in words.
 
 <p align="center">
   <img src="examples/maze-superposition/assets/maze-frontier.gif" alt="A trained langset world model flooding a maze: one latent per tick holding a set of frontier cells, with the model's P(solvable) readout firming up as the search advances." width="340">
@@ -21,19 +22,31 @@ is the world model.
 
 ## The idea
 
-**You describe what a latent should mean, in words — and that description *is* the geometry.** Point the target
-texts at the *next states* of a process and the model learns to **emit** them: given a state, predict the set of
-admissible futures, with its own uncertainty calibrated to how open the future is. You don't gather labels or
-hand-build a simulator — you write the states, and the LLM's world knowledge does the reading.
+Language models and world models are usually posed as a *choice*. It's a false binary — and underneath it is
+an architecture question: does moving from next-token prediction to **latent** prediction require a new
+primitive? It doesn't.
 
-* 🔮 **It predicts, in latent space.** Emit a *set-valued* latent future with calibrated uncertainty — the JEPA
-  property LeCun argues an LLM needs a *separate* world model for. Here the LLM does it itself.
-* 🧭 **You design the state-space in words.** The target text defines what the world model tracks; rewrite it to
-  re-steer the model — no architecture changes, no relabeling.
-* 🧠 **World knowledge does the reading.** A generative LLM generalizes from *hundreds* of examples, not
-  millions — it *reads* each state rather than pattern-matching surface tokens.
-* 🪞 **The LLM is the world model.** Latents live in the model's own hidden space and (FSQ) its own token
-  vocabulary, so text and latent prediction share one stream — not two networks.
+LeCun names what a language model lacks — an abstract latent variable, *discrete, low-capacity,
+collapse-resistant*. langset gives a pretrained model exactly that, **inside its own vocabulary**: a
+self-supervised JEPA latent emitted as **FSQ digit tokens through the ordinary softmax**, trained toward the
+model's *own* latent (kept from collapsing by a standard self-supervised mechanism) — no decoder, no target
+outside the model. Latents and text co-train under one next-token cross-entropy. **Quantize the latent, keep
+the token.**
+
+In practice you write the *states* of a process as `target_texts`, and the model learns to emit the set of
+admissible next states — no labels, no hand-built simulator. What that buys:
+
+* 🔎 **Readout, not acquisition.** The emitted latents *surface* world knowledge the pretrained model already
+  held. Scramble the vocabulary so the task keeps its dynamics but loses its meaning, and much of that knowledge
+  falls away with it — evidence the latents read it out of pretraining, not out of the task.
+* 🎲 **One latent, several futures.** A single emission can hold several live continuations at once — its
+  uncertainty rising with how many remain, dropping none of them. A *calibrated* superposition, read from the
+  digit softmax (see the [maze-superposition example](examples/maze-superposition)).
+* 💬 **Reason in words, then emit.** When holding those futures takes reasoning rather than perception, one
+  emission isn't enough on its own — but because the latent shares the stream, the model can reason in tokens
+  first, and that reasoning is what calibrates its uncertainty.
+* 🧭 **Steer with text.** The `target_text` defines what the latent tracks; rewrite it to re-steer — no
+  architecture changes, no relabeling.
 
 ## Install
 
@@ -120,35 +133,6 @@ standardized** — standardizing per-dim before the Gaussianity test is scale-in
 anti-collapse (a collapsed batch passes with zero gradient). SIGReg is research-grade; the EMA twin remains
 the validated default.
 
-### Continuous emission — `ContinuousObjective`
-
-By default multi-latent quantizes each emission to FSQ digits (a discrete token). The continuous path keeps
-the same variable-length, STOP-terminated, fed-back latent-set structure but emits a **raw continuous vector**
-(`out_proj`), trained by cosine to the target with a BCE STOP head instead of digit cross-entropy.
-
-Two pieces select it: the **model** is built with the continuous head (`continuous_emit=True` — a head-architecture
-property, chosen at `from_pretrained`), and the **trainer** is given the continuous emission strategy by *injecting*
-`emission=ContinuousObjective` (interchangeable with the default `FSQObjective`, see `strategies.py`):
-
-```python
-from langset.strategies import ContinuousObjective
-model = LangSetModel.from_pretrained("...", multi_latent=True, continuous_emit=True)
-Trainer(model, TrainingArguments(emission=ContinuousObjective), rows).train()
-```
-
-**Why:** a discrete argmax emission can only name *one* future, so when an input admits several plausible next
-latents the digit head can't represent the *mixture*. A continuous emission can settle at the **centroid of the
-admissible futures** — calibrated superposition, the one-to-many property that motivates Large Concept Models'
-diffusion-over-next-concept ([Meta LCM, arXiv:2412.08821](https://arxiv.org/abs/2412.08821)); it is also the
-regime the isotropic-Gaussian identifiability result assumes ([arXiv:2605.26379](https://arxiv.org/abs/2605.26379)),
-which a bounded discrete lattice does not satisfy.
-
-**Trade-offs:** you gain the ability to represent a calibrated distribution over futures, but you give up the
-token-native discreteness — emissions are no longer in-vocabulary digits sharing the softmax/CE machinery, and
-the FSQ grid no longer provides *free* anti-collapse, so lean on the EMA twin (or SIGReg) and watch the
-`distinct` diversity count. Use `ContinuousObjective` when the target is genuinely one-to-many; stay on the default
-FSQ when you want the discrete token interface (e.g. to co-train text and latents in one stream).
-
 ### CoT-conditioned emission — `build_cot_loss_terms` + `cot_seed_texts`
 
 By default the model emits latents straight from the input seed. Injecting the CoT strategy pair inserts a
@@ -207,8 +191,9 @@ Trainer(model, TrainingArguments(loss_terms=build_superposition_loss_terms,
 
 Without these injections the default strategies treat branches as independent items (byte-identical to the
 standard multi-latent path). Use them only when branches of one seed genuinely share a state and you want the
-emission to be a *distribution*, not a pick. This is the property a discrete FSQ argmax can only approximate as a
-mixture of codes; see also [`ContinuousObjective`](#continuous-emission--continuousobjective) for a raw-vector centroid.
+emission to be a *distribution*, not a pick. The calibrated superposition is read from the emitted digit
+*softmax* via `rollout(..., return_soft=True)` (entropy + expected latent), not the argmax — see the
+[maze-superposition example](examples/maze-superposition), where FSQ holds it (entropy tracks the branch count).
 
 Why `last_epoch_selector`: the default checkpoint selection (`retr_mrr`) rewards a *collapsed* one-future-per-seed
 geometry, which is exactly the wrong signal here — under superposition training you *want* retrieval MRR to fall

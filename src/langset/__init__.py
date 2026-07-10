@@ -11,4 +11,4 @@ from langset.training_args import TrainingArguments
 
 __all__ = ["LangSetModel", "EmitHead", "Trainer", "TrainingArguments",
            "calibration_corr", "linear_decodability"]
-__version__ = "0.10.0"
+__version__ = "0.11.0"

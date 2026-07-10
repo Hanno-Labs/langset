@@ -396,42 +396,6 @@ class FSQObjective(_EmissionObjective):
         return soft[valid], z_tgt
 
 
-class ContinuousObjective(_EmissionObjective):
-    """Raw continuous-vector emission — INJECT via `TrainingArguments(emission=ContinuousObjective)`. Emit via
-    out_proj, cosine to the target, STOP as a BCE on stop_proj. No FSQ digits, so `dim_lg`/`lab_label` are None
-    and the FSQ-only aux terms (label subspace) self-skip. The emitted latent can settle at the CENTROID of several
-    admissible futures (calibrated superposition) — the mixture a discrete FSQ argmax cannot represent. REQUIRES the
-    model built with `continuous_emit=True` (the head architecture is a MODEL property, chosen at from_pretrained)."""
-    codebook = False
-
-    def __init__(self, model: LangSetModel, args: TrainingArguments, dev: torch.device, trainer: Trainer) -> None:
-        super().__init__(model, args, dev, trainer)
-        # fail fast: the continuous forward (rollout_train_continuous) needs the continuous head; without it the user
-        # would hit a low-signal AssertionError deep in the rollout. Point them at the from_pretrained flag instead.
-        if not (getattr(model.head, "multi_latent", False) and getattr(model.head, "continuous_emit", False)):
-            raise ValueError(
-                "emission=ContinuousObjective requires a model built with multi_latent=True and continuous_emit=True; "
-                "pass LangSetModel.from_pretrained(..., multi_latent=True, continuous_emit=True).")
-
-    def emit(self, se: dict[str, torch.Tensor], target_lat: torch.Tensor, valid: torch.Tensor,
-             lens_l: list[int], bidx: list[int], b: int, lmax: int, ep: int) -> EmissionOut:
-        m, dev = self.m, self.dev
-        preds, stop_lg = m.rollout_train_continuous(
-            se["input_ids"], se["attention_mask"], target_lat)       # [b, lmax+1, d], [b, lmax+1]
-        recon = preds[:, :lmax]                                      # emitted continuous latents (gradient flows here)
-        stop_lab = torch.zeros(b, lmax + 1, device=dev)
-        stop_msk = torch.zeros(b, lmax + 1, dtype=torch.bool, device=dev)
-        for r, nl in enumerate(lens_l):
-            stop_msk[r, :nl + 1] = True                              # supervise positions 0..nl (STOP at nl); rest ignore
-            stop_lab[r, nl] = 1.0
-        loss_stop = F.binary_cross_entropy_with_logits(stop_lg[stop_msk], stop_lab[stop_msk])
-        recon_loss = (1.0 - F.cosine_similarity(recon[valid], target_lat[valid], dim=-1)).mean()
-        loss_dims = recon_loss.new_zeros(())                        # no FSQ digit CE in continuous mode (logged as 0)
-        return EmissionOut(recon=recon, base_loss=loss_stop + recon_loss,
-                           logs={"loss_stop": loss_stop, "loss_dims": loss_dims, "recon_loss": recon_loss},
-                           dim_lg=None, lab_label=None)
-
-
 # ---- target source ------------------------------------------------------------------------------
 class _TargetSource:
     """Strategy for the TARGET latents the emission trains toward, plus any anti-collapse regularization.
