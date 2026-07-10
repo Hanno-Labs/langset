@@ -112,6 +112,23 @@ def identical_text_mask(c: MultiStepCtx, fn_mask: torch.Tensor) -> None:
                         fn_mask[aa, bb] = True
 
 
+def same_seed_mask(c: MultiStepCtx, fn_mask: torch.Tensor) -> None:
+    """SUPERPOSITION negative-mask (an extra masker — inject via build_superposition_loss_terms): also MUTATES
+    `fn_mask` in place so the alternative futures of ONE seed aren't negatives of each other — then the emitted
+    latent can settle at their centroid (the mixture) instead of being pushed apart. Seed per emission = its row's
+    input_text, repeated lens_l[r] times to stay aligned with recon[valid]."""
+    seed_flat = [c.trainer.input_text[k] for r, k in enumerate(c.bidx) for _ in range(c.lens_l[r])]
+    grp: dict[str, list[int]] = {}
+    for ii, sd in enumerate(seed_flat):
+        grp.setdefault(sd, []).append(ii)
+    for mem in grp.values():
+        if len(mem) > 1:
+            for aa in mem:
+                for bb in mem:
+                    if aa != bb:
+                        fn_mask[aa, bb] = True
+
+
 class MultiNCETerm(_LossTerm):
     """IN-BATCH-NEGATIVE InfoNCE: each emitted recon vs the batch's EMA targets, own target = positive, others
     = negatives, minus the `maskers`' false-negatives. On by default (lam_multi_nce). Ported from the
@@ -259,6 +276,20 @@ def build_cot_loss_terms(args: TrainingArguments) -> list[_LossTerm]:
     `seed_builder=cot_seed_texts`). The DEFAULT terms plus CoTGenTerm (isolated-backward), so the model is
     co-trained to generate the row's reasoning while it emits the latents. Needs a `cot_text` dataset column."""
     return [*build_loss_terms(args), CoTGenTerm()]
+
+
+def build_superposition_loss_terms(args: TrainingArguments) -> list[_LossTerm]:
+    """SUPERPOSITION loss set — INJECT via `TrainingArguments(loss_terms=build_superposition_loss_terms)`. Same as
+    the default, but the in-batch InfoNCE also gets `same_seed_mask`, so two branches of ONE seed aren't pushed
+    apart and the emitted latent can settle at their mixture. Pair with `epoch_order=grouped_epoch_order` (branches
+    contiguous) and `selector=last_epoch_selector` (retr_mrr is meant to fall here, so it must not gate selection)."""
+    return [
+        LabelDimsTerm(),
+        MultiNCETerm(maskers=[identical_text_mask, same_seed_mask]),
+        HardNegTerm(),
+        SupConTerm(),
+        PhaseTerm(),
+    ]
 
 
 # ---- emission objective -------------------------------------------------------------------------
@@ -495,10 +526,32 @@ def multi_epoch_order(tr_idx: list[int], rng_t: torch.Generator, args: TrainingA
     return torch.randperm(len(tr_idx), generator=rng_t).tolist()
 
 
+def grouped_epoch_order(tr_idx: list[int], rng_t: torch.Generator, args: TrainingArguments,
+                        seeds: list[str]) -> list[int]:
+    """SUPERPOSITION epoch ordering — INJECT via `TrainingArguments(epoch_order=grouped_epoch_order)`. Keeps a
+    seed's branches CONTIGUOUS (shuffle the seed GROUPS, not the positions) so all of one seed's futures land in
+    the same batch -> their per-target digit-CE sums to a soft-CE toward the branch mixture P_mix, a clean per-seed
+    uncertainty signal instead of branches scattered across batches. Pair with build_superposition_loss_terms."""
+    grp: dict[str, list[int]] = {}
+    for pos in range(len(tr_idx)):
+        grp.setdefault(seeds[tr_idx[pos]], []).append(pos)
+    gkeys = list(grp.keys())
+    gperm = torch.randperm(len(gkeys), generator=rng_t).tolist()
+    return [pos for gi in gperm for pos in grp[gkeys[gi]]]
+
+
 def multi_select_metric(mode: str, mrr: float, pur: float, ep: int) -> float:
     """DEFAULT checkpoint-selection signal from the epoch's metrics. retr_mrr (default) / purity / blend. Inject
     a different `selector` to change it (e.g. one that keeps the last epoch)."""
     return pur if mode == "purity" else (mrr + pur) if mode == "blend" else mrr
+
+
+def last_epoch_selector(mode: str, mrr: float, pur: float, ep: int) -> float:
+    """SUPERPOSITION selector — INJECT via `TrainingArguments(selector=last_epoch_selector)`. No early-stop signal;
+    keeps the LAST epoch (returns float(ep)). Under superposition training retr_mrr selects for a collapsed
+    one-future-per-seed geometry — exactly the wrong target when you WANT the latent to spread over a seed's
+    alternative futures, so retr_mrr is meant to fall and must not gate selection."""
+    return float(ep)
 
 
 def multi_seed_texts(trainer: Trainer, seeds: list[str], args: TrainingArguments) -> list[str]:

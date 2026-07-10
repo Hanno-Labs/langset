@@ -892,6 +892,14 @@ class Trainer:
                     self.on_checkpoint()
                 if a.verbose:
                     print(f"        <- best {a.select}={best:.3f}, saved to {a.output_dir}", flush=True)
+            if getattr(a, "snapshot_every", 0) and ep % a.snapshot_every == 0:   # per-epoch ONLINE-weights snapshot
+                snap = f"{a.output_dir}_ep{ep}"                     # (not the best-restore) — keep a trajectory to eval later
+                Path(snap).mkdir(parents=True, exist_ok=True)
+                m.save_pretrained(snap)
+                if self.on_checkpoint is not None:
+                    self.on_checkpoint()
+                if a.verbose:
+                    print(f"        <- snapshot ep{ep} -> {snap}", flush=True)
             save_resume(ep + 1)          # epoch boundary: durable full-state checkpoint so a preempt resumes HERE, not ep0
 
         if best_state is not None:                                  # restore best into memory (matches single-latent)
