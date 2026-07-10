@@ -473,9 +473,11 @@ class Trainer:
         _gstep = 0
         _mem_n = int(_os.environ.get("LANGSET_MEM_PRINT", "0"))        # diagnostic: print MEASURED VRAM peak for first N steps
         _mem_step = 0
+        _cuda = torch.cuda.is_available()                             # profile whatever device is present (CPU-only is valid)
         if _prof_n > 0:
             from torch.profiler import ProfilerActivity as _PA, profile as _tp_profile
-            _prof = _tp_profile(activities=[_PA.CPU, _PA.CUDA], record_shapes=False, with_stack=False)
+            _acts = [_PA.CPU] + ([_PA.CUDA] if _cuda else [])          # no CUDA activity on a CPU box
+            _prof = _tp_profile(activities=_acts, record_shapes=False, with_stack=False)
             _prof.__enter__()
             _prof_t0 = _time.perf_counter()
             print(f"[PROFILE] capturing {_prof_n} single-latent steps (bs={a.batch_size} ml={a.max_len} "
@@ -543,13 +545,15 @@ class Trainer:
                     _mem_step += 1
 
                 if _prof is not None:                              # profiling: sync for honest timing, dump + EXIT at N
-                    torch.cuda.synchronize()
+                    if _cuda:
+                        torch.cuda.synchronize()                   # only meaningful (and only valid) with a CUDA device
                     _gstep += 1
                     if _gstep >= _prof_n:
                         _wall = _time.perf_counter() - _prof_t0
                         _prof.__exit__(None, None, None)
                         print(f"[PROFILE] SUMMARY {_prof_n} steps: wall={_wall:.1f}s = {_wall / _prof_n:.3f}s/step", flush=True)
-                        print(_prof.key_averages().table(sort_by="cuda_time_total", row_limit=25), flush=True)
+                        _sort = "cuda_time_total" if _cuda else "cpu_time_total"   # cuda_time column is absent on CPU
+                        print(_prof.key_averages().table(sort_by=_sort, row_limit=25), flush=True)
                         import sys as _sys
                         _sys.exit(0)
 
