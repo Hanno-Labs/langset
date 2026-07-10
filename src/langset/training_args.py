@@ -139,6 +139,14 @@ class TrainingArguments:
     # (e.g. future-event strings) are already < 64 so a higher cap only enriches the long ones (mild padding cost).
     target_max_len: int = 64
 
+    # SIGReg (LeJEPA, arXiv:2511.08544) scalar knobs — used only when the target source is SIGRegTarget (inject via
+    # `TrainingArguments(target_source=SIGRegTarget)`, see the injection block below). SIGRegTarget replaces the EMA
+    # twin with a LIVE encoder + an isotropic-Gaussian penalty on the pre-quant z; these tune that penalty. Inert
+    # under the default EMATwinTarget. See langset/sigreg.py.
+    sigreg_lambda: float = 1.0            # weight on the SIGReg isotropic-Gaussian loss (~0.3 balances vs recon)
+    sigreg_knots: int = 17               # Epps-Pulley quadrature knots
+    sigreg_slices: int = 256             # random 1-D projection directions (resampled each step)
+
     # ---- MULTI-LATENT STRATEGY INJECTION (dependency injection, not flags) --------------------------------------
     # The multi-latent step is assembled from swappable pieces (see langset/strategies.py). Each field below holds
     # the STRATEGY ITSELF — a class or callable — and the trainer just calls it; there is NO `if use_x:` selection.

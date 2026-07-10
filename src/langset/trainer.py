@@ -800,6 +800,11 @@ class Trainer:
                         _k, _raw, _w = contrib
                         loss = loss + _w * _raw
                         agg[_k] = agg.get(_k, 0.0) + float(_raw.detach())
+                if target_source.wants_regularizer and int(valid.sum()) > 1:   # e.g. SIGReg anti-collapse penalty
+                    z_pred, z_tgt = objective.z_for_reg(em, target_lat, valid, lmax)
+                    loss_sig = target_source.regularizer(z_pred, z_tgt)
+                    loss = loss + a.sigreg_lambda * loss_sig
+                    agg["loss_sig"] = agg.get("loss_sig", 0.0) + float(loss_sig.detach())
                 opt.zero_grad()
                 with _rf("backward"):
                     loss.backward()

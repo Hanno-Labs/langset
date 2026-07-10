@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from langset.modeling import LangSetModel
+from langset.sigreg import SIGReg
 
 if TYPE_CHECKING:                                    # annotations only (from __future__ import annotations -> strings);
     from langset.trainer import Trainer              # avoids a runtime import cycle trainer <-> strategies
@@ -375,6 +376,34 @@ class EMATwinTarget(_TargetSource):
         with torch.no_grad():
             torch._foreach_mul_(self._ema, self.a.ema_m)
             torch._foreach_add_(self._ema, self._online, alpha=1.0 - self.a.ema_m)
+
+
+class SIGRegTarget(_TargetSource):
+    """EMA-free anti-collapse (LeJEPA, arXiv:2511.08544). INJECT via `TrainingArguments(target_source=SIGRegTarget)`.
+    Targets come from the LIVE model WITH gradient (no stop-grad twin); collapse is prevented by an isotropic-Gaussian
+    SIGReg penalty on the pre-quant z (via `regularizer`) instead of by a twin. So it drops the twin's VRAM + target
+    forward, the in-batch NCE is suppressed (the regularizer replaces it), and eval encodes with the live model itself.
+    Reads scalar knobs off args: sigreg_lambda (loss weight, applied in the trainer), sigreg_knots, sigreg_slices."""
+    suppresses_nce = True
+    wants_regularizer = True
+
+    def __init__(self, model: LangSetModel, args: TrainingArguments, tok: Any, dev: torch.device) -> None:
+        self.m, self.a, self.tok, self.dev = model, args, tok, dev
+        self.twin = model                                        # no separate twin — eval encodes with the live model
+        self.sig_reg = SIGReg(knots=args.sigreg_knots, slices=args.sigreg_slices).to(dev)
+
+    def encode(self, texts: list[str]) -> torch.Tensor:
+        # LIVE target WITH gradient (no no_grad, no twin): both the emitted and target latents move, and SIGReg —
+        # not a stop-grad twin — is what stops them collapsing together.
+        a, tok, dev = self.a, self.tok, self.dev
+        e = tok(texts, padding=True, truncation=True, max_length=a.target_max_len, return_tensors="pt").to(dev)
+        z = self.m(e["input_ids"], e["attention_mask"])
+        return F.normalize(z.float(), dim=-1)
+
+    def regularizer(self, z_pred: torch.Tensor, z_tgt: torch.Tensor) -> Optional[torch.Tensor]:
+        # Two INDEPENDENT Gaussianity penalties (predicted E[digit] and target z), NOT a match between them —
+        # each is pushed toward isotropic Gaussian, spreading codes across the FSQ grid.
+        return self.sig_reg(z_pred) + self.sig_reg(z_tgt)
 
 
 # ---- small function-strategies ------------------------------------------------------------------
