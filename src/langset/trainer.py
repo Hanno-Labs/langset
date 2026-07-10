@@ -393,6 +393,12 @@ def multi_select_metric(mode: str, mrr: float, pur: float, ep: int) -> float:
     return pur if mode == "purity" else (mrr + pur) if mode == "blend" else mrr
 
 
+def multi_seed_texts(trainer: Any, seeds: list[str], args: TrainingArguments) -> list[str]:
+    """The texts fed to the EMISSION forward — what the model reads before emitting its latents. Default = the
+    raw input seeds. (A CoT-conditioned variant appends each row's reasoning here; targets/eval keep raw seeds.)"""
+    return seeds
+
+
 @dataclass
 class EmissionOut:
     """What one emission forward produces: the emitted latents (grad flows), the base emission loss, per-term
@@ -881,6 +887,7 @@ class Trainer:
         rng = np.random.default_rng(a.seed)
 
         seeds = self.input_text
+        seed_texts = multi_seed_texts(self, seeds, a)            # what the emission forward reads (default: raw seeds)
         futs = [lst[:a.max_target_items] for lst in self.target_texts]   # cap targets per row
         if a.emit_seed:
             # PHASE-0 as an emitted node: prepend each seed's OWN text as target position 0, so the emitter learns to
@@ -1059,7 +1066,7 @@ class Trainer:
             agg = {"loss_stop": 0.0, "loss_dims": 0.0, "recon_loss": 0.0}
             for i in range(0, len(order), a.batch_size):
                 bidx = [tr_idx[k] for k in order[i:i + a.batch_size]]
-                se = tok([seeds[k] for k in bidx], padding=True, truncation=True, max_length=a.max_len,
+                se = tok([seed_texts[k] for k in bidx], padding=True, truncation=True, max_length=a.max_len,
                          padding_side="left", return_tensors="pt").to(dev)   # left-pad: hid[s_len-1] = last real token
                 ent_lists = [list(futs[k]) for k in bidx]
                 lmax = max(len(x) for x in ent_lists)
