@@ -80,6 +80,43 @@ def _dyn_trim(ids: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torc
     return ids[:, :n], mask[:, :n]
 
 
+# ---- text replay (rehearsal) — shared by the single- and multi-latent learn paths ---------------
+def _require_emit_rows(is_learn: list[bool], learn_field: Optional[str]) -> None:
+    """Text replay pulls `learn`-tagged rows OUT of the emit/latent split (they only rehearse text). If EVERY row
+    is tagged, that split is empty — training would silently no-op (no emit steps) or crash deep in eval. Fail
+    loudly and early instead."""
+    if is_learn and all(is_learn):
+        raise ValueError(
+            f"learn_field '{learn_field}' tagged all {len(is_learn)} rows as 'learn' — no rows left for the emit "
+            "objective. Leave some rows untagged: they carry the latent geometry; 'learn' rows only rehearse text.")
+
+
+def _tokenize_replay(tok: Any, texts: list[str], max_len: int, side: str, dev: torch.device
+                     ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Tokenize replay text with an EXPLICIT padding side. The doc (the conditioning context) MUST be left-padded
+    so every row's last real token lands in the final column — that's the position whose hidden predicts the first
+    target token in `_replay_ce`. The target is right-padded (its pad is masked out of the CE). Defaulting the side
+    (right-pad the doc) silently conditions the replay loss on padding for any row shorter than the batch max."""
+    e = tok(texts, padding=True, truncation=True, max_length=max_len, padding_side=side, return_tensors="pt")
+    return e["input_ids"].to(dev), e["attention_mask"].to(dev)
+
+
+def _replay_ce(model: LangSetModel, doc_ids: torch.Tensor, doc_mask: torch.Tensor,
+               tgt_ids: torch.Tensor, tgt_mask: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    """Teacher-forced next-token CE for a text-replay (rehearsal) row: condition on the doc, score CE on the target
+    tokens only, projected through the tied input embedding (no lm_head, no full-vocab OOM). REQUIRES the doc to be
+    left-padded (see `_tokenize_replay`) so column `sd-1` is the last REAL doc token for every row regardless of its
+    length; the target is right-padded and its pad positions are ignored. Shared by both learn paths."""
+    seq = torch.cat([doc_ids, tgt_ids], dim=1)
+    am = torch.cat([doc_mask, tgt_mask], dim=1)
+    hid = model._last_hidden(model._run_backbone(model.embed(seq), am, seq, 0))   # all real tokens -> real_start=0
+    sd = doc_ids.size(1)
+    ph = hid[:, sd - 1: sd - 1 + tgt_ids.size(1), :]                # the hidden that predicts each target token
+    lg = F.linear(ph.float(), model.embed.weight.float())          # [B, St, vocab] via the tied embedding
+    return F.cross_entropy(lg.reshape(-1, vocab_size),
+                           tgt_ids.masked_fill(tgt_mask == 0, -100).reshape(-1), ignore_index=-100)
+
+
 # ---- single-latent step engines -----------------------------------------------------------------
 # The real axis of the single-latent path is "where do pred/target/hard-neg features come from, and how is the
 # step run": the LIVE backbone (default) vs. FROZEN-POOL cached vectors (pool_mode="last" + frozen backbone). Both
@@ -309,6 +346,7 @@ class Trainer:
             if getattr(args, "learn_field", None) is not None and args.learn_ratio > 0:
                 raw = cols[inv.get(args.learn_field, args.learn_field)]
                 self.is_learn = [str(v).lower() == "learn" for v in raw]
+            _require_emit_rows(self.is_learn, args.learn_field)
             if args.verbose:
                 hn = "" if not self.hard_neg_texts else " (+hard-neg)"
                 sp = "" if not self.sup_labels else " (+supcon)"
@@ -335,6 +373,7 @@ class Trainer:
         if getattr(args, "learn_field", None) is not None and args.learn_ratio > 0:
             raw = cols[inv.get(args.learn_field, args.learn_field)]
             self.is_learn = [str(v).lower() == "learn" for v in raw]
+        _require_emit_rows(self.is_learn, args.learn_field)
         n_learn = sum(self.is_learn)
         if args.verbose:
             masked = "" if self.mask_keys is None else " (+false-neg mask)"
@@ -366,8 +405,10 @@ class Trainer:
         learn_pool = [i for i in range(len(self.input_text)) if self.is_learn[i]]
         ln_doc_ids = ln_doc_mask = ln_tgt_ids = ln_tgt_mask = None
         if learn_pool:
-            ln_doc_ids, ln_doc_mask = tok_to([self.input_text[i] for i in learn_pool], a.max_len)      # instruction+case
-            ln_tgt_ids, ln_tgt_mask = tok_to([self.target_text[i] for i in learn_pool], _LEARN_TGT)    # german substance
+            ln_doc_ids, ln_doc_mask = _tokenize_replay(tok, [self.input_text[i] for i in learn_pool],
+                                                       a.max_len, "left", dev)                          # doc LEFT-pad
+            ln_tgt_ids, ln_tgt_mask = _tokenize_replay(tok, [self.target_text[i] for i in learn_pool],
+                                                       _LEARN_TGT, "right", dev)                        # target RIGHT-pad
 
         n = len(self.input_text)
         embed_all = np.array([i for i in range(n) if not self.is_learn[i]])
@@ -398,19 +439,10 @@ class Trainer:
                                    ignore_index=-100)
 
         def learn_loss(pos: torch.Tensor) -> torch.Tensor:
-            # [LEARN] rows: teacher-forced causal LM. Condition on the case (instruction+case), CE ONLY on the German
-            # substance tokens -> forces the backbone's hidden states to REPRESENT the substance (builds the axis the
-            # probe found missing). Projection via the tied embedding on the target span only (no lm_head, no OOM).
-            di, dm = ln_doc_ids[pos], ln_doc_mask[pos]                       # type: ignore[index]
-            ti, tm = ln_tgt_ids[pos], ln_tgt_mask[pos]                       # type: ignore[index]
-            seq = torch.cat([di, ti], dim=1)
-            am = torch.cat([dm, tm], dim=1)
-            hid = m._last_hidden(m._run_backbone(m.embed(seq), am, seq, 0))  # all real tokens -> real_start=0
-            sd = di.size(1)
-            ph = hid[:, sd - 1: sd - 1 + ti.size(1), :]                     # hidden that predicts each target token
-            lg = F.linear(ph.float(), m.embed.weight.float())               # [B, St, vocab]
-            return F.cross_entropy(lg.reshape(-1, vsz), ti.masked_fill(tm == 0, -100).reshape(-1),
-                                   ignore_index=-100)
+            # [LEARN] rows: teacher-forced causal LM. Condition on the LEFT-padded case, CE ONLY on the substance
+            # tokens -> forces the backbone's hidden states to REPRESENT the substance (builds the axis the probe
+            # found missing). Shared _replay_ce (tied-embedding projection on the target span only, no lm_head/OOM).
+            return _replay_ce(m, ln_doc_ids[pos], ln_doc_mask[pos], ln_tgt_ids[pos], ln_tgt_mask[pos], vsz)
 
         opt = torch.optim.AdamW([p for p in m.parameters() if p.requires_grad] + list(connector.parameters()),
                                 lr=a.lr)
@@ -826,24 +858,15 @@ class Trainer:
         ln_doc_ids = ln_doc_mask = ln_tgt_ids = ln_tgt_mask = None
         vsz = m.vocab_size
 
-        def _tokm(texts: list[str], mx: int) -> tuple[torch.Tensor, torch.Tensor]:
-            e = tok(texts, padding=True, truncation=True, max_length=mx, return_tensors="pt")
-            return e["input_ids"].to(dev), e["attention_mask"].to(dev)
-
         if learn_pool:
-            ln_doc_ids, ln_doc_mask = _tokm([seeds[i] for i in learn_pool], a.max_len)
-            ln_tgt_ids, ln_tgt_mask = _tokm([(self.target_texts[i][0] if self.target_texts[i] else " ")
-                                             for i in learn_pool], _LEARN_TGT)
+            ln_doc_ids, ln_doc_mask = _tokenize_replay(tok, [seeds[i] for i in learn_pool],
+                                                       a.max_len, "left", dev)                          # doc LEFT-pad
+            ln_tgt_ids, ln_tgt_mask = _tokenize_replay(
+                tok, [(self.target_texts[i][0] if self.target_texts[i] else " ") for i in learn_pool],
+                _LEARN_TGT, "right", dev)                                                               # target RIGHT-pad
 
-        def learn_loss(pos: torch.Tensor) -> torch.Tensor:
-            di, dm = ln_doc_ids[pos], ln_doc_mask[pos]
-            ti, tm = ln_tgt_ids[pos], ln_tgt_mask[pos]
-            seq = torch.cat([di, ti], dim=1); am = torch.cat([dm, tm], dim=1)
-            hid = m._last_hidden(m._run_backbone(m.embed(seq), am, seq, 0))
-            sd = di.size(1)
-            ph = hid[:, sd - 1: sd - 1 + ti.size(1), :]                     # hidden that predicts each target token
-            lg = F.linear(ph.float(), m.embed.weight.float())
-            return F.cross_entropy(lg.reshape(-1, vsz), ti.masked_fill(tm == 0, -100).reshape(-1), ignore_index=-100)
+        def learn_loss(pos: torch.Tensor) -> torch.Tensor:                  # shared teacher-forced replay CE
+            return _replay_ce(m, ln_doc_ids[pos], ln_doc_mask[pos], ln_tgt_ids[pos], ln_tgt_mask[pos], vsz)
 
         for ep in range(start_ep, a.epochs):
             m.train()
