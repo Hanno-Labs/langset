@@ -476,19 +476,21 @@ class LangSetModel(nn.Module):
                 hid = self._last_hidden(self._run_backbone(torch.cat([seq, q], 1), am_q,
                                                            enc["input_ids"], 0))[:, -1]   # [B, h] PLE-safe
                 z = self.head(hid.unsqueeze(1)).squeeze(1)                   # [B, d] emit via out_proj
-                cols.append(torch.where(alive.unsqueeze(1), z, torch.zeros_like(z)))
-                if return_soft:                                             # continuous/out_proj emission IS the soft
-                    soft_cols.append(torch.where(alive.unsqueeze(1), z, torch.zeros_like(z)))  # readout; entropy undefined
-                    ent_cols.append(torch.zeros(b, device=dev))                                # -> 0
-                lengths = lengths + alive.long()
-                if self.head.multi_latent and self.head.continuous_emit:    # trained STOP head (continuous multi-latent)
-                    assert self.head.stop_proj is not None
-                    stop = self.head.stop_proj(hid.float()).squeeze(-1) > stop_threshold
+                if self.head.multi_latent and self.head.continuous_emit:    # trained STOP head (continuous multi-latent):
+                    assert self.head.stop_proj is not None                  # CHECK-then-emit (matches training's terminal
+                    stop = self.head.stop_proj(hid.float()).squeeze(-1) > stop_threshold   # STOP position + the FSQ branch),
+                    emit_now = alive & ~stop                                # so a STOP position emits NOTHING (no off-by-one)
                 else:
-                    stop = self.head.stop_logit(hid, self.embed) > stop_threshold  # emit-then-check: the hidden that emitted
-                seq = torch.cat([seq, self.head.feedback(z).unsqueeze(1).to(seq.dtype)], 1)  # this latent also carries
-                am = torch.cat([am, alive.long().unsqueeze(1)], 1)         # its natural-EOS logit (aligns with the last-
-                alive = alive & ~stop                                      # position EOS label in rollout_train)
+                    stop = self.head.stop_logit(hid, self.embed) > stop_threshold  # single-latent: emit-then-check on the
+                    emit_now = alive                                        # natural-EOS logit of the hidden that emitted
+                cols.append(torch.where(emit_now.unsqueeze(1), z, torch.zeros_like(z)))
+                if return_soft:                                             # continuous/out_proj emission IS the soft
+                    soft_cols.append(torch.where(emit_now.unsqueeze(1), z, torch.zeros_like(z)))  # readout; entropy undefined
+                    ent_cols.append(torch.zeros(b, device=dev))                                # -> 0
+                lengths = lengths + emit_now.long()
+                seq = torch.cat([seq, self.head.feedback(z).unsqueeze(1).to(seq.dtype)], 1)  # feed back the emitted latent
+                am = torch.cat([am, emit_now.long().unsqueeze(1)], 1)      # mask stopped/dead positions out of attention
+                alive = alive & ~stop
             if not bool(alive.any()):
                 break
         if was_training:

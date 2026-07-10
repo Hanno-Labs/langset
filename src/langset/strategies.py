@@ -328,6 +328,15 @@ class ContinuousObjective(_EmissionObjective):
     model built with `continuous_emit=True` (the head architecture is a MODEL property, chosen at from_pretrained)."""
     codebook = False
 
+    def __init__(self, model: LangSetModel, args: TrainingArguments, dev: torch.device, trainer: Trainer) -> None:
+        super().__init__(model, args, dev, trainer)
+        # fail fast: the continuous forward (rollout_train_continuous) needs the continuous head; without it the user
+        # would hit a low-signal AssertionError deep in the rollout. Point them at the from_pretrained flag instead.
+        if not (getattr(model.head, "multi_latent", False) and getattr(model.head, "continuous_emit", False)):
+            raise ValueError(
+                "emission=ContinuousObjective requires a model built with multi_latent=True and continuous_emit=True; "
+                "pass LangSetModel.from_pretrained(..., multi_latent=True, continuous_emit=True).")
+
     def emit(self, se: dict[str, torch.Tensor], target_lat: torch.Tensor, valid: torch.Tensor,
              lens_l: list[int], bidx: list[int], b: int, lmax: int, ep: int) -> EmissionOut:
         m, dev = self.m, self.dev
