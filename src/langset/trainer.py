@@ -8,6 +8,7 @@ defines where it should land). Pass a `datasets.Dataset` or `list[dict]`; use `c
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional, cast
 
@@ -223,6 +224,174 @@ class FrozenPoolStepEngine(_StepEngine):
             emit_in = self.m.head_project(self.feat_in[vi].float()).cpu().numpy()
             emit_tg = self.m.head_project(self.feat_tg[vi].float()).cpu().numpy()
         return emit_in, emit_tg
+
+
+# ---- multi-latent step seams --------------------------------------------------------------------
+# Same idea as the single-latent step engines above, for `_train_multi`. The multi-latent step has a base
+# objective (FSQ emission + STOP + cosine recon) plus a set of SEPARATION / shaping terms, each historically an
+# `if a.lam_x > 0:` block inline in the epoch loop. Instead the loop selects its strategies ONCE (below) and
+# then just iterates them, so a new behavior is a new strategy object, not another `if` in the hot loop.
+# Each default reproduces the historical inline block BYTE-FOR-BYTE (guarded by tests/test_trainer_multi_*).
+
+@dataclass
+class MultiStepCtx:
+    """Everything a multi-latent aux loss term reads for one step. Assembled once per step after the emission
+    forward; terms pull what they need and return their contribution (or None to skip)."""
+    trainer: Any                    # the Trainer (for self.sup_labels / hard_neg_texts / label_plan+cols+codewords)
+    args: Any
+    model: Any
+    dev: Any
+    bidx: list
+    lens_l: list
+    flat_texts: list
+    valid: torch.Tensor
+    target_lat: torch.Tensor
+    recon: torch.Tensor
+    dim_lg: Optional[torch.Tensor]      # FSQ per-dim digit logits (None for a non-FSQ objective)
+    lmax: int
+    fsq_levels: int
+    lab_label: Optional[torch.Tensor]   # reserved-dim label targets (None unless FSQ label subspace active)
+    emit_texts: Callable[..., torch.Tensor]   # (texts, model) -> normalized target latents (no grad)
+    ema_model: Any
+    phase_head: Optional[Any]
+    phase_ids: dict
+
+
+class _LossTerm:
+    """Strategy for one weighted, optional term added on top of the base emission loss. `contribute` returns
+    (agg_key, raw_unweighted_loss, weight) or None to skip — the loop applies `loss += weight * raw` and logs
+    `raw` under agg_key, exactly as the historical inline block did."""
+    key: str = ""
+
+    def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
+        raise NotImplementedError
+
+
+def identical_text_mask(c: MultiStepCtx, fn_mask: torch.Tensor) -> None:
+    """Default NCE negative-mask: two emissions with IDENTICAL target text share the same true geometry, so
+    they are not negatives of each other (mirrors the single-latent mask_keys path)."""
+    grp: dict[str, list[int]] = {}
+    for ii, tx in enumerate(c.flat_texts):               # flat_texts is row-major aligned with recon[valid]
+        grp.setdefault(tx, []).append(ii)
+    for mem in grp.values():
+        if len(mem) > 1:
+            for aa in mem:
+                for bb in mem:
+                    if aa != bb:
+                        fn_mask[aa, bb] = True
+
+
+class MultiNCETerm(_LossTerm):
+    """IN-BATCH-NEGATIVE InfoNCE: each emitted recon vs the batch's EMA targets, own target = positive, others
+    = negatives, minus the `maskers`' false-negatives. On by default (lam_multi_nce). Ported from the
+    single-latent self-contrastive loss."""
+    key = "loss_multi_nce"
+
+    def __init__(self, maskers: list[Callable[[MultiStepCtx, torch.Tensor], None]]) -> None:
+        self.maskers = maskers
+
+    def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
+        a = c.args
+        if not (a.lam_multi_nce > 0 and int(c.valid.sum()) > 1):
+            return None
+        rvn = F.normalize(c.recon[c.valid], dim=-1)          # [N, d] emitted (gradient flows here)
+        tvn = F.normalize(c.target_lat[c.valid], dim=-1)     # [N, d] EMA targets (already stop-grad)
+        nce_logits = (rvn @ tvn.t()) / a.tau                 # [N, N] query x key cosine / temp
+        n_nce = rvn.size(0)
+        fn_mask = torch.zeros(n_nce, n_nce, dtype=torch.bool, device=c.dev)
+        for masker in self.maskers:
+            masker(c, fn_mask)
+        nce_logits = nce_logits.masked_fill(fn_mask, float("-inf"))   # diagonal (positive) never masked
+        loss_nce = F.cross_entropy(nce_logits, torch.arange(n_nce, device=c.dev))
+        return (self.key, loss_nce, a.lam_multi_nce)
+
+
+class HardNegTerm(_LossTerm):
+    """Each emitted recon: own EMA target (positive) vs a shared bank of the batch's mined hard-negative texts."""
+    key = "loss_hard_neg"
+
+    def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
+        a, self_ = c.args, c.trainer
+        if self_.hard_neg_texts is None or a.lam_hard_neg <= 0:
+            return None
+        hn_flat = [t for k in c.bidx for t in self_.hard_neg_texts[k]]
+        if not hn_flat:
+            return None
+        hn_bank = c.emit_texts(hn_flat, c.ema_model)         # [Nhn, d] stop-grad normalized hard-neg latents
+        rv = F.normalize(c.recon[c.valid], dim=-1)           # [Nvalid, d] emitted reconstructions
+        pos = (rv * c.target_lat[c.valid]).sum(-1, keepdim=True)   # [Nvalid, 1] cos to own target
+        neg = rv @ hn_bank.t()                               # [Nvalid, Nhn] cos to every hard neg
+        logits_hn = torch.cat([pos, neg], dim=1) / a.tau
+        loss_hn = F.cross_entropy(logits_hn, torch.zeros(logits_hn.size(0), dtype=torch.long, device=c.dev))
+        return (self.key, loss_hn, a.lam_hard_neg)
+
+
+class SupConTerm(_LossTerm):
+    """Supervised-contrastive shaping over emitted latents by the per-item `sup_field` group labels."""
+    key = "loss_sup"
+
+    def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
+        a, self_ = c.args, c.trainer
+        if self_.sup_labels is None or a.lam_sup <= 0:
+            return None
+        sup_flat = [(self_.sup_labels[k][j] if j < len(self_.sup_labels[k]) else "unknown")
+                    for r, k in enumerate(c.bidx) for j in range(c.lens_l[r])]
+        loss_sup = supcon_loss(c.recon[c.valid], sup_flat, a.sup_tau)   # pull same-stage, push different-stage
+        return (self.key, loss_sup, a.lam_sup)
+
+
+class PhaseTerm(_LossTerm):
+    """CE phase classifier on the emitted reconstruction (non-collapsing SupCon alternative)."""
+    key = "loss_phase"
+
+    def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
+        a, self_ = c.args, c.trainer
+        if c.phase_head is None:
+            return None
+        pf = [(self_.sup_labels[k][j] if j < len(self_.sup_labels[k]) else "")
+              for r, k in enumerate(c.bidx) for j in range(c.lens_l[r])]
+        pid = torch.tensor([c.phase_ids.get(x, -100) for x in pf], device=c.dev)
+        loss_phase = F.cross_entropy(c.phase_head(c.recon[c.valid]), pid, ignore_index=-100)
+        return (self.key, loss_phase, a.lam_phase)
+
+
+class LabelDimsTerm(_LossTerm):
+    """FSQ LABEL SUBSPACE: full-strength CE on the reserved digit dims so the label lives AS coordinates of the
+    emitted code. FSQ-only (reads dim_lg); skipped when the objective produces no digit logits or no label plan."""
+    key = "loss_label"
+
+    def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
+        a, self_ = c.args, c.trainer
+        if c.lab_label is None or c.dim_lg is None or a.lam_label_dims <= 0:
+            return None
+        rcols = [cj for (cj, _, _) in self_.label_plan]
+        lab_lg = c.dim_lg[:, :c.lmax, 1:, :][:, :, rcols, :]     # [b, lmax, n_reserved, fsq_levels]
+        loss_label = F.cross_entropy(lab_lg.reshape(-1, c.fsq_levels), c.lab_label.reshape(-1), ignore_index=-100)
+        return (self.key, loss_label, a.lam_label_dims)
+
+
+def build_loss_terms(args: TrainingArguments) -> list[_LossTerm]:
+    """Select the active aux terms ONCE from the args. Order is fixed (matches the historical inline sequence:
+    label -> multi_nce -> hard_neg -> sup -> phase) so the float summation is byte-identical; each term self-skips
+    when its weight/column is absent, so 'default' = exactly today's behavior."""
+    return [
+        LabelDimsTerm(),
+        MultiNCETerm(maskers=[identical_text_mask]),
+        HardNegTerm(),
+        SupConTerm(),
+        PhaseTerm(),
+    ]
+
+
+def multi_epoch_order(tr_idx: list[int], rng_t: torch.Generator, args: TrainingArguments,
+                      seeds: list[str]) -> list[int]:
+    """Default epoch ordering: a plain shuffle of the training positions."""
+    return torch.randperm(len(tr_idx), generator=rng_t).tolist()
+
+
+def multi_select_metric(mode: str, mrr: float, pur: float, ep: int) -> float:
+    """Default checkpoint-selection signal from the epoch's metrics. retr_mrr (default) / purity / blend."""
+    return pur if mode == "purity" else (mrr + pur) if mode == "blend" else mrr
 
 
 class Trainer:
@@ -782,9 +951,11 @@ class Trainer:
 
         def _rf(name: str) -> Any:                             # named phase range when profiling, no-op otherwise
             return _rfn(name) if _prof is not None else _nullctx()
+
+        loss_terms = build_loss_terms(a)                       # aux separation/shaping terms, selected ONCE (see seams)
         for ep in range(start_ep, a.epochs):
             m.train()
-            order = torch.randperm(len(tr_idx), generator=rng_t).tolist()
+            order = multi_epoch_order(tr_idx, rng_t, a, seeds)
             if a.max_steps_per_epoch:                          # SMALL epochs: cap steps so each <= ~30min (natural save pt)
                 order = order[:a.max_steps_per_epoch * a.batch_size]
             tot = 0.0
@@ -839,64 +1010,17 @@ class Trainer:
                                             lab_rest.reshape(-1), ignore_index=-100)
                 recon_loss = (1.0 - F.cosine_similarity(recon[valid], target_lat[valid], dim=-1)).mean()
                 loss = loss_stop + loss_dims + recon_loss           # base objective (recon-only) + separation below
-                if lab_label is not None and a.lam_label_dims > 0:  # FSQ LABEL SUBSPACE: full-strength reserved-dim CE
-                    rcols = [cj for (cj, _, _) in self.label_plan]
-                    lab_lg = dim_lg[:, :lmax, 1:, :][:, :, rcols, :]     # [b, lmax, n_reserved, fsq_levels]
-                    loss_label = F.cross_entropy(lab_lg.reshape(-1, fsq_levels), lab_label.reshape(-1), ignore_index=-100)
-                    loss = loss + a.lam_label_dims * loss_label
-                    agg["loss_label"] = agg.get("loss_label", 0.0) + float(loss_label.detach())
-                if a.lam_multi_nce > 0 and int(valid.sum()) > 1:
-                    # IN-BATCH-NEGATIVE InfoNCE — the separation term the multi-latent path was missing (ported from
-                    # the single-latent self-contrastive loss). Each emitted recon vs the batch's EMA targets: own
-                    # target = positive (diagonal), all OTHER items = in-batch negatives -> pushes DIFFERENT events
-                    # apart so the geometry separates rather than just reproducing codes. Identical target text (same
-                    # true geometry) is masked as a false-negative, mirroring the single-latent mask_keys path.
-                    rvn = F.normalize(recon[valid], dim=-1)          # [N, d] emitted (gradient flows here)
-                    tvn = F.normalize(target_lat[valid], dim=-1)     # [N, d] EMA targets (already stop-grad)
-                    nce_logits = (rvn @ tvn.t()) / a.tau             # [N, N] query x key cosine / temp
-                    n_nce = rvn.size(0)
-                    fn_mask = torch.zeros(n_nce, n_nce, dtype=torch.bool, device=dev)
-                    grp: dict[str, list[int]] = {}
-                    for ii, tx in enumerate(flat_texts):             # flat_texts is row-major aligned with recon[valid]
-                        grp.setdefault(tx, []).append(ii)
-                    for mem in grp.values():                         # identical target text -> not a negative of itself
-                        if len(mem) > 1:
-                            for aa in mem:
-                                for bb in mem:
-                                    if aa != bb:
-                                        fn_mask[aa, bb] = True
-                    nce_logits = nce_logits.masked_fill(fn_mask, float("-inf"))   # diagonal (positive) never masked
-                    loss_nce = F.cross_entropy(nce_logits, torch.arange(n_nce, device=dev))
-                    loss = loss + a.lam_multi_nce * loss_nce
-                    agg["loss_multi_nce"] = agg.get("loss_multi_nce", 0.0) + float(loss_nce.detach())
-                if self.hard_neg_texts is not None and a.lam_hard_neg > 0:
-                    hn_flat = [t for k in bidx for t in self.hard_neg_texts[k]]
-                    if hn_flat:                                     # each emitted recon: own EMA target vs a shared bank
-                        hn_bank = emit_texts(hn_flat, ema_model)    # [Nhn, d] stop-grad normalized hard-neg latents
-                        rv = F.normalize(recon[valid], dim=-1)      # [Nvalid, d] emitted reconstructions
-                        pos = (rv * target_lat[valid]).sum(-1, keepdim=True)   # [Nvalid, 1] cos to own target
-                        neg = rv @ hn_bank.t()                      # [Nvalid, Nhn] cos to every hard neg
-                        logits_hn = torch.cat([pos, neg], dim=1) / a.tau
-                        loss_hn = F.cross_entropy(
-                            logits_hn, torch.zeros(logits_hn.size(0), dtype=torch.long, device=dev))
-                        loss = loss + a.lam_hard_neg * loss_hn
-                        agg["loss_hard_neg"] = agg.get("loss_hard_neg", 0.0) + float(loss_hn.detach())
-                if self.sup_labels is not None and a.lam_sup > 0:
-                    # per-item group labels flattened in the SAME row-major order as recon[valid] (row r, items 0..nl)
-                    sup_flat = [(self.sup_labels[k][j] if j < len(self.sup_labels[k]) else "unknown")
-                                for r, k in enumerate(bidx) for j in range(lens_l[r])]
-                    loss_sup = supcon_loss(recon[valid], sup_flat, a.sup_tau)   # pull same-stage, push different-stage
-                    loss = loss + a.lam_sup * loss_sup
-                    agg["loss_sup"] = agg.get("loss_sup", 0.0) + float(loss_sup.detach())
-                if phase_head is not None:
-                    # CE phase classifier on the emitted reconstruction (non-collapsing SupCon alternative). Same
-                    # row-major order as recon[valid]; labels not in phase_ids -> ignored (-100).
-                    pf = [(self.sup_labels[k][j] if j < len(self.sup_labels[k]) else "")
-                          for r, k in enumerate(bidx) for j in range(lens_l[r])]
-                    pid = torch.tensor([phase_ids.get(x, -100) for x in pf], device=dev)
-                    loss_phase = F.cross_entropy(phase_head(recon[valid]), pid, ignore_index=-100)
-                    loss = loss + a.lam_phase * loss_phase
-                    agg["loss_phase"] = agg.get("loss_phase", 0.0) + float(loss_phase.detach())
+                c = MultiStepCtx(                                    # everything the aux terms read this step
+                    trainer=self, args=a, model=m, dev=dev, bidx=bidx, lens_l=lens_l, flat_texts=flat_texts,
+                    valid=valid, target_lat=target_lat, recon=recon, dim_lg=dim_lg, lmax=lmax,
+                    fsq_levels=fsq_levels, lab_label=lab_label, emit_texts=emit_texts, ema_model=ema_model,
+                    phase_head=phase_head, phase_ids=phase_ids)
+                for term in loss_terms:                             # aux separation/shaping terms (fixed order; each self-skips)
+                    contrib = term.contribute(c)
+                    if contrib is not None:
+                        _k, _raw, _w = contrib
+                        loss = loss + _w * _raw
+                        agg[_k] = agg.get(_k, 0.0) + float(_raw.detach())
                 opt.zero_grad()
                 with _rf("backward"):
                     loss.backward()
@@ -942,7 +1066,7 @@ class Trainer:
             metrics = evaluate()
             row = {"loss": tot / max(nb, 1), **{kk: vv / max(nb, 1) for kk, vv in agg.items()}}
             mrr, pur = metrics["retr_mrr"], metrics.get("purity", 0.0)
-            sel = pur if a.select == "purity" else (mrr + pur) if a.select == "blend" else mrr
+            sel = multi_select_metric(a.select, mrr, pur, ep)
             if a.verbose:
                 hn_s = f" hn={row['loss_hard_neg']:.3f}" if "loss_hard_neg" in row else ""
                 sup_s = f" sup={row['loss_sup']:.3f}" if "loss_sup" in row else ""
