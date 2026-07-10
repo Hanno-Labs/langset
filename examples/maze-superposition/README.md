@@ -4,6 +4,14 @@ Most langset examples emit a latent that names **one** thing. This one trains a 
 emitted latent holds a **superposition** — a calibrated *set* of possible next states — and shows that the
 model knows *how many* possibilities there are.
 
+<p align="center">
+  <img src="assets/maze-frontier.gif" alt="A trained langset world model flooding a maze — one latent per tick, the caption shows how many branches that single latent is holding; lime outline = ground-truth frontier, glow = the model's P(solvable)." width="360">
+</p>
+
+*One frame per tick of a trained 135M model rolling out a maze. The caption is the payload: **one latent, holding
+N branches** — the lime cells are the ground-truth frontier that single emitted latent has to represent at once,
+and the glow is the model's own P(solvable) readout firming up as the flood advances.*
+
 The task is a maze search. A parallel breadth-first flood spreads out from `S`; at each tick the **frontier**
 is the set of cells the wavefront currently occupies. langset emits **one latent per tick**, and that tick's
 target describes the *whole frontier set*. So a single latent has to represent several cells at once — the
@@ -49,6 +57,7 @@ below.
 | `selector=last_epoch_selector` | retrieval MRR rewards a **collapsed** one-cell-per-tick geometry — exactly the wrong signal here (it's *meant to fall* as the latent spreads over the set), so keep the last epoch instead of early-stopping on it |
 | `rollout(..., return_soft=True)` | at eval, read the **expected** latent and its per-dim **entropy** — the model's native uncertainty — instead of the argmax |
 | `target_source=SIGRegTarget` *(optional, `--sigreg`)* | EMA-free anti-collapse (LeJEPA) instead of the stop-grad twin — see [`langset/sigreg.py`](../../src/langset/sigreg.py) |
+| `langset.probes` | the world-model property tests themselves — `calibration_corr` (entropy ↔ frontier size) and `linear_decodability` (probe the emitted latent), reused by `eval.py` so this signal isn't maze-only |
 
 Nothing here is a flag on a monolith — each is a strategy injected into `TrainingArguments`. See
 [`train.py`](train.py).
@@ -56,7 +65,7 @@ Nothing here is a flag on a monolith — each is a strategy injected into `Train
 ### Run it
 
 ```bash
-pip install "langset" scipy scikit-learn        # eval uses scipy + sklearn probes
+pip install "langset[probes]"                    # eval uses langset.probes (pulls in scipy + sklearn)
 
 python gen_maze.py build 4000 maze.npz          # training corpus (mixed sizes, ~55% solvable)
 python train.py --data maze.npz --out maze_model --wandb
@@ -77,17 +86,19 @@ python eval.py --data maze_eval.npz --ckpt /tmp/m --device cpu --max-steps 8
 
 ### What you should see
 
-`eval.py` reports the headline calibration signal:
+`eval.py` reports the headline calibration signal (via `langset.probes.calibration_corr`):
 
 ```json
-"B_calibration": { "corr_entropy_nbranch": 0.35, "count_acc": ..., "count_mae": ... }
+"B_calibration": { "corr_entropy_nbranch": 0.35, "count_decodability": { "bal_acc": ..., "baseline_majority": ... } }
 ```
 
 **`corr(entropy, nbranch) > 0`** is the result: the emitted latent's FSQ entropy rises with the frontier size,
 so the single latent carries a *calibrated* superposition rather than one guess. On a real 135M run (SmolLM2,
 30 epochs) this lands around **+0.34–0.39** (EMA twin / SIGReg), with frontier recall staying flat across branch
-counts `k=1..5` — the opposite of discretization collapse. It's already visible in the CPU smoke above
-(`corr ≈ 0.35` even from a tiny random backbone).
+counts `k=1..5` — the opposite of discretization collapse.
 
-The second probe, `A_solvability` (can the emitted trajectory separate solvable from unsolvable mazes), needs
-the real backbone and full training to clear its majority-class baseline — the tiny smoke leaves it at chance.
+The CPU smoke above is a **plumbing check, not a result**: on an untrained tiny-random backbone the true
+correlation is ~0, so the reported `corr` is noise and its sign flips run to run (you'll see anything from
+`-0.25` to `+0.35`). It confirms gen → train → probe runs end-to-end; the calibration signal itself only shows
+up with the real backbone and full training. The same goes for `A_solvability` — at chance until the model is
+actually trained.

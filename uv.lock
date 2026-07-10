@@ -740,7 +740,7 @@ wheels = [
 
 [[package]]
 name = "langset"
-version = "0.8.0"
+version = "0.9.1"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },
@@ -757,6 +757,18 @@ dependencies = [
 dev = [
     { name = "pytest" },
     { name = "ruff" },
+    { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scikit-learn", version = "1.9.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
+probes = [
+    { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scikit-learn", version = "1.9.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 setfit = [
     { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -776,7 +788,11 @@ requires-dist = [
     { name = "peft", specifier = ">=0.13.2" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "ruff", marker = "extra == 'dev'" },
+    { name = "scikit-learn", marker = "extra == 'dev'" },
+    { name = "scikit-learn", marker = "extra == 'probes'" },
     { name = "scikit-learn", marker = "extra == 'setfit'" },
+    { name = "scipy", marker = "extra == 'dev'", specifier = ">=1.10" },
+    { name = "scipy", marker = "extra == 'probes'", specifier = ">=1.10" },
     { name = "sentence-transformers", specifier = ">=3.0" },
     { name = "setfit", marker = "extra == 'setfit'", specifier = ">=1.1.0" },
     { name = "torch", specifier = ">=2.2" },
@@ -785,7 +801,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'setfit'", specifier = ">=4.41,<4.47" },
     { name = "wandb", marker = "extra == 'wandb'", specifier = ">=0.18" },
 ]
-provides-extras = ["setfit", "wandb", "dev"]
+provides-extras = ["setfit", "wandb", "probes", "dev"]
 
 [[package]]
 name = "markupsafe"

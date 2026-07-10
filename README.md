@@ -1,12 +1,26 @@
-# langset — read text, answer in a vector
+# langset — fine-tune an LLM to work in latent space
 
-**langset turns a language model into your own bespoke embedding space, few-shot.** Bolt a tiny vector head
-onto a pretrained LLM, describe the axis you want in words, and it learns to *read text and emit a latent* into
-a geometry defined by those descriptions — using the LLM's world knowledge to do the reading. The latent lives
-in the model's own space (it's *your* embedding, not a re-projected off-the-shelf one), and it drops straight
-into SetFit as a Sentence-Transformer body.
+**langset few-shot fine-tunes a pretrained LLM to *read text and answer in a vector*.** Bolt a tiny head onto
+the backbone, describe the geometry you want in words, and the LLM's own world knowledge does the reading — the
+latent lives in the model's *own* hidden space, so it's your embedding, not a re-projection of an off-the-shelf
+one. One method, two things you can build with it:
 
-## The one idea
+* **single-latent → a bespoke embedding model.** One vector per input, in a geometry you define. Drops straight
+  into SetFit as a Sentence-Transformer body. *(This README's running example.)*
+* **multi-latent → a JEPA world model.** The LLM emits a *sequence* of latents in its own token stream — one per
+  step, with a learned STOP — and each latent holds a **calibrated superposition** of possible next states. It
+  *predicts in latent space*, which is the thing people say LLMs can't do without a separate world model. Here
+  the LLM **is** the world model. → **[examples/maze-superposition](examples/maze-superposition)**
+
+<p align="center">
+  <img src="examples/maze-superposition/assets/maze-frontier.gif" alt="A trained langset multi-latent world model flooding a maze: one latent per tick holding a set of frontier cells, with the model's P(solvable) readout firming up as the search advances." width="340">
+</p>
+
+<p align="center"><em>A trained multi-latent langset model as a world model — each tick is one emitted latent
+holding a whole <strong>set</strong> of next states (the lime frontier), the caption counting how many. See
+<a href="examples/maze-superposition">the superposition example</a>.</em></p>
+
+## The one idea (both modes)
 
 **The `target_text` *is* the geometry.** Whatever your target descriptions describe becomes the axis your
 latent space measures — and nothing else. Describe instrumentation and the space clusters by instrumentation;
@@ -130,7 +144,16 @@ neighbor against a bank, a downstream head, whatever).
 blurry point. Multi-latent keeps them separate — three latents, each retrievable on its own — and, unlike a
 fixed-slot head, it doesn't need you to know the count in advance.
 
-Where it fits:
+**The headline use case is a JEPA world model.** When the *set* is the set of possible **next states** — and
+each step's target literally is that set — a multi-latent model learns to emit a **calibrated superposition**:
+one latent that holds several admissible futures at once, with its own entropy tracking how open the future is.
+That's prediction in latent space (JEPA), done by the LLM itself rather than a separate world model bolted
+alongside it. The **[maze-superposition example](examples/maze-superposition)** trains and *measures* exactly
+this (with [`langset.probes`](src/langset/probes.py)); the anti-collapse machinery that makes it work — the
+[EMA target twin and SIGReg/LeJEPA](#anti-collapse-ema-twin-default-vs-sigreg-lejepa) — is the same JEPA
+apparatus described below.
+
+The other things a variable-length latent set is good for:
 
 * **Multi-item extraction** — entities, keyphrases, skills, ingredients: read a document, emit a latent per
   item, retrieve each against a reference bank. ([`examples/ner-multi-latent/`](examples/ner-multi-latent/)
