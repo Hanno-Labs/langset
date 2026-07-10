@@ -40,21 +40,24 @@ def test_last_epoch_selector_invariant_to_eval_every() -> None:
         f"skipped by the eval gate, so an earlier epoch is kept instead of the last")
 
 
-def test_superposition_triple_activates() -> None:
-    """Injecting the three superposition strategies changes training vs the default (grouped order + same_seed mask
-    + last-epoch selection are really wired in) and stays finite."""
-    from langset.strategies import build_superposition_loss_terms, grouped_epoch_order
-    base = M._build_model()
+def test_direct_superposition_smoke() -> None:
+    """The DIRECT way to teach superposition (what the maze example does): each target text describes the SET of
+    next states, trained with last_epoch_selector; read back with return_soft, whose per-latent entropy is the
+    calibrated-uncertainty readout. Verify it trains finite and exposes that entropy."""
+    model = M._build_model()
+    rows = [
+        {"input_text": "a fair coin is flipped", "target_texts": ["it lands heads or tails"]},
+        {"input_text": "a six-sided die is rolled", "target_texts": ["it shows one, two, three, four, five, or six"]},
+        {"input_text": "water at sea level is heated past its boiling point", "target_texts": ["it turns to steam"]},
+    ] * 3
     with tempfile.TemporaryDirectory() as td:
-        Trainer(base, M._args(td, verbose=False), M._dataset()).train()
-    base_p = M._flat_trainable(base)
-    sup = M._build_model()
-    with tempfile.TemporaryDirectory() as td:
-        Trainer(sup, M._args(td, verbose=False, loss_terms=build_superposition_loss_terms,
-                             epoch_order=grouped_epoch_order, selector=last_epoch_selector), M._dataset()).train()
-    sup_p = M._flat_trainable(sup)
-    assert np.isfinite(sup_p).all(), "superposition training went non-finite"
-    assert float(np.max(np.abs(sup_p - base_p))) > 1e-4, "superposition triple did not change training"
+        Trainer(model, M._args(td, epochs=2, verbose=False, selector=last_epoch_selector,
+                               sup_field=None, lam_sup=0.0, hard_neg_field=None, lam_hard_neg=0.0,
+                               label_dims=None, lam_label_dims=0.0), rows).train()
+    p = M._flat_trainable(model)
+    assert np.isfinite(p).all(), "direct-superposition training went non-finite"
+    lat, lengths, soft, ent = model.rollout("a six-sided die is rolled", return_soft=True)
+    assert ent.shape[0] == lat.shape[0], "return_soft must expose one entropy value per emitted latent"
 
 
 def test_snapshot_every_is_one_based() -> None:
@@ -73,7 +76,7 @@ if __name__ == "__main__":
     import torch
     torch.use_deterministic_algorithms(True, warn_only=True)
     for name in ("test_last_epoch_selector_invariant_to_eval_every",
-                 "test_superposition_triple_activates",
+                 "test_direct_superposition_smoke",
                  "test_snapshot_every_is_one_based"):
         try:
             globals()[name]()

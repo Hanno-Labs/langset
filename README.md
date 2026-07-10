@@ -168,39 +168,43 @@ CoT (self-generated reasoning helps even when the CoT text itself came from a st
 fair ceiling to compare against). Without the injected strategies (or with an absent `cot_text` column) the path
 is byte-identical to the plain FSQ emission — `CoTGenTerm` self-skips on empty reasoning.
 
-### Superposition — one seed, several alternative futures
+### Superposition — one latent, several futures
 
-When a single input seed admits **several alternative futures** — its `target_texts` are competing branches of
-*one* state, not disjoint items — the default in-batch objective pushes those branches apart, forcing the
-emitted latent to commit to one. Injecting the superposition strategy triple lets it instead represent the
-calibrated **mixture** over branches (its uncertainty), the token-space analogue of predicting a distribution
-over next states:
-
-| injected strategy | effect |
-|---|---|
-| `epoch_order=grouped_epoch_order` | orders each epoch so a seed's branches are **contiguous**, so they *tend to share a batch* (guaranteed only when `batch_size` ≥ the per-seed branch count and the groups align — contiguity alone doesn't stop a group straddling a batch boundary); when they do co-occur, their per-target digit-CE sums within the batch ≈ a soft cross-entropy toward the branch mixture `P_mix` |
-| `loss_terms=build_superposition_loss_terms` | adds `same_seed_mask` to the in-batch InfoNCE, treating two branches of the **same seed** as false-negatives (not pushed apart), so the emitted latent may settle at their **centroid** (the mixture) rather than being repelled from it |
-| `selector=last_epoch_selector` | keeps the **last epoch** instead of early-stopping on `retr_mrr` (see below) |
+To make one emitted latent hold a **calibrated superposition** — several possible next states at once, its
+uncertainty rising with how many are live — supervise it **directly**: write a target text that *describes the
+whole set of futures*. There's no special loss or batching trick — the set is in the target, so the single
+latent that matches it has to hold the set, and its per-step **entropy** (read via `rollout(..., return_soft=True)`)
+tracks how open the future is. The only knob is `selector=last_epoch_selector` — retrieval MRR is *meant* to fall
+as the latent spreads over the set, so it must not gate checkpoint selection.
 
 ```python
-from langset.strategies import build_superposition_loss_terms, grouped_epoch_order, last_epoch_selector
-Trainer(model, TrainingArguments(loss_terms=build_superposition_loss_terms,
-                                 epoch_order=grouped_epoch_order,
-                                 selector=last_epoch_selector), rows).train()
+from langset import LangSetModel, Trainer, TrainingArguments
+from langset.strategies import last_epoch_selector
+
+# one row per state; each target text names the SET of admissible next states — a wider set should read back hotter
+rows = [
+    {"input_text": "a fair coin is flipped",         "target_texts": ["it lands heads or tails"]},                    # 2 live
+    {"input_text": "a six-sided die is rolled",       "target_texts": ["it shows one, two, three, four, five, or six"]},# 6 live
+    {"input_text": "water at sea level reaches 100°C", "target_texts": ["it boils to steam"]},                         # 1 live
+    # ...many states, each target enumerating its own live next-states
+]
+model = LangSetModel.from_pretrained("HuggingFaceTB/SmolLM2-135M", multi_latent=True)
+Trainer(model, TrainingArguments(selector=last_epoch_selector), rows).train()
+
+# read the superposition back: entropy should rise with the number of live outcomes (die > coin > boil)
+_, _, soft, ent = model.rollout("a six-sided die is rolled", return_soft=True)   # soft = expected latent, ent = per-step entropy
 ```
 
-Without these injections the default strategies treat branches as independent items (byte-identical to the
-standard multi-latent path). Use them only when branches of one seed genuinely share a state and you want the
-emission to be a *distribution*, not a pick. The calibrated superposition is read from the emitted digit
-*softmax* via `rollout(..., return_soft=True)` (entropy + expected latent), not the argmax — see the
-[maze-superposition example](examples/maze-superposition), where FSQ holds it (entropy tracks the branch count).
+The same shape scales to a real world model: in **[examples/maze-superposition](examples/maze-superposition)**,
+each tick's target is the set of active search-frontier cells, and the emitted latent's entropy provably tracks
+the branch count (`corr(entropy, k) = +0.34–0.39`) — the example *measures* that calibration with
+[`langset.probes`](src/langset/probes.py).
 
-Why `last_epoch_selector`: the default checkpoint selection (`retr_mrr`) rewards a *collapsed* one-future-per-seed
-geometry, which is exactly the wrong signal here — under superposition training you *want* retrieval MRR to fall
-as the latent spreads over a seed's alternatives, so keep the last epoch rather than early-stopping on it. There
-is also a plain `snapshot_every=N` scalar knob that saves the online weights to `{output_dir}_ep{N}`,
+Why `last_epoch_selector`: the default checkpoint selection (`retr_mrr`) rewards a *collapsed* one-future-per-state
+geometry — exactly the wrong signal here, since you *want* retrieval MRR to fall as the latent spreads over the
+set. (There is also a plain `snapshot_every=N` knob that saves the online weights to `{output_dir}_ep{N}`,
 `{output_dir}_ep{2N}`, … after every N epochs — independent of the eval cadence, separate from the best-so-far
-restore — to keep a checkpoint trajectory for offline evaluation.
+restore — to keep a checkpoint trajectory for offline evaluation.)
 
 ### Text replay — `learn_field` / `learn_ratio`
 
