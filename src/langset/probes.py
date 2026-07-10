@@ -21,7 +21,7 @@ never requires them — `pip install "langset[probes]"` (or bring your own sklea
 """
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Iterable, Optional, Sequence
 
 import numpy as np
 
@@ -61,7 +61,8 @@ def calibration_corr(entropy: Sequence[float], cardinality: Sequence[int],
 
 
 def linear_decodability(latents: np.ndarray, labels: Sequence, groups: Sequence,
-                        test_frac: float = 0.4, seed: int = 0, balanced: bool = True) -> dict:
+                        test_frac: float = 0.4, seed: int = 0, balanced: bool = True,
+                        test_groups: Optional[Iterable] = None) -> dict:
     """Linear DECODABILITY of a per-emission label from the emitted latent, on a GROUP-DISJOINT split.
 
     latents   [N, d] emitted latents (the `lat`/`soft_lat` rows from `rollout`, one per emission).
@@ -70,27 +71,33 @@ def linear_decodability(latents: np.ndarray, labels: Sequence, groups: Sequence,
               trajectory appears on both sides — the number a probe reports is genuine generalisation, not leakage.
     test_frac fraction of GROUPS held out for test. seed fixes the group shuffle.
     balanced  fit the logistic probe with class_weight='balanced' (robust to skewed label frequencies).
+    test_groups pass an EXPLICIT set of held-out group ids to skip the internal shuffle — so this probe and
+              `calibration_corr` (or a second decodability probe) can share ONE identical cut instead of each
+              recomputing its own. `test_frac`/`seed` are ignored when given.
 
-    Returns {'acc', 'bal_acc', 'baseline_majority', 'n_train', 'n_test', 'n_classes'}. bal_acc is the mean
-    per-class recall — compare it to baseline_majority to see if the latent carries the label above chance."""
+    Returns {'acc', 'bal_acc', 'baseline_majority', 'n_train', 'n_test', 'n_classes'}, where `n_classes` is
+    always the number of DISTINCT labels in the full input (consistent across the early-return and normal paths).
+    bal_acc is the mean per-class recall — compare it to baseline_majority to see if the latent beats chance."""
     skl = _require("sklearn.linear_model", "scikit-learn")
     metrics = _require("sklearn.metrics", "scikit-learn")
     X = np.asarray(latents, dtype=float)
     y = np.asarray(labels)
     g = np.asarray(groups)
-    uniq = np.unique(g)
-    rng = np.random.default_rng(seed)
-    order = uniq.copy()
-    rng.shuffle(order)
-    n_test = max(1, int(round(len(order) * test_frac)))
-    test_g = set(order[:n_test].tolist())
+    n_classes = int(len(np.unique(y)))                     # always report classes from the FULL label vector
+    if test_groups is not None:
+        test_g = set(test_groups)                          # caller-supplied cut -> both probes stay comparable
+    else:
+        order = np.unique(g).copy()
+        np.random.default_rng(seed).shuffle(order)
+        n_test = max(1, int(round(len(order) * test_frac)))
+        test_g = set(order[:n_test].tolist())
     te = np.array([gi in test_g for gi in g], dtype=bool)
     tr = ~te
     if tr.sum() == 0 or te.sum() == 0 or len(np.unique(y[tr])) < 2:
         return {"acc": None, "bal_acc": None, "baseline_majority": None,
-                "n_train": int(tr.sum()), "n_test": int(te.sum()), "n_classes": int(len(np.unique(y)))}
+                "n_train": int(tr.sum()), "n_test": int(te.sum()), "n_classes": n_classes}
     yt = y[te]
-    vals, counts = np.unique(yt, return_counts=True)
+    _, counts = np.unique(yt, return_counts=True)
     baseline = float(counts.max() / counts.sum())          # majority-class accuracy on the test set
     clf = skl.LogisticRegression(max_iter=2000,
                                  class_weight="balanced" if balanced else None).fit(X[tr], y[tr])
@@ -98,4 +105,4 @@ def linear_decodability(latents: np.ndarray, labels: Sequence, groups: Sequence,
     return {"acc": round(float((pr == yt).mean()), 4),
             "bal_acc": round(float(metrics.balanced_accuracy_score(yt, pr)), 4),
             "baseline_majority": round(baseline, 4),
-            "n_train": int(tr.sum()), "n_test": int(te.sum()), "n_classes": int(len(vals))}
+            "n_train": int(tr.sum()), "n_test": int(te.sum()), "n_classes": n_classes}

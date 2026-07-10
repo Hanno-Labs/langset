@@ -70,13 +70,14 @@ def main():
     solv_terminal = linear_decodability(Xt, maze_y, gm, test_frac=0.4)
     solv_mean = linear_decodability(Xm, maze_y, gm, test_frac=0.4)
 
-    # ---- (B) CALIBRATION: corr(entropy, count) + count decodability, both maze-disjoint on the SAME test split -
-    # reuse the solvability probe's held-out mazes so calibration and decodability report on one consistent cut.
+    # ---- (B) CALIBRATION: corr(entropy, count) + count decodability, on ONE shared maze-disjoint cut ----------
+    # derive the split from the TICK groups (the exact universe both per-tick probes see) and hand the SAME
+    # held-out set to each, so corr_entropy_nbranch and count_decodability are always comparable.
     Xk = np.stack(tick_lat); ka = np.array(tick_k); gk = np.array(tick_gid)
-    rng = np.random.default_rng(0); order = np.unique(gm).copy(); rng.shuffle(order)
+    order = np.unique(gk).copy(); np.random.default_rng(0).shuffle(order)
     test_g = set(order[:max(1, int(round(len(order) * 0.4)))].tolist())
     corr = calibration_corr(tick_ent, ka, groups=gk, test_groups=test_g)
-    count = linear_decodability(Xk, ka, gk, test_frac=0.4)
+    count = linear_decodability(Xk, ka, gk, test_groups=test_g)
 
     out = {
         "ckpt": a.ckpt, "n_maze": n_maze, "n_tick": len(tick_k),
