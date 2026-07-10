@@ -24,3 +24,7 @@ langset-ner*/
 .ruff_cache/
 .pytest_cache/
 .ipynb_checkpoints/
+
+# local scratch / prototype (never commit or ship)
+src_proto/
+dist/

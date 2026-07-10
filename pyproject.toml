@@ -30,3 +30,8 @@ dev = ["pytest", "ruff", "scikit-learn", "scipy>=1.10"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/langset"]
+
+[tool.hatch.build.targets.sdist]
+# src_proto/ is untracked scratch/prototype code — never ship it to PyPI (the wheel already
+# only packages src/langset; this keeps the sdist from sweeping the scratch dir in).
+exclude = ["/src_proto"]
