@@ -461,6 +461,26 @@ class Trainer:
                                         recon_loss, self.input_text, self.target_text)
         engine.precompute()          # no-op for the backbone; frozen-pool encodes+caches every view here
 
+        # OPTIONAL step-level diagnostics (env-gated, OFF by default = byte-identical). Mirrors the multi-latent path's
+        # profiler harness for the single-latent trainer: LANGSET_PROFILE_STEPS=N captures a torch profiler over the
+        # first N steps then dumps a CUDA-time table and EXITS; LANGSET_MEM_PRINT=N prints the MEASURED VRAM peak for
+        # the first N steps (for right-sizing batch/seq-len instead of guessing at OOMs).
+        import os as _os
+        import time as _time
+        _prof_n = int(_os.environ.get("LANGSET_PROFILE_STEPS", "0"))   # diagnostic: profile N single-latent steps then EXIT
+        _prof = None
+        _prof_t0 = 0.0
+        _gstep = 0
+        _mem_n = int(_os.environ.get("LANGSET_MEM_PRINT", "0"))        # diagnostic: print MEASURED VRAM peak for first N steps
+        _mem_step = 0
+        if _prof_n > 0:
+            from torch.profiler import ProfilerActivity as _PA, profile as _tp_profile
+            _prof = _tp_profile(activities=[_PA.CPU, _PA.CUDA], record_shapes=False, with_stack=False)
+            _prof.__enter__()
+            _prof_t0 = _time.perf_counter()
+            print(f"[PROFILE] capturing {_prof_n} single-latent steps (bs={a.batch_size} ml={a.max_len} "
+                  f"grad_ckpt={getattr(m, '_grad_ckpt', '?')} attn={getattr(m, '_attn_impl', '?')}) then exiting ...", flush=True)
+
         for ep in range(start_ep, a.epochs):
             m.train()
             order = tr_idx[rng.permutation(len(tr_idx))]
@@ -512,6 +532,26 @@ class Trainer:
                     loss = loss + a.lam_uniform * sq.mul(-2.0).exp().mean().log()
                 opt.zero_grad(); loss.backward(); opt.step()
                 tot += float(loss.detach()); nb += 1
+
+                if _mem_n and _mem_step < _mem_n and torch.cuda.is_available():   # MEASURED peak (not an estimate)
+                    torch.cuda.synchronize()
+                    _peak = torch.cuda.max_memory_allocated() / 2 ** 30
+                    _cur = torch.cuda.memory_allocated() / 2 ** 30
+                    print(f"[MEM] step {_mem_step}: peak={_peak:.1f}GiB current={_cur:.1f}GiB "
+                          f"(bs={a.batch_size} ml={a.max_len} lora_top_k={getattr(m, '_lora_top_k', '?')} "
+                          f"grad_ckpt={getattr(m, '_grad_ckpt', '?')} sgt={a.stop_grad_target})", flush=True)
+                    _mem_step += 1
+
+                if _prof is not None:                              # profiling: sync for honest timing, dump + EXIT at N
+                    torch.cuda.synchronize()
+                    _gstep += 1
+                    if _gstep >= _prof_n:
+                        _wall = _time.perf_counter() - _prof_t0
+                        _prof.__exit__(None, None, None)
+                        print(f"[PROFILE] SUMMARY {_prof_n} steps: wall={_wall:.1f}s = {_wall / _prof_n:.3f}s/step", flush=True)
+                        print(_prof.key_averages().table(sort_by="cuda_time_total", row_limit=25), flush=True)
+                        import sys as _sys
+                        _sys.exit(0)
 
             if ep % a.eval_every:
                 continue
