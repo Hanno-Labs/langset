@@ -210,6 +210,35 @@ standardized** — standardizing per-dim before the Gaussianity test is scale-in
 anti-collapse (a collapsed batch passes with zero gradient). SIGReg is research-grade; the EMA twin remains
 the validated default.
 
+### Continuous emission — `ContinuousObjective`
+
+By default multi-latent quantizes each emission to FSQ digits (a discrete token). The continuous path keeps
+the same variable-length, STOP-terminated, fed-back latent-set structure but emits a **raw continuous vector**
+(`out_proj`), trained by cosine to the target with a BCE STOP head instead of digit cross-entropy.
+
+Two pieces select it: the **model** is built with the continuous head (`continuous_emit=True` — a head-architecture
+property, chosen at `from_pretrained`), and the **trainer** is given the continuous emission strategy by *injecting*
+`emission=ContinuousObjective` (interchangeable with the default `FSQObjective`, see `strategies.py`):
+
+```python
+from langset.strategies import ContinuousObjective
+model = LangSetModel.from_pretrained("...", multi_latent=True, continuous_emit=True)
+Trainer(model, TrainingArguments(emission=ContinuousObjective), rows).train()
+```
+
+**Why:** a discrete argmax emission can only name *one* future, so when an input admits several plausible next
+latents the digit head can't represent the *mixture*. A continuous emission can settle at the **centroid of the
+admissible futures** — calibrated superposition, the one-to-many property that motivates Large Concept Models'
+diffusion-over-next-concept ([Meta LCM, arXiv:2412.08821](https://arxiv.org/abs/2412.08821)); it is also the
+regime the isotropic-Gaussian identifiability result assumes ([arXiv:2605.26379](https://arxiv.org/abs/2605.26379)),
+which a bounded discrete lattice does not satisfy.
+
+**Trade-offs:** you gain the ability to represent a calibrated distribution over futures, but you give up the
+token-native discreteness — emissions are no longer in-vocabulary digits sharing the softmax/CE machinery, and
+the FSQ grid no longer provides *free* anti-collapse, so lean on the EMA twin (or SIGReg) and watch the
+`distinct` diversity count. Use `ContinuousObjective` when the target is genuinely one-to-many; stay on the default
+FSQ when you want the discrete token interface (e.g. to co-train text and latents in one stream).
+
 ## Status
 
 v0.4 — **multi-latent is now first-class in `Trainer`** (`{input_text, target_texts: [...]}` rows), plus sdpa

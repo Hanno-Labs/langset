@@ -34,7 +34,7 @@ class EmitHead(nn.Module):
 
     def __init__(self, h: int, d: int, n_latents: int = 1, dropout: float = 0.0, eos_id: int = 0,
                  multi_latent: bool = False, fsq_dim: int = 128, fsq_levels: int = 8,
-                 fsq_emit: bool = False) -> None:
+                 fsq_emit: bool = False, continuous_emit: bool = False) -> None:
         super().__init__()
         self.n_latents = n_latents
         self.q = nn.Parameter(torch.randn(n_latents, h) * 0.02)   # one query token per emitted latent
@@ -48,6 +48,12 @@ class EmitHead(nn.Module):
         # rewrites, letting injected knowledge reach the retrieval vector. Trainer routing stays on multi_latent (off).
         # Default False => byte-identical: forward() uses out_proj and the FSQ projections match `multi_latent` alone.
         self.fsq_emit = fsq_emit
+        # continuous_emit: MULTI-LATENT but each emission is a raw CONTINUOUS vector (out_proj) trained by cosine to the
+        # target — NOT quantized to FSQ digits. The token-native AR structure (variable-length latent set + trained STOP
+        # head) is retained, but FSQ discretization is dropped, so an emitted latent can sit at the CENTROID of several
+        # admissible futures (calibrated superposition) instead of snapping to one grid cell. STOP moves from the dim-0
+        # softmax to a plain BCE on stop_proj. Default False => byte-identical FSQ path. Requires multi_latent.
+        self.continuous_emit = continuous_emit
         self.fsq_dim, self.fsq_levels = fsq_dim, fsq_levels
         _mk_fsq = multi_latent or fsq_emit
         self.down_proj = nn.Linear(d, fsq_dim) if _mk_fsq else None             # d -> FSQ bottleneck (learned)
@@ -212,7 +218,7 @@ class LangSetModel(nn.Module):
     def __init__(self, backbone: Any, tokenizer: Any, latent_dim: int, n_latents: int,
                  llm_model: str, dropout: float = 0.0, max_len: int = 512,
                  multi_latent: bool = False, fsq_dim: int = 128, fsq_levels: int = 8,
-                 fsq_emit: bool = False, pool_mode: str = "") -> None:
+                 fsq_emit: bool = False, pool_mode: str = "", continuous_emit: bool = False) -> None:
         super().__init__()
         self.backbone = backbone
         self.tokenizer = tokenizer
@@ -233,10 +239,11 @@ class LangSetModel(nn.Module):
         self.multi_latent = multi_latent
         self.fsq_dim = fsq_dim
         self.fsq_levels = fsq_levels
+        self.continuous_emit = continuous_emit
         eos_id = int(tokenizer.eos_token_id or 0)
         self.head = EmitHead(self.h, latent_dim, n_latents, dropout, eos_id=eos_id,
                              multi_latent=multi_latent, fsq_dim=fsq_dim, fsq_levels=fsq_levels,
-                             fsq_emit=fsq_emit)
+                             fsq_emit=fsq_emit, continuous_emit=continuous_emit)
         self.llm_model = llm_model
         self.max_len = max_len
         self._lora_top_k = 0                                      # overwritten by from_pretrained; persisted in config
@@ -255,7 +262,7 @@ class LangSetModel(nn.Module):
                         device: Optional[str] = None, attn_implementation: str = "sdpa",
                         train_base: bool = False, grad_ckpt: bool = False,
                         lora_top_k: int = 0, fsq_emit: bool = False, pool_mode: str = "",
-                        freeze_backbone: bool = False) -> "LangSetModel":
+                        freeze_backbone: bool = False, continuous_emit: bool = False) -> "LangSetModel":
         from transformers import AutoTokenizer  # type: ignore[import-untyped]
         dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
         tok = AutoTokenizer.from_pretrained(llm_model)
@@ -266,7 +273,8 @@ class LangSetModel(nn.Module):
         if latent_dim is None:                                   # default: emit in the backbone's own hidden space
             latent_dim = _cfg_int(backbone.config, "hidden_size")
         model = cls(backbone, tok, latent_dim, n_latents, llm_model, dropout, max_len,
-                    multi_latent, fsq_dim, fsq_levels, fsq_emit=fsq_emit, pool_mode=pool_mode)
+                    multi_latent, fsq_dim, fsq_levels, fsq_emit=fsq_emit, pool_mode=pool_mode,
+                    continuous_emit=continuous_emit)
         model._lora_top_k = int(lora_top_k)                      # persisted in config so load() rebuilds same adapters
         if pool_mode == "last":                      # WARM-START the pool head at the base's NATIVE embedding: identity
             torch.nn.init.eye_(model.head.out_proj.weight)   # out_proj -> head_project == normalize(last-token hidden) ==
@@ -409,7 +417,9 @@ class LangSetModel(nn.Module):
         single = isinstance(text, str)
         texts = [text] if single else list(text)
         dev = self.device
-        codebook = self.head.multi_latent                                   # token-native (multi-latent) FSQ path
+        # token-native (multi-latent) FSQ path. continuous_emit keeps the multi-latent AR loop but emits raw vectors
+        # (out_proj) with a stop_proj terminator -> falls to the continuous else-branch below, not the FSQ branch.
+        codebook = self.head.multi_latent and not self.head.continuous_emit
         stop_idx = self.head.fsq_levels if codebook else -1                 # STOP is the extra class in dim-0's softmax
         pad_side = "left" if codebook else self.tokenizer.padding_side      # left-pad so [:, -1] is the last real token
         enc = self.tokenizer(texts, padding=True, truncation=True, max_length=self.max_len,
@@ -471,7 +481,11 @@ class LangSetModel(nn.Module):
                     soft_cols.append(torch.where(alive.unsqueeze(1), z, torch.zeros_like(z)))  # readout; entropy undefined
                     ent_cols.append(torch.zeros(b, device=dev))                                # -> 0
                 lengths = lengths + alive.long()
-                stop = self.head.stop_logit(hid, self.embed) > stop_threshold  # emit-then-check: the hidden that emitted
+                if self.head.multi_latent and self.head.continuous_emit:    # trained STOP head (continuous multi-latent)
+                    assert self.head.stop_proj is not None
+                    stop = self.head.stop_proj(hid.float()).squeeze(-1) > stop_threshold
+                else:
+                    stop = self.head.stop_logit(hid, self.embed) > stop_threshold  # emit-then-check: the hidden that emitted
                 seq = torch.cat([seq, self.head.feedback(z).unsqueeze(1).to(seq.dtype)], 1)  # this latent also carries
                 am = torch.cat([am, alive.long().unsqueeze(1)], 1)         # its natural-EOS logit (aligns with the last-
                 alive = alive & ~stop                                      # position EOS label in rollout_train)
@@ -581,6 +595,29 @@ class LangSetModel(nn.Module):
         stop_lg = torch.cat(stop_parts + [sl_rest], 1) if stop_parts else sl_rest  # [B, n+1, 1]
         return dim_lg, stop_lg, digits, recon
 
+    def rollout_train_continuous(self, input_ids: torch.Tensor, attention_mask: torch.Tensor,
+                                 target_latents: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Token-native AR pass (multi-latent, CONTINUOUS emission). Same variable-length latent-set structure as
+        `rollout_train_codebook`, but the emitter predicts a RAW continuous vector per position (out_proj) instead of
+        FSQ digits, and STOP is a plain logit from `stop_proj` (not folded into a dim-0 softmax). The TRUE (unquantized)
+        target latents are fed back teacher-forced. Predicts at each of L+1 positions (0..L-1 emissions, then a STOP at
+        position L). Returns (preds [B, L+1, d] normalized continuous emissions, stop_lg [B, L+1] STOP logits). The
+        trainer supervises preds[:, :L] with cosine-to-target (+InfoNCE) and stop_lg with BCE — a continuous latent can
+        settle at the CENTROID of several admissible futures, which discrete FSQ argmax cannot represent."""
+        assert self.head.multi_latent and self.head.continuous_emit
+        bsz, s_len = input_ids.size(0), input_ids.size(1)
+        n = target_latents.size(1)
+        seed = self.embed(input_ids)                                        # [B, S, h]
+        fb = self.head.feedback(target_latents.to(seed.dtype))              # [B, L, h] — TRUE latents fed back (no FSQ)
+        seq = torch.cat([seed, fb], 1)
+        am = torch.cat([attention_mask, attention_mask.new_ones(bsz, n)], 1)
+        hid = self._last_hidden(self._run_backbone(seq, am, input_ids, 0))   # PLE-safe teacher-forced read
+        hf = hid[:, s_len - 1: s_len - 1 + n + 1]                           # [B, L+1, h] — +1 to predict the STOP
+        preds = self.head(hf)                                              # [B, L+1, d] continuous via out_proj (normed)
+        assert self.head.stop_proj is not None
+        stop = self.head.stop_proj(hf.float()).squeeze(-1)                  # [B, L+1] STOP logit
+        return preds, stop
+
     def get_sentence_embedding_dimension(self) -> int:
         return self.latent_dim
 
@@ -600,7 +637,8 @@ class LangSetModel(nn.Module):
             "llm_model": self.llm_model, "latent_dim": self.latent_dim,
             "n_latents": self.head.n_latents, "max_len": self.max_len,
             "multi_latent": self.multi_latent, "fsq_dim": self.fsq_dim, "fsq_levels": self.fsq_levels,
-            "lora_top_k": self._lora_top_k, "fsq_emit": self.head.fsq_emit, "pool_mode": self.pool_mode}))
+            "lora_top_k": self._lora_top_k, "fsq_emit": self.head.fsq_emit, "pool_mode": self.pool_mode,
+            "continuous_emit": self.head.continuous_emit}))
 
     @classmethod
     def load(cls, path: Union[str, Path], *, lora_r: int = 16, device: Optional[str] = None,
@@ -611,6 +649,7 @@ class LangSetModel(nn.Module):
                                 lora_r=lora_r, max_len=cfg["max_len"], multi_latent=cfg.get("multi_latent", False),
                                 fsq_dim=cfg.get("fsq_dim", 128), fsq_levels=cfg.get("fsq_levels", 8),
                                 lora_top_k=int(cfg.get("lora_top_k", 0)), fsq_emit=cfg.get("fsq_emit", False),
+                                continuous_emit=cfg.get("continuous_emit", False),
                                 pool_mode=cfg.get("pool_mode", ""), device=device,
                                 attn_implementation=attn_implementation)  # 'eager' to read attention weights
         sd = torch.load(p / "langset.pt", map_location=m.device, weights_only=False)
