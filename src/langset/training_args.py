@@ -2,7 +2,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
+
+from langset.strategies import (
+    EMATwinTarget,
+    FSQObjective,
+    build_loss_terms,
+    multi_epoch_order,
+    multi_seed_texts,
+    multi_select_metric,
+)
 
 
 @dataclass
@@ -129,6 +138,21 @@ class TrainingArguments:
     # abstract, and 64 tokens keeps only its (often boilerplate) intro -> blurry phase-0 identity. Short targets
     # (e.g. future-event strings) are already < 64 so a higher cap only enriches the long ones (mild padding cost).
     target_max_len: int = 64
+
+    # ---- MULTI-LATENT STRATEGY INJECTION (dependency injection, not flags) --------------------------------------
+    # The multi-latent step is assembled from swappable pieces (see langset/strategies.py). Each field below holds
+    # the STRATEGY ITSELF — a class or callable — and the trainer just calls it; there is NO `if use_x:` selection.
+    # The defaults reproduce the historical behavior byte-for-byte (guarded by test_trainer_multi_characterization).
+    # To change a behavior, INJECT a different implementation, e.g.
+    #     TrainingArguments(target_source=SIGRegTarget)          # EMA-free anti-collapse
+    #     TrainingArguments(emission=ContinuousObjective)         # raw-vector emission instead of FSQ digits
+    # rather than toggling a boolean the trainer then branches on. See strategies.py for the interface each must meet.
+    emission: Callable = FSQObjective              # (model, args, dev, trainer) -> _EmissionObjective : seed->latents + base loss
+    target_source: Callable = EMATwinTarget        # (model, args, tok, dev) -> _TargetSource : the target latents + anti-collapse
+    loss_terms: Callable = build_loss_terms        # (args) -> list[_LossTerm] : the weighted aux separation/shaping terms
+    epoch_order: Callable = multi_epoch_order      # (tr_idx, rng, args, seeds) -> list[int] : per-epoch visiting order
+    selector: Callable = multi_select_metric       # (mode, mrr, purity, ep) -> float : the checkpoint-selection signal
+    seed_builder: Callable = multi_seed_texts      # (trainer, seeds, args) -> list[str] : the texts the emission reads
 
     # PREEMPT-RESUME (long big-model runs on preemptible GPUs). Epochs are the natural checkpoint boundary, so instead of
     # fragile mid-epoch state we make epochs SMALL: `max_steps_per_epoch` caps each epoch to N steps (~<=30min of wall
