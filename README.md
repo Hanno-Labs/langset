@@ -284,7 +284,7 @@ over next states:
 
 | injected strategy | effect |
 |---|---|
-| `epoch_order=grouped_epoch_order` | orders each epoch so all of a seed's branches land in the **same batch**; their per-target digit-CE then sums within the batch ≈ a soft cross-entropy toward the branch mixture `P_mix` — a clean per-seed uncertainty signal instead of branches scattered across batches |
+| `epoch_order=grouped_epoch_order` | orders each epoch so a seed's branches are **contiguous**, so they *tend to share a batch* (guaranteed only when `batch_size` ≥ the per-seed branch count and the groups align — contiguity alone doesn't stop a group straddling a batch boundary); when they do co-occur, their per-target digit-CE sums within the batch ≈ a soft cross-entropy toward the branch mixture `P_mix` |
 | `loss_terms=build_superposition_loss_terms` | adds `same_seed_mask` to the in-batch InfoNCE, treating two branches of the **same seed** as false-negatives (not pushed apart), so the emitted latent may settle at their **centroid** (the mixture) rather than being repelled from it |
 | `selector=last_epoch_selector` | keeps the **last epoch** instead of early-stopping on `retr_mrr` (see below) |
 
@@ -303,8 +303,9 @@ mixture of codes; see also [`ContinuousObjective`](#continuous-emission--continu
 Why `last_epoch_selector`: the default checkpoint selection (`retr_mrr`) rewards a *collapsed* one-future-per-seed
 geometry, which is exactly the wrong signal here — under superposition training you *want* retrieval MRR to fall
 as the latent spreads over a seed's alternatives, so keep the last epoch rather than early-stopping on it. There
-is also a plain `snapshot_every=N` scalar knob that saves the online weights to `{output_dir}_ep{N·k}` each N
-epochs (separate from the best-so-far restore), to keep a checkpoint trajectory for offline evaluation.
+is also a plain `snapshot_every=N` scalar knob that saves the online weights to `{output_dir}_ep{N}`,
+`{output_dir}_ep{2N}`, … after every N epochs — independent of the eval cadence, separate from the best-so-far
+restore — to keep a checkpoint trajectory for offline evaluation.
 
 ## Status
 

@@ -161,9 +161,9 @@ class TrainingArguments:
     # injection block below: `loss_terms=build_superposition_loss_terms` (adds same_seed_mask so a seed's branches
     # aren't pushed apart), `epoch_order=grouped_epoch_order` (branches contiguous in a batch -> soft-CE toward the
     # mixture), and `selector=last_epoch_selector` (retr_mrr is meant to FALL here, so it must not gate selection).
-    # `snapshot_every` below is the one plain scalar: a per-epoch ONLINE-weights snapshot to `{output_dir}_ep{ep}`
-    # (separate from the best-so-far restore and the preempt-resume checkpoint) so you can eval the trajectory
-    # offline. 0 = off (no snapshots) = byte-identical.
+    # `snapshot_every` below is the one plain scalar: an ONLINE-weights snapshot to `{output_dir}_ep{N}`, `_ep{2N}`,
+    # ... after every N epochs (1-based, independent of the eval cadence; separate from the best-so-far restore and
+    # the preempt-resume checkpoint) so you can eval the trajectory offline. 0 = off (no snapshots) = byte-identical.
     snapshot_every: int = 0
 
     # ---- MULTI-LATENT STRATEGY INJECTION (dependency injection, not flags) --------------------------------------

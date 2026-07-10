@@ -528,10 +528,12 @@ def multi_epoch_order(tr_idx: list[int], rng_t: torch.Generator, args: TrainingA
 
 def grouped_epoch_order(tr_idx: list[int], rng_t: torch.Generator, args: TrainingArguments,
                         seeds: list[str]) -> list[int]:
-    """SUPERPOSITION epoch ordering — INJECT via `TrainingArguments(epoch_order=grouped_epoch_order)`. Keeps a
-    seed's branches CONTIGUOUS (shuffle the seed GROUPS, not the positions) so all of one seed's futures land in
-    the same batch -> their per-target digit-CE sums to a soft-CE toward the branch mixture P_mix, a clean per-seed
-    uncertainty signal instead of branches scattered across batches. Pair with build_superposition_loss_terms."""
+    """SUPERPOSITION epoch ordering — INJECT via `TrainingArguments(epoch_order=grouped_epoch_order)`. Keeps a seed's
+    branches CONTIGUOUS (shuffle the seed GROUPS, not the positions) so they tend to share a batch and their
+    per-target digit-CE sums to a soft-CE toward the branch mixture P_mix. NOTE: contiguity is not a hard guarantee
+    of same-batch — with fixed-size batching a group can still straddle a batch boundary (or be split by
+    max_steps_per_epoch); it holds cleanly when batch_size is >= the per-seed branch count and the groups align.
+    Pair with build_superposition_loss_terms."""
     grp: dict[str, list[int]] = {}
     for pos in range(len(tr_idx)):
         grp.setdefault(seeds[tr_idx[pos]], []).append(pos)
@@ -552,6 +554,12 @@ def last_epoch_selector(mode: str, mrr: float, pur: float, ep: int) -> float:
     one-future-per-seed geometry — exactly the wrong target when you WANT the latent to spread over a seed's
     alternative futures, so retr_mrr is meant to fall and must not gate selection."""
     return float(ep)
+
+
+# The trainer evaluates/selects only on `ep % eval_every == 0`; a "keep the last epoch" selector must still see the
+# FINAL epoch even when eval_every>1, or it silently restores an earlier (last-evaluated) epoch. This flag tells the
+# trainer to always evaluate the final epoch for this selector; the default selector lacks it, so its path is unchanged.
+last_epoch_selector.needs_final_epoch = True  # type: ignore[attr-defined]
 
 
 def multi_seed_texts(trainer: Trainer, seeds: list[str], args: TrainingArguments) -> list[str]:
