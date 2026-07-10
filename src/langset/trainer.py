@@ -863,7 +863,20 @@ class Trainer:
                                 continue
                         return   # diagnostic run: stop after profiling
 
-            if ep % a.eval_every:
+            # per-epoch ONLINE-weights snapshot to {output_dir}_ep{N,2N,...} (1-based) — INDEPENDENT of the eval
+            # cadence (a trajectory to eval offline, separate from the best-so-far restore). snapshot_every=0 = off.
+            if getattr(a, "snapshot_every", 0) and (ep + 1) % a.snapshot_every == 0:
+                snap = f"{a.output_dir}_ep{ep + 1}"
+                Path(snap).mkdir(parents=True, exist_ok=True)
+                m.save_pretrained(snap)
+                if self.on_checkpoint is not None:
+                    self.on_checkpoint()
+                if a.verbose:
+                    print(f"        <- snapshot ep{ep + 1} -> {snap}", flush=True)
+
+            # eval/select cadence — but a selector flagged `needs_final_epoch` (e.g. last_epoch_selector) must SEE the
+            # final epoch, else with eval_every>1 the last epoch is skipped and an earlier one is kept instead.
+            if ep % a.eval_every and not (ep == a.epochs - 1 and getattr(a.selector, "needs_final_epoch", False)):
                 continue
             metrics = evaluate()
             row = {"loss": tot / max(nb, 1), **{kk: vv / max(nb, 1) for kk, vv in agg.items()}}
