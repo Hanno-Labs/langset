@@ -239,6 +239,41 @@ the FSQ grid no longer provides *free* anti-collapse, so lean on the EMA twin (o
 `distinct` diversity count. Use `ContinuousObjective` when the target is genuinely one-to-many; stay on the default
 FSQ when you want the discrete token interface (e.g. to co-train text and latents in one stream).
 
+### CoT-conditioned emission — `build_cot_loss_terms` + `cot_seed_texts`
+
+By default the model emits latents straight from the input seed. Injecting the CoT strategy pair inserts a
+**chain-of-thought step**: the model is co-trained to *generate* a per-row reasoning string (a `cot_text` column)
+before it emits the latents, and the latent forward is conditioned on `seed + CoT`. Two objectives share one
+optimizer step — the FSQ latent loss, and a next-token cross-entropy on the CoT string (weight `lam_cot`) through
+the tied embedding, i.e. the **same CE machinery the latents already use**.
+
+It's selected by *injecting two strategies* (not a flag): `loss_terms=build_cot_loss_terms` adds the isolated
+`CoTGenTerm`, and `seed_builder=cot_seed_texts` conditions the emission on the reasoning:
+
+```python
+from langset.strategies import build_cot_loss_terms, cot_seed_texts
+rows = [{"input_text": "...", "target_texts": ["...", "..."], "cot_text": "step-by-step reasoning ..."}, ...]
+model = LangSetModel.from_pretrained("Qwen/Qwen3-1.7B-Base", multi_latent=True)
+Trainer(model, TrainingArguments(loss_terms=build_cot_loss_terms, seed_builder=cot_seed_texts, lam_cot=1.0),
+        rows).train()
+```
+
+**Why:** some target latents aren't a direct function of the surface input — they need an intermediate
+inference the model can do but doesn't surface in one hop. Letting the model *think in tokens first*, then emit,
+lets that reasoning inform the latent, in the spirit of chain-of-thought reasoning
+([Wei et al., arXiv:2201.11903](https://arxiv.org/abs/2201.11903)) — but here the reasoning and the latent are
+co-trained in **one token stream** rather than the reasoning being an external prompt, and unlike COCONUT's
+continuous latent thoughts ([Hao et al., arXiv:2412.06769](https://arxiv.org/abs/2412.06769)) the CoT stays in
+readable token space sharing the softmax/CE interface.
+
+**Trade-offs:** the two forward+backward passes run *separately* so their autograd graphs never coexist (peak
+activation is `max(latent, cot)`, not the sum) — but you still pay a second forward per step, and CoT blocks are
+long (train-time cost scales with CoT length, not the short latents). You need a `cot_text` column: at train
+time it's a teacher-forcing target; the measured result is the *lift* from the model learning to produce its own
+CoT (self-generated reasoning helps even when the CoT text itself came from a stronger teacher, which is not a
+fair ceiling to compare against). Without the injected strategies (or with an absent `cot_text` column) the path
+is byte-identical to the plain FSQ emission — `CoTGenTerm` self-skips on empty reasoning.
+
 ## Status
 
 v0.4 — **multi-latent is now first-class in `Trainer`** (`{input_text, target_texts: [...]}` rows), plus sdpa

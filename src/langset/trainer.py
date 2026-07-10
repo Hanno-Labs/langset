@@ -241,6 +241,12 @@ class Trainer:
                     raise ValueError(
                         f"multi_latent Trainer needs a 'target_texts' column of non-empty lists; row {i} = {v!r}")
                 self.target_texts.append([str(x) for x in v])
+            # optional Exp-B CoT: a per-row reasoning STRING the model learns to GENERATE before the latents and
+            # conditions the emission on (via seed_builder=cot_seed_texts + loss_terms=build_cot_loss_terms). Absent
+            # column -> empty strings, so the default (non-CoT) strategies stay byte-identical: multi_seed_texts uses
+            # raw seeds and CoTGenTerm — even if injected — self-skips on all-empty reasoning.
+            self.cot_texts: list[str] = [str(x) for x in cols["cot_text"]] if "cot_text" in cols \
+                else [""] * len(self.input_text)
             # optional MULTI-latent hard negatives: a per-row LIST of texts the emitted latents must be pushed AWAY
             # from (batch-pooled InfoNCE bank, weight lam_hard_neg). Empty/None rows contribute no negatives.
             self.hard_neg_texts: Optional[list[list[str]]] = None
@@ -795,6 +801,8 @@ class Trainer:
                     fsq_levels=fsq_levels, lab_label=lab_label, target_source=target_source,
                     phase_head=phase_head, phase_ids=phase_ids)
                 for term in loss_terms:                             # aux separation/shaping terms (fixed order; each self-skips)
+                    if term.isolated_backward:                      # isolated terms run AFTER the main backward (below)
+                        continue
                     contrib = term.contribute(c)
                     if contrib is not None:
                         _k, _raw, _w = contrib
@@ -807,7 +815,15 @@ class Trainer:
                     agg["loss_sig"] = agg.get("loss_sig", 0.0) + float(loss_sig.detach())
                 opt.zero_grad()
                 with _rf("backward"):
-                    loss.backward()
+                    loss.backward()                                 # frees the main graph before any isolated term runs
+                for term in loss_terms:                             # isolated terms: own forward+backward, grads ACCUMULATE
+                    if not term.isolated_backward:
+                        continue
+                    contrib = term.contribute(c)
+                    if contrib is not None:
+                        _k, _raw, _w = contrib
+                        (_w * _raw).backward()
+                        agg[_k] = agg.get(_k, 0.0) + float(_raw.detach())
                 with _rf("opt_ema"):
                     opt.step()
                     target_source.update()                          # EMA twin tracks the online model

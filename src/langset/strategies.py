@@ -216,6 +216,46 @@ def build_loss_terms(args: TrainingArguments) -> list[_LossTerm]:
     ]
 
 
+class CoTGenTerm(_LossTerm):
+    """Exp-B: teach the model to GENERATE the row's chain-of-thought from the clean seed (doc=seed -> target=
+    cot_text) via the tied embedding — the SAME CE machinery the latents use, co-trained in the same step.
+    `isolated_backward` so its (long) CoT graph never coexists with the latent graph. Pairs with the seed+CoT
+    conditioning that `cot_seed_texts` applies to the emission forward — inject BOTH (see build_cot_loss_terms).
+    Self-skips when the batch's rows carry no CoT text (so it's inert if injected without a `cot_text` column)."""
+    key = "loss_cot"
+    isolated_backward = True
+
+    def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
+        a, m, dev, self_ = c.args, c.model, c.dev, c.trainer
+        if not any(self_.cot_texts[k] for k in c.bidx):        # no reasoning in this batch -> nothing to learn
+            return None
+        tok, vsz = m.tokenizer, m.vocab_size
+
+        def _tokm(texts: list[str], mx: int) -> tuple[torch.Tensor, torch.Tensor]:
+            e = tok(texts, padding=True, truncation=True, max_length=mx, return_tensors="pt")
+            return e["input_ids"].to(dev), e["attention_mask"].to(dev)
+
+        # CoT blocks are long (p50~726, p90~1541 tok) -> keep full a.max_len, don't truncate hard.
+        di, dm = _tokm([self_.input_text[k] for k in c.bidx], a.max_len)
+        ti, tm = _tokm([self_.cot_texts[k] or " " for k in c.bidx], a.max_len)
+        seq = torch.cat([di, ti], dim=1); am = torch.cat([dm, tm], dim=1)
+        hid = m._last_hidden(m._run_backbone(m.embed(seq), am, seq, 0))
+        sd = di.size(1)
+        ph = hid[:, sd - 1: sd - 1 + ti.size(1), :]                     # hidden that predicts each CoT token
+        # bf16 vocab projection (NOT .float()): the fp32 [b, T, |V|] logits were the OOM driver on the 80GB A100;
+        # CE reduces the softmax in fp32 internally, so bf16 logits are a numerically fine training signal.
+        lg = F.linear(ph, m.embed.weight)
+        loss_cot = F.cross_entropy(lg.reshape(-1, vsz), ti.masked_fill(tm == 0, -100).reshape(-1), ignore_index=-100)
+        return (self.key, loss_cot, a.lam_cot)
+
+
+def build_cot_loss_terms(args: TrainingArguments) -> list[_LossTerm]:
+    """Exp-B loss set — INJECT via `TrainingArguments(loss_terms=build_cot_loss_terms)` (pair with
+    `seed_builder=cot_seed_texts`). The DEFAULT terms plus CoTGenTerm (isolated-backward), so the model is
+    co-trained to generate the row's reasoning while it emits the latents. Needs a `cot_text` dataset column."""
+    return [*build_loss_terms(args), CoTGenTerm()]
+
+
 # ---- emission objective -------------------------------------------------------------------------
 @dataclass
 class EmissionOut:
@@ -460,3 +500,11 @@ def multi_seed_texts(trainer: Trainer, seeds: list[str], args: TrainingArguments
     """DEFAULT texts fed to the EMISSION forward — what the model reads before emitting its latents = the raw
     input seeds. Inject a different `seed_builder` to change it (e.g. append per-row CoT); targets/eval keep raw seeds."""
     return seeds
+
+
+def cot_seed_texts(trainer: Trainer, seeds: list[str], args: TrainingArguments) -> list[str]:
+    """Exp-B seed-builder — INJECT via `TrainingArguments(seed_builder=cot_seed_texts)` (pair with
+    `loss_terms=build_cot_loss_terms`). Conditions the emission forward on each row's teacher-forced reasoning
+    (seed + CoT) so the latents are emitted AFTER the reasoning; targets and eval keep the raw seeds, and
+    CoTGenTerm trains the model to produce that reasoning itself."""
+    return [f"{s}\n\nReasoning:\n{trainer.cot_texts[i]}" for i, s in enumerate(seeds)]
