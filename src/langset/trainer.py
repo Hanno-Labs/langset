@@ -237,13 +237,13 @@ class FrozenPoolStepEngine(_StepEngine):
 class MultiStepCtx:
     """Everything a multi-latent aux loss term reads for one step. Assembled once per step after the emission
     forward; terms pull what they need and return their contribution (or None to skip)."""
-    trainer: Any                    # the Trainer (for self.sup_labels / hard_neg_texts / label_plan+cols+codewords)
-    args: Any
-    model: Any
-    dev: Any
-    bidx: list
-    lens_l: list
-    flat_texts: list
+    trainer: Trainer                    # for self.sup_labels / hard_neg_texts / label_plan+cols+codewords
+    args: TrainingArguments
+    model: LangSetModel
+    dev: torch.device
+    bidx: list[int]
+    lens_l: list[int]
+    flat_texts: list[str]
     valid: torch.Tensor
     target_lat: torch.Tensor
     recon: torch.Tensor
@@ -251,9 +251,9 @@ class MultiStepCtx:
     lmax: int
     fsq_levels: int
     lab_label: Optional[torch.Tensor]   # reserved-dim label targets (None unless FSQ label subspace active)
-    target_source: Any                  # _TargetSource — encode() the hard-neg bank, twin for eval
-    phase_head: Optional[Any]
-    phase_ids: dict
+    target_source: _TargetSource        # encode() the hard-neg bank, twin for eval
+    phase_head: Optional[torch.nn.Module]
+    phase_ids: dict[str, int]
 
 
 class _LossTerm:
@@ -393,7 +393,7 @@ def multi_select_metric(mode: str, mrr: float, pur: float, ep: int) -> float:
     return pur if mode == "purity" else (mrr + pur) if mode == "blend" else mrr
 
 
-def multi_seed_texts(trainer: Any, seeds: list[str], args: TrainingArguments) -> list[str]:
+def multi_seed_texts(trainer: Trainer, seeds: list[str], args: TrainingArguments) -> list[str]:
     """The texts fed to the EMISSION forward — what the model reads before emitting its latents. Default = the
     raw input seeds. (A CoT-conditioned variant appends each row's reasoning here; targets/eval keep raw seeds.)"""
     return seeds
@@ -405,7 +405,7 @@ class EmissionOut:
     logs for agg, and — for FSQ — the digit logits + reserved-dim label targets the aux terms consume."""
     recon: torch.Tensor
     base_loss: torch.Tensor
-    logs: dict                          # unweighted scalars for agg: loss_stop / loss_dims / recon_loss
+    logs: dict[str, torch.Tensor]       # unweighted scalars for agg: loss_stop / loss_dims / recon_loss
     dim_lg: Optional[torch.Tensor]      # FSQ per-dim digit logits (None for a non-FSQ objective)
     lab_label: Optional[torch.Tensor]   # reserved-dim label targets (None unless FSQ label subspace active)
 
@@ -416,8 +416,8 @@ class _EmissionObjective:
     use. Selected ONCE per run so the step loop has no emission `if`s."""
     codebook: bool = True
 
-    def emit(self, se: dict, target_lat: torch.Tensor, valid: torch.Tensor, lens_l: list,
-             bidx: list, b: int, lmax: int, ep: int) -> EmissionOut:
+    def emit(self, se: dict[str, torch.Tensor], target_lat: torch.Tensor, valid: torch.Tensor,
+             lens_l: list[int], bidx: list[int], b: int, lmax: int, ep: int) -> EmissionOut:
         raise NotImplementedError
 
 
@@ -426,13 +426,13 @@ class FSQObjective(_EmissionObjective):
     reconstruction to the target. Byte-identical to the historical inline FSQ block."""
     codebook = True
 
-    def __init__(self, model: Any, args: TrainingArguments, dev: Any, trainer: Any,
+    def __init__(self, model: LangSetModel, args: TrainingArguments, dev: torch.device, trainer: Trainer,
                  fsq_dim: int, fsq_levels: int, stop_idx: int) -> None:
         self.m, self.a, self.dev, self.trainer = model, args, dev, trainer
         self.fsq_dim, self.fsq_levels, self.stop_idx = fsq_dim, fsq_levels, stop_idx
 
-    def emit(self, se: dict, target_lat: torch.Tensor, valid: torch.Tensor, lens_l: list,
-             bidx: list, b: int, lmax: int, ep: int) -> EmissionOut:
+    def emit(self, se: dict[str, torch.Tensor], target_lat: torch.Tensor, valid: torch.Tensor,
+             lens_l: list[int], bidx: list[int], b: int, lmax: int, ep: int) -> EmissionOut:
         m, a, dev, self_ = self.m, self.a, self.dev, self.trainer
         fsq_dim, fsq_levels = self.fsq_dim, self.fsq_levels
         eff_ss = a.ss_prob if a.ss_warmup <= 0 else a.ss_prob * min(1.0, ep / a.ss_warmup)
@@ -472,7 +472,7 @@ class _TargetSource:
     turn the in-batch NCE off; `twin` is the model the eval block encodes its retrieval bank with; `regularizer`
     contributes an extra anti-collapse loss (None by default). Selected ONCE per run."""
     suppresses_nce: bool = False
-    twin: Any = None
+    twin: Optional[LangSetModel] = None
 
     def encode(self, texts: list[str]) -> torch.Tensor:
         """Emit each text -> [N, d] normalized target latents (no grad for the EMA default)."""
@@ -490,7 +490,7 @@ class EMATwinTarget(_TargetSource):
     don't move together and collapse. Byte-identical to the historical inline twin + emit_texts + ema_update."""
     suppresses_nce = False
 
-    def __init__(self, model: Any, args: TrainingArguments, tok: Any, dev: Any) -> None:
+    def __init__(self, model: LangSetModel, args: TrainingArguments, tok: Any, dev: torch.device) -> None:
         self.m, self.a, self.tok, self.dev = model, args, tok, dev
         self.twin = copy.deepcopy(model)
         for p in self.twin.parameters():
