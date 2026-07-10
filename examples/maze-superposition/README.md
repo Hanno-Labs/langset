@@ -59,8 +59,9 @@ below.
 | `target_source=SIGRegTarget` *(optional, `--sigreg`)* | EMA-free anti-collapse (LeJEPA) instead of the stop-grad twin — see [`langset/sigreg.py`](../../src/langset/sigreg.py) |
 | `langset.probes` | the world-model property tests themselves — `calibration_corr` (entropy ↔ frontier size) and `linear_decodability` (probe the emitted latent), reused by `eval.py` so this signal isn't maze-only |
 
-Nothing here is a flag on a monolith — each is a strategy injected into `TrainingArguments`. See
-[`train.py`](train.py).
+None of this is a monolithic config: `multi_latent` builds the set-emission head, `selector` and `target_source`
+are strategies injected into `TrainingArguments`, `return_soft` is a rollout flag, and `langset.probes` is a
+plain eval helper. See [`train.py`](train.py) and [`eval.py`](eval.py).
 
 ### Run it
 
