@@ -251,8 +251,7 @@ class MultiStepCtx:
     lmax: int
     fsq_levels: int
     lab_label: Optional[torch.Tensor]   # reserved-dim label targets (None unless FSQ label subspace active)
-    emit_texts: Callable[..., torch.Tensor]   # (texts, model) -> normalized target latents (no grad)
-    ema_model: Any
+    target_source: Any                  # _TargetSource — encode() the hard-neg bank, twin for eval
     phase_head: Optional[Any]
     phase_ids: dict
 
@@ -317,7 +316,7 @@ class HardNegTerm(_LossTerm):
         hn_flat = [t for k in c.bidx for t in self_.hard_neg_texts[k]]
         if not hn_flat:
             return None
-        hn_bank = c.emit_texts(hn_flat, c.ema_model)         # [Nhn, d] stop-grad normalized hard-neg latents
+        hn_bank = c.target_source.encode(hn_flat)            # [Nhn, d] stop-grad normalized hard-neg latents
         rv = F.normalize(c.recon[c.valid], dim=-1)           # [Nvalid, d] emitted reconstructions
         pos = (rv * c.target_lat[c.valid]).sum(-1, keepdim=True)   # [Nvalid, 1] cos to own target
         neg = rv @ hn_bank.t()                               # [Nvalid, Nhn] cos to every hard neg
@@ -459,6 +458,55 @@ class FSQObjective(_EmissionObjective):
         return EmissionOut(recon=recon, base_loss=loss_stop + loss_dims + recon_loss,
                            logs={"loss_stop": loss_stop, "loss_dims": loss_dims, "recon_loss": recon_loss},
                            dim_lg=dim_lg, lab_label=lab_label)
+
+
+class _TargetSource:
+    """Strategy for the TARGET latents the emission trains toward, plus any anti-collapse regularization.
+    Default = stop-grad EMA twin. `suppresses_nce` lets an alt source (e.g. a live-target + regularizer one)
+    turn the in-batch NCE off; `twin` is the model the eval block encodes its retrieval bank with; `regularizer`
+    contributes an extra anti-collapse loss (None by default). Selected ONCE per run."""
+    suppresses_nce: bool = False
+    twin: Any = None
+
+    def encode(self, texts: list[str]) -> torch.Tensor:
+        """Emit each text -> [N, d] normalized target latents (no grad for the EMA default)."""
+        raise NotImplementedError
+
+    def update(self) -> None:
+        """Post-optimizer-step update (EMA momentum step; no-op for a live/grad target)."""
+
+    def regularizer(self, z_pred: torch.Tensor, z_tgt: torch.Tensor) -> Optional[torch.Tensor]:
+        return None
+
+
+class EMATwinTarget(_TargetSource):
+    """DEFAULT: a stop-grad EMA copy of the online model supplies the target latents (BYOL/JEPA) so both sides
+    don't move together and collapse. Byte-identical to the historical inline twin + emit_texts + ema_update."""
+    suppresses_nce = False
+
+    def __init__(self, model: Any, args: TrainingArguments, tok: Any, dev: Any) -> None:
+        self.m, self.a, self.tok, self.dev = model, args, tok, dev
+        self.twin = copy.deepcopy(model)
+        for p in self.twin.parameters():
+            p.requires_grad_(False)
+        self.twin.eval()
+        self._online = [po for po in model.parameters() if po.requires_grad]
+        self._ema = [pe for pe, po in zip(self.twin.parameters(), model.parameters()) if po.requires_grad]
+
+    def encode(self, texts: list[str]) -> torch.Tensor:
+        # Single-latent emission of each text -> [N, d] normalized, no_grad. Truncated to target_max_len
+        # (default 64: targets are short descriptors; raise it when a target is a DOCUMENT, e.g. emit_seed's
+        # phase-0 target is a full abstract). Short future strings are already < 64 so unaffected.
+        a, tok, dev = self.a, self.tok, self.dev
+        e = tok(texts, padding=True, truncation=True, max_length=a.target_max_len, return_tensors="pt").to(dev)
+        with torch.no_grad():
+            z = self.twin(e["input_ids"], e["attention_mask"])
+        return F.normalize(z.float(), dim=-1)
+
+    def update(self) -> None:
+        with torch.no_grad():
+            torch._foreach_mul_(self._ema, self.a.ema_m)
+            torch._foreach_add_(self._ema, self._online, alpha=1.0 - self.a.ema_m)
 
 
 class Trainer:
@@ -848,29 +896,9 @@ class Trainer:
         tr_idx = perm[:cut].tolist()
         val_idx = perm[cut:].tolist() or perm[:1].tolist()        # never-empty val (a tiny smoke can fill train)
 
-        # EMA target twin (stop-grad): supplies the target latents so both sides don't move together and collapse.
-        ema_model: Any = copy.deepcopy(m)
-        for p in ema_model.parameters():
-            p.requires_grad_(False)
-        ema_model.eval()
-        ema_o = [po for po in m.parameters() if po.requires_grad]
-        ema_e = [pe for pe, po in zip(ema_model.parameters(), m.parameters()) if po.requires_grad]
-
-        def ema_update() -> None:
-            with torch.no_grad():
-                torch._foreach_mul_(ema_e, a.ema_m)
-                torch._foreach_add_(ema_e, ema_o, alpha=1.0 - a.ema_m)
-
-        def emit_texts(texts: list[str], mdl: Any) -> torch.Tensor:
-            """Single-latent emission of each text -> [N, d] on device (normalized), no_grad — the target latents.
-            Truncated to `target_max_len` (default 64: targets are short descriptors). Raise it when a target is a
-            DOCUMENT not a label — e.g. emit_seed's phase-0 target is a full science abstract; 64 tokens keeps only
-            the boilerplate-y intro, blurring phase-0 identity (self-retrieval top1 0.10). Short targets (futures)
-            are unaffected (already < 64)."""
-            e = tok(texts, padding=True, truncation=True, max_length=a.target_max_len, return_tensors="pt").to(dev)
-            with torch.no_grad():
-                z = mdl(e["input_ids"], e["attention_mask"])
-            return F.normalize(z.float(), dim=-1)
+        # Target source (stop-grad EMA twin by default): supplies the target latents so both sides don't move
+        # together and collapse. Selected ONCE (see the _TargetSource seam).
+        target_source: _TargetSource = EMATwinTarget(m, a, tok, dev)
 
         # PHASE HEAD (the non-collapsing alternative to SupCon): a transient linear classifier hidden->phase trained
         # with CE on the emitted reconstruction. CE only needs a separating hyperplane, so it makes phase LINEARLY
@@ -911,7 +939,7 @@ class Trainer:
             if not bank_texts:
                 m.train()
                 return {"retr_mrr": 0.0, "purity": 0.0, "n_distinct": 0, "avg_emitted": 0.0}
-            zb = F.normalize(ema_model.emit(bank_texts).to(dev).float(), dim=-1)   # [Nbank, d] target-space bank
+            zb = F.normalize(target_source.twin.emit(bank_texts).to(dev).float(), dim=-1)   # [Nbank, d] target-space bank
             chain_t = torch.tensor(bank_chain, device=dev)
             rr: list[float] = []
             produced: set[int] = set()
@@ -1037,7 +1065,7 @@ class Trainer:
                 lmax = max(len(x) for x in ent_lists)
                 flat_texts = [txt for lst in ent_lists for txt in lst]
                 with _rf("ema_encode"):
-                    flat_tgt = emit_texts(flat_texts, ema_model)     # [ΣL, d] stop-grad EMA targets
+                    flat_tgt = target_source.encode(flat_texts)      # [ΣL, d] stop-grad EMA targets
                 b = len(bidx)
                 target_lat = torch.zeros(b, lmax, d, device=dev)
                 valid = torch.zeros(b, lmax, dtype=torch.bool, device=dev)
@@ -1057,7 +1085,7 @@ class Trainer:
                 c = MultiStepCtx(                                    # everything the aux terms read this step
                     trainer=self, args=a, model=m, dev=dev, bidx=bidx, lens_l=lens_l, flat_texts=flat_texts,
                     valid=valid, target_lat=target_lat, recon=recon, dim_lg=dim_lg, lmax=lmax,
-                    fsq_levels=fsq_levels, lab_label=lab_label, emit_texts=emit_texts, ema_model=ema_model,
+                    fsq_levels=fsq_levels, lab_label=lab_label, target_source=target_source,
                     phase_head=phase_head, phase_ids=phase_ids)
                 for term in loss_terms:                             # aux separation/shaping terms (fixed order; each self-skips)
                     contrib = term.contribute(c)
@@ -1070,7 +1098,7 @@ class Trainer:
                     loss.backward()
                 with _rf("opt_ema"):
                     opt.step()
-                    ema_update()                                    # EMA twin tracks the online model
+                    target_source.update()                          # EMA twin tracks the online model
                 tot += float(loss.detach())
                 nb += 1
                 agg["loss_stop"] += float(loss_stop.detach())
