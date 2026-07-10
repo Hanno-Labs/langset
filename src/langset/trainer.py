@@ -394,6 +394,73 @@ def multi_select_metric(mode: str, mrr: float, pur: float, ep: int) -> float:
     return pur if mode == "purity" else (mrr + pur) if mode == "blend" else mrr
 
 
+@dataclass
+class EmissionOut:
+    """What one emission forward produces: the emitted latents (grad flows), the base emission loss, per-term
+    logs for agg, and — for FSQ — the digit logits + reserved-dim label targets the aux terms consume."""
+    recon: torch.Tensor
+    base_loss: torch.Tensor
+    logs: dict                          # unweighted scalars for agg: loss_stop / loss_dims / recon_loss
+    dim_lg: Optional[torch.Tensor]      # FSQ per-dim digit logits (None for a non-FSQ objective)
+    lab_label: Optional[torch.Tensor]   # reserved-dim label targets (None unless FSQ label subspace active)
+
+
+class _EmissionObjective:
+    """Strategy for turning the seeded forward into emitted latents + the base emission loss. Default = FSQ
+    (token-native digit CE + folded STOP + cosine recon). `codebook` tells the free-run rollout which head to
+    use. Selected ONCE per run so the step loop has no emission `if`s."""
+    codebook: bool = True
+
+    def emit(self, se: dict, target_lat: torch.Tensor, valid: torch.Tensor, lens_l: list,
+             bidx: list, b: int, lmax: int, ep: int) -> EmissionOut:
+        raise NotImplementedError
+
+
+class FSQObjective(_EmissionObjective):
+    """DEFAULT emission: predict each item's per-dim FSQ digits (a STOP folded into dim-0's softmax) + a cosine
+    reconstruction to the target. Byte-identical to the historical inline FSQ block."""
+    codebook = True
+
+    def __init__(self, model: Any, args: TrainingArguments, dev: Any, trainer: Any,
+                 fsq_dim: int, fsq_levels: int, stop_idx: int) -> None:
+        self.m, self.a, self.dev, self.trainer = model, args, dev, trainer
+        self.fsq_dim, self.fsq_levels, self.stop_idx = fsq_dim, fsq_levels, stop_idx
+
+    def emit(self, se: dict, target_lat: torch.Tensor, valid: torch.Tensor, lens_l: list,
+             bidx: list, b: int, lmax: int, ep: int) -> EmissionOut:
+        m, a, dev, self_ = self.m, self.a, self.dev, self.trainer
+        fsq_dim, fsq_levels = self.fsq_dim, self.fsq_levels
+        eff_ss = a.ss_prob if a.ss_warmup <= 0 else a.ss_prob * min(1.0, ep / a.ss_warmup)
+        dim_lg, stop_lg, digits, recon = m.rollout_train_codebook(
+            se["input_ids"], se["attention_mask"], target_lat, a.tau,
+            train_hops=a.train_hops, ss_prob=eff_ss, ss_sample=a.ss_sample)
+        dim0 = torch.cat([dim_lg[:, :, 0, :], stop_lg], -1)  # [b, lmax+1, L+1] — digit-0 + STOP
+        lab0 = torch.full((b, lmax + 1), -100, dtype=torch.long, device=dev)
+        lab_rest = torch.full((b, lmax, fsq_dim - 1), -100, dtype=torch.long, device=dev)
+        for r, nl in enumerate(lens_l):
+            lab0[r, :nl] = digits[r, :nl, 0]
+            lab0[r, nl] = self.stop_idx                          # emit digit-0 per item, then STOP after the last
+            lab_rest[r, :nl] = digits[r, :nl, 1:]
+        lab_label = None                                         # FSQ LABEL SUBSPACE: reserved dims -> a SEPARATE
+        if self_.label_plan is not None:                         # weighted label CE (NOT diluted inside loss_dims)
+            lab_label = torch.full((b, lmax, len(self_.label_plan)), -100, dtype=torch.long, device=dev)
+            for s_i, (col_j, field, pos) in enumerate(self_.label_plan):
+                labs, cw = self_.label_cols[field], self_.label_codewords[field]
+                for r, kk in enumerate(bidx):
+                    row_labs = labs[kk]
+                    for j in range(lens_l[r]):
+                        code = cw.get(row_labs[j] if j < len(row_labs) else "")
+                        lab_label[r, j, s_i] = code[pos] if code is not None else -100
+                lab_rest[:, :, col_j] = -100                     # reserved dims leave the reconstruction CE
+        loss_stop = F.cross_entropy(dim0.reshape(-1, fsq_levels + 1), lab0.reshape(-1), ignore_index=-100)
+        loss_dims = F.cross_entropy(dim_lg[:, :lmax, 1:, :].reshape(-1, fsq_levels),
+                                    lab_rest.reshape(-1), ignore_index=-100)
+        recon_loss = (1.0 - F.cosine_similarity(recon[valid], target_lat[valid], dim=-1)).mean()
+        return EmissionOut(recon=recon, base_loss=loss_stop + loss_dims + recon_loss,
+                           logs={"loss_stop": loss_stop, "loss_dims": loss_dims, "recon_loss": recon_loss},
+                           dim_lg=dim_lg, lab_label=lab_label)
+
+
 class Trainer:
     def __init__(self, model: LangSetModel, args: TrainingArguments, train_dataset: Any,
                  eval_dataset: Optional[Any] = None, column_mapping: Optional[dict[str, str]] = None,
@@ -952,6 +1019,7 @@ class Trainer:
         def _rf(name: str) -> Any:                             # named phase range when profiling, no-op otherwise
             return _rfn(name) if _prof is not None else _nullctx()
 
+        objective: _EmissionObjective = FSQObjective(m, a, dev, self, fsq_dim, fsq_levels, stop_idx)  # emission, selected ONCE
         loss_terms = build_loss_terms(a)                       # aux separation/shaping terms, selected ONCE (see seams)
         for ep in range(start_ep, a.epochs):
             m.train()
@@ -981,35 +1049,11 @@ class Trainer:
                     target_lat[r, :nl] = flat_tgt[k:k + nl]
                     valid[r, :nl] = True
                     k += nl
-                # token-native FSQ: predict each item's per-dim digits, then a STOP folded into dim-0's softmax.
-                eff_ss = a.ss_prob if a.ss_warmup <= 0 else a.ss_prob * min(1.0, ep / a.ss_warmup)
                 with _rf("rollout"):
-                    dim_lg, stop_lg, digits, recon = m.rollout_train_codebook(
-                        se["input_ids"], se["attention_mask"], target_lat, a.tau,
-                        train_hops=a.train_hops, ss_prob=eff_ss, ss_sample=a.ss_sample)
-                dim0 = torch.cat([dim_lg[:, :, 0, :], stop_lg], -1)  # [b, lmax+1, L+1] — digit-0 + STOP
-                lab0 = torch.full((b, lmax + 1), -100, dtype=torch.long, device=dev)
-                lab_rest = torch.full((b, lmax, fsq_dim - 1), -100, dtype=torch.long, device=dev)
-                for r, nl in enumerate(lens_l):
-                    lab0[r, :nl] = digits[r, :nl, 0]
-                    lab0[r, nl] = stop_idx                           # emit digit-0 per item, then STOP after the last
-                    lab_rest[r, :nl] = digits[r, :nl, 1:]
-                lab_label = None                                     # FSQ LABEL SUBSPACE: reserved dims -> a SEPARATE
-                if self.label_plan is not None:                      # weighted label CE (NOT diluted inside loss_dims)
-                    lab_label = torch.full((b, lmax, len(self.label_plan)), -100, dtype=torch.long, device=dev)
-                    for s_i, (col_j, field, pos) in enumerate(self.label_plan):
-                        labs, cw = self.label_cols[field], self.label_codewords[field]
-                        for r, kk in enumerate(bidx):
-                            row_labs = labs[kk]
-                            for j in range(lens_l[r]):
-                                code = cw.get(row_labs[j] if j < len(row_labs) else "")
-                                lab_label[r, j, s_i] = code[pos] if code is not None else -100
-                        lab_rest[:, :, col_j] = -100                 # reserved dims leave the reconstruction CE
-                loss_stop = F.cross_entropy(dim0.reshape(-1, fsq_levels + 1), lab0.reshape(-1), ignore_index=-100)
-                loss_dims = F.cross_entropy(dim_lg[:, :lmax, 1:, :].reshape(-1, fsq_levels),
-                                            lab_rest.reshape(-1), ignore_index=-100)
-                recon_loss = (1.0 - F.cosine_similarity(recon[valid], target_lat[valid], dim=-1)).mean()
-                loss = loss_stop + loss_dims + recon_loss           # base objective (recon-only) + separation below
+                    em = objective.emit(se, target_lat, valid, lens_l, bidx, b, lmax, ep)
+                recon, dim_lg, lab_label = em.recon, em.dim_lg, em.lab_label
+                loss_stop, loss_dims, recon_loss = em.logs["loss_stop"], em.logs["loss_dims"], em.logs["recon_loss"]
+                loss = em.base_loss                                 # base objective (emission + STOP + recon); separation below
                 c = MultiStepCtx(                                    # everything the aux terms read this step
                     trainer=self, args=a, model=m, dev=dev, bidx=bidx, lens_l=lens_l, flat_texts=flat_texts,
                     valid=valid, target_lat=target_lat, recon=recon, dim_lg=dim_lg, lmax=lmax,
