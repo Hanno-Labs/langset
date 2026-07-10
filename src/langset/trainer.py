@@ -245,8 +245,10 @@ class Trainer:
             # conditions the emission on (via seed_builder=cot_seed_texts + loss_terms=build_cot_loss_terms). Absent
             # column -> empty strings, so the default (non-CoT) strategies stay byte-identical: multi_seed_texts uses
             # raw seeds and CoTGenTerm — even if injected — self-skips on all-empty reasoning.
-            self.cot_texts: list[str] = [str(x) for x in cols["cot_text"]] if "cot_text" in cols \
-                else [""] * len(self.input_text)
+            cot_key = inv.get("cot_text", "cot_text")          # honor column_mapping (a renamed reasoning column)
+            self.cot_texts: list[str] = (
+                [("" if x is None else str(x)) for x in cols[cot_key]]   # None/absent -> "" (not the literal "None")
+                if cot_key in cols else [""] * len(self.input_text))
             # optional MULTI-latent hard negatives: a per-row LIST of texts the emitted latents must be pushed AWAY
             # from (batch-pooled InfoNCE bank, weight lam_hard_neg). Empty/None rows contribute no negatives.
             self.hard_neg_texts: Optional[list[list[str]]] = None

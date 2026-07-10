@@ -231,13 +231,18 @@ class CoTGenTerm(_LossTerm):
             return None
         tok, vsz = m.tokenizer, m.vocab_size
 
-        def _tokm(texts: list[str], mx: int) -> tuple[torch.Tensor, torch.Tensor]:
-            e = tok(texts, padding=True, truncation=True, max_length=mx, return_tensors="pt")
+        def _tokm(texts: list[str], mx: int, side: str) -> tuple[torch.Tensor, torch.Tensor]:
+            e = tok(texts, padding=True, truncation=True, max_length=mx, padding_side=side, return_tensors="pt")
             return e["input_ids"].to(dev), e["attention_mask"].to(dev)
 
-        # CoT blocks are long (p50~726, p90~1541 tok) -> keep full a.max_len, don't truncate hard.
-        di, dm = _tokm([self_.input_text[k] for k in c.bidx], a.max_len)
-        ti, tm = _tokm([self_.cot_texts[k] or " " for k in c.bidx], a.max_len)
+        # CoT blocks are long (p50~726, p90~1541 tok) -> keep full a.max_len, don't truncate hard. Pin padding sides
+        # EXPLICITLY (not the tokenizer's mutable default): the SEED is LEFT-padded so its last real token lands at
+        # index sd-1 (the position that predicts the first CoT token), and the CoT is RIGHT-padded so its real tokens
+        # sit adjacent to the seed with pads trailing -> no padding between seed and CoT, and the CE never conditions
+        # on a pad hidden. (Mirrors the emission forward's left-pad; a right-defaulting tokenizer would otherwise
+        # silently condition short seeds' CoT on padding.)
+        di, dm = _tokm([self_.input_text[k] for k in c.bidx], a.max_len, "left")
+        ti, tm = _tokm([self_.cot_texts[k] or " " for k in c.bidx], a.max_len, "right")
         seq = torch.cat([di, ti], dim=1); am = torch.cat([dm, tm], dim=1)
         hid = m._last_hidden(m._run_backbone(m.embed(seq), am, seq, 0))
         sd = di.size(1)
