@@ -1,42 +1,39 @@
-# langset — fine-tune an LLM to work in latent space
+# langset — a short path to a world model in your LLM
 
-**langset few-shot fine-tunes a pretrained LLM to *read text and answer in a vector*.** Bolt a tiny head onto
-the backbone, describe the geometry you want in words, and the LLM's own world knowledge does the reading — the
-latent lives in the model's *own* hidden space, so it's your embedding, not a re-projection of an off-the-shelf
-one. One method, two things you can build with it:
-
-* **single-latent → a bespoke embedding model.** One vector per input, in a geometry you define. Drops straight
-  into SetFit as a Sentence-Transformer body. *(This README's running example.)*
-* **multi-latent → a JEPA world model.** The LLM emits a *sequence* of latents in its own token stream — one per
-  step, with a learned STOP — and each latent holds a **calibrated superposition** of possible next states. It
-  *predicts in latent space*, which is the thing people say LLMs can't do without a separate world model. Here
-  the LLM **is** the world model. → **[examples/maze-superposition](examples/maze-superposition)**
+**langset few-shot fine-tunes a pretrained LLM to *predict in latent space*.** Bolt a tiny head onto the
+backbone and it emits a *sequence* of latents in its own token stream — one per step, with a learned STOP —
+where each latent holds a **calibrated superposition** of possible next states. That is a JEPA world model, and
+the LLM **is** it: no separate world model bolted alongside, no pixel simulator, no new architecture. You get
+there few-shot, by describing the states in words.
 
 <p align="center">
-  <img src="examples/maze-superposition/assets/maze-frontier.gif" alt="A trained langset multi-latent world model flooding a maze: one latent per tick holding a set of frontier cells, with the model's P(solvable) readout firming up as the search advances." width="340">
+  <img src="examples/maze-superposition/assets/maze-frontier.gif" alt="A trained langset world model flooding a maze: one latent per tick holding a set of frontier cells, with the model's P(solvable) readout firming up as the search advances." width="340">
 </p>
 
-<p align="center"><em>A trained multi-latent langset model as a world model — each tick is one emitted latent
-holding a whole <strong>set</strong> of next states (the lime frontier), the caption counting how many. See
+<p align="center"><em>A trained langset world model rolling out a maze — each tick is one emitted latent holding
+a whole <strong>set</strong> of next states (the lime frontier), the caption counting how many. It predicts the
+distribution of where the search could be, not a single guess. See
 <a href="examples/maze-superposition">the superposition example</a>.</em></p>
 
-## The one idea (both modes)
+The *same* machinery with a **single** latent per input is a bespoke **embedding model**, SetFit-ready — that
+tier still works and is documented [below](#also-a-bespoke-embedding-model). But the reason to reach for langset
+is the world model.
 
-**The `target_text` *is* the geometry.** Whatever your target descriptions describe becomes the axis your
-latent space measures — and nothing else. Describe instrumentation and the space clusters by instrumentation;
-describe vocals and emotion and it clusters by vocals and emotion. You don't discover the geometry, you
-**define** it — and you re-steer it by rewriting the target text, no model changes.
+## The idea
 
-What makes langset different:
+**You describe what a latent should mean, in words — and that description *is* the geometry.** Point the target
+texts at the *next states* of a process and the model learns to **emit** them: given a state, predict the set of
+admissible futures, with its own uncertainty calibrated to how open the future is. You don't gather labels or
+hand-build a simulator — you write the states, and the LLM's world knowledge does the reading.
 
-* 🎯 **Latent out, not a label.** You define the output space; the model answers in a *vector*. Retrieval,
-  "find similar", ranking, clustering — classification is just one thing you can do downstream.
-* 🧭 **You design the axis in words.** The target text defines the geometry. Point it at the signal you care
-  about (and at something the input text can't trivially regenerate, or you're just distilling a text encoder).
-* 🧠 **World knowledge does the work.** It's a generative LLM, so it generalizes from *hundreds* of examples,
-  not millions — it *reads* the input rather than pattern-matching surface tokens.
-* 🪞 **Your own embedding.** The latent lives in the model's own hidden space; the geometry comes from a
-  self-contrastive objective against your target text — no external encoder in the loop.
+* 🔮 **It predicts, in latent space.** Emit a *set-valued* latent future with calibrated uncertainty — the JEPA
+  property LeCun argues an LLM needs a *separate* world model for. Here the LLM does it itself.
+* 🧭 **You design the state-space in words.** The target text defines what the world model tracks; rewrite it to
+  re-steer the model — no architecture changes, no relabeling.
+* 🧠 **World knowledge does the reading.** A generative LLM generalizes from *hundreds* of examples, not
+  millions — it *reads* each state rather than pattern-matching surface tokens.
+* 🪞 **The LLM is the world model.** Latents live in the model's own hidden space and (FSQ) its own token
+  vocabulary, so text and latent prediction share one stream — not two networks.
 
 ## Install
 
@@ -44,159 +41,49 @@ What makes langset different:
 pip install langset
 ```
 
-## Usage
+## Quickstart — a world model
 
-A langset dataset is rows of `input_text` → `target_text`. Pick an LLM backbone; langset trains the mapping.
-
-```python
-from langset import LangSetModel, Trainer, TrainingArguments
-
-rows = [  # what you'll have at inference -> a description that DEFINES where it should land
-    {"input_text": "an hour-long track of detuned riffs that never break stride, moving at the pace of continental drift",
-     "target_text": "glacial detuned doom-metal, sludgy and hypnotic, buried roared vocals"},
-    {"input_text": "chopped vocal ghosts drifting over vinyl crackle and the hiss of a city at 3am",
-     "target_text": "crackly nocturnal UK garage, pitched vocal ghosts, wistful and restless"},
-    # ...
-]
-
-model = LangSetModel.from_pretrained("HuggingFaceTB/SmolLM2-135M")   # any HF causal LM
-Trainer(model, TrainingArguments(), train_dataset=rows).train()
-
-z = model.encode(["a wall of downtuned fuzz that buries the vocals under sheer volume"])
-print(z.shape)   # (1, 576)  — a latent in the backbone's own space
-```
-
-See [`examples/sounds_like/`](examples/sounds_like/) for the full reference task (album review → "how it
-sounds" latent).
-
-## How it works
-
-1. **Self-contrastive.** For each row, `emit(input_text)` is trained to match `emit(target_text)` — *both*
-   emitted through the model into its own space — against in-batch negatives. The target text defines where
-   each item lands; the negatives force different items apart (so the space can't collapse).
-2. **Grounding aux.** A light reconstruction term makes the latent also *decode* the target text, tying it to
-   the words. A light uniformity term keeps the space spread on the sphere.
-3. **Collapse-aware selection.** langset early-stops on held-out input↔target retrieval and reconstruction,
-   with a hard penalty on any collapse of the geometry — never on the training loss (which collapse can game).
-
-## Dataset contract
-
-| column | meaning |
-|---|---|
-| `input_text` | what you'll have at inference (a name, a query, a review) |
-| `target_text` | a description of the same item that **defines** where it lands (the geometry) |
-
-`Trainer` accepts a `datasets.Dataset` or `list[dict]`; use `column_mapping` to rename your columns.
-
-## Using with SetFit
-
-The name is the chain: **lang·set·fit** — a *language* model emits into the *set* geometry (langset, usable on
-its own), which then *fit*s a classifier. `model.as_sentence_transformer()` is a drop-in
-[SetFit](https://github.com/huggingface/setfit) `model_body`, so you can train a few-shot classifier directly
-on your bespoke geometry.
-
-The clean distinction: **SetFit answers with a *label*; langset answers with a *latent*.**
-
-| | reach for **SetFit** | reach for **langset** |
-|---|---|---|
-| your answer is | a **label** (fixed classes) | a **point in a space** — retrieval, "find similar", ranking, clustering |
-| you define the target by | enumerating classes | a **description** of the geometry ("how it sounds") |
-| your input | text to classify | text *or an identifier* — leans on the LLM's world knowledge |
-
-- **Use SetFit alone** for plain few-shot classification — you won't beat it by bolting on langset.
-- **Use langset** when the answer is a *geometry, not a label* (you'll retrieve / rank / cluster in it).
-- **Use langset → SetFit** when a task-shaped body helps the classifier.
-
-```bash
-pip install "langset[setfit]"      # pins the verified composition window (below)
-```
-```python
-from sklearn.linear_model import LogisticRegression
-from setfit import SetFitModel
-
-clf = SetFitModel(model_body=langset_model.as_sentence_transformer(),
-                  model_head=LogisticRegression(max_iter=2000),    # direct construction needs an explicit head
-                  labels=[...])
-clf.fit(x_train, y_train, num_epochs=1)        # frozen body + head — the robust path
-clf.predict(["..."])
-```
-
-**Dependency alignment.** SetFit's pins are loose, so versions matter:
-
-| install | transformers / torch | Python | use |
-|---|---|---|---|
-| `langset` | latest (≥4.41) | 3.10+ | modern backbones incl. **Qwen3**; no SetFit |
-| `langset[setfit]` | **4.46.x / <2.5** | **3.10–3.12** | verified SetFit composition |
-
-SetFit imports `transformers.training_args.default_logdir` (removed after 4.46), and 4.46 + torch≥2.5 trips a
-`torch.distributed.tensor` bug — hence the cap. Use the frozen-body `SetFitModel.fit`/`predict` path above; the
-full `setfit.Trainer` (fine-tunes the body) is fragile in this window.
-
-## Multi-latent — one input, a *set* of latents
-
-Everything above emits **one** latent per input. Multi-latent emits a **variable-length set** — one latent per
-distinct item in the input — autoregressively, with the model deciding *how many* via a learned STOP. Each
-latent lands in the same bespoke geometry, so you decode it the same way you'd decode a single one (nearest
-neighbor against a bank, a downstream head, whatever).
-
-**Why:** a single vector is the wrong shape whenever one input contains an unknown number of things. Collapse
-*"Apple and Microsoft partnered in California"* into one embedding and you've blended three items into one
-blurry point. Multi-latent keeps them separate — three latents, each retrievable on its own — and, unlike a
-fixed-slot head, it doesn't need you to know the count in advance.
-
-**The headline use case is a JEPA world model.** When the *set* is the set of possible **next states** — and
-each step's target literally is that set — a multi-latent model learns to emit a **calibrated superposition**:
-one latent that holds several admissible futures at once, with its own entropy tracking how open the future is.
-That's prediction in latent space (JEPA), done by the LLM itself rather than a separate world model bolted
-alongside it. The **[maze-superposition example](examples/maze-superposition)** trains and *measures* exactly
-this (with [`langset.probes`](src/langset/probes.py)); the anti-collapse machinery that makes it work — the
-[EMA target twin and SIGReg/LeJEPA](#anti-collapse-ema-twin-default-vs-sigreg-lejepa) — is the same JEPA
-apparatus described below.
-
-The other things a variable-length latent set is good for:
-
-* **Multi-item extraction** — entities, keyphrases, skills, ingredients: read a document, emit a latent per
-  item, retrieve each against a reference bank. ([`examples/ner-multi-latent/`](examples/ner-multi-latent/)
-  does exactly this for named entities.)
-* **Multi-vector retrieval** — represent a query or document as a *set* of latents (ColBERT-style late
-  interaction) instead of one averaged vector, for finer-grained matching.
-* **Multi-aspect / multi-label** — one latent per facet (a product's `{brand, category, material}`) or per
-  applicable label, instead of one vector forced to mean several things at once.
-* **Multi-intent parsing** — an utterance carrying several intents → a latent each.
-
-```python
-from langset import LangSetModel
-import torch.nn.functional as F
-
-m = LangSetModel.load("path/to/checkpoint", device="cpu")
-
-# a reference bank you retrieve emitted latents against (any short label works)
-bank = ["PER: Barack Obama", "LOC: Berlin", "PER: Angela Merkel", "ORG: Apple", "LOC: California"]
-zb = F.normalize(m.emit(bank).float(), dim=-1)                       # [N, d]
-
-# emit a VARIABLE-length set from one input — the count is decided by a learned STOP
-lat = F.normalize(m.rollout("Barack Obama visited Berlin to meet Angela Merkel.").float(), dim=-1)
-for v in lat:                                                        # -> one latent per entity
-    print(bank[int((v @ zb.T).argmax())])                           # PER: Barack Obama / LOC: Berlin / PER: Angela Merkel
-```
-
-Train it with the same `Trainer` — a multi-latent model reads rows of `{input_text, target_texts: [...]}` (a
-*list* of targets per input) instead of a single `target_text`:
+Rows are `input_text` (a state) → `target_texts` (the **set** of possible next states). The model learns to emit
+that set, deciding *how many* via a learned STOP; at inference `rollout(..., return_soft=True)` reads the emitted
+set back plus its per-step entropy — the model's own calibrated uncertainty.
 
 ```python
 from langset import LangSetModel, Trainer, TrainingArguments
 
-rows = [{"input_text": "Barack Obama visited Berlin to meet Angela Merkel.",
-         "target_texts": ["PER: Barack Obama", "LOC: Berlin", "PER: Angela Merkel"]},
-        # ...
+rows = [{"input_text": "<a state>", "target_texts": ["<next state A>", "<next state B>", "<next state C>"]},
+        # ...one row per state; target_texts is the SET of admissible next states
        ]
-model = LangSetModel.from_pretrained("Qwen/Qwen3-0.6B-Base", multi_latent=True)  # FSQ set-emission head
+model = LangSetModel.from_pretrained("HuggingFaceTB/SmolLM2-135M", multi_latent=True)   # FSQ set-emission head
 Trainer(model, TrainingArguments(epochs=15), rows).train()
+
+lat, lengths, soft, ent = model.rollout("<a state>", return_soft=True)
+# soft = the expected latent SET (the superposition); ent = per-step entropy (higher = a more open future)
 ```
 
-Under the hood each latent is finite-scalar-quantized (FSQ) into per-dimension digits the model predicts, an
-EMA target twin (stop-grad) supplies the target latents so the set can't collapse, and every emitted latent is
-fed back into the stream so the next one is conditioned on those already emitted.
+**[examples/maze-superposition](examples/maze-superposition)** is the end-to-end reference: it trains a world
+model on a maze search-frontier and *measures* the headline property with [`langset.probes`](src/langset/probes.py) —
+the emitted latent's entropy tracks the true number of possible next states (a calibrated superposition, not one
+guess).
+
+## How it works — JEPA in the token stream
+
+1. **Predict in latent space (JEPA).** Each emitted latent is trained to match the **stop-grad target latents**
+   of its next states (in-batch negatives keep distinct states apart). Predicting a target-encoder's latents —
+   not pixels, not tokens — is exactly the JEPA objective, here run *inside* a pretrained LLM.
+2. **Token-native emission.** Each latent is finite-scalar-quantized (FSQ) into per-dimension digits the model
+   predicts, with **STOP folded into dim-0's softmax**; every emitted latent is fed back into the stream so the
+   next one is conditioned on those already emitted. The latent is literally a token — text and latents share
+   one softmax/CE interface.
+3. **Anti-collapse is the JEPA apparatus.** A stop-grad **EMA target twin** (BYOL/JEPA) supplies the targets by
+   default; inject `SIGRegTarget` for the EMA-free **LeJEPA** alternative
+   ([details below](#anti-collapse-ema-twin-default-vs-sigreg-lejepa)).
+4. **Collapse-aware selection.** langset selects on held-out retrieval/reconstruction with a hard penalty on any
+   collapse of the geometry — never on the training loss (which collapse can game).
+
+## World-model knobs
+
+Every knob below is a **strategy injected into `TrainingArguments`**, not a boolean on a monolith — the defaults
+give you the FSQ + EMA-twin world model, and each injection swaps one piece.
 
 ### Anti-collapse: EMA twin (default) vs SIGReg (LeJEPA)
 
@@ -350,3 +237,86 @@ Trainer(model, TrainingArguments(learn_field="tag", learn_ratio=0.2), rows).trai
 Works on **both** the single-latent and multi-latent paths (multi-latent uses `target_texts[0]` as the replay
 target). `learn_ratio=0` or no `learn` rows = off (byte-identical). Use it when the backbone must stay fluent on
 a domain while you retrain its emission geometry; leave it off for pure embedding tasks.
+
+## Also: a bespoke embedding model
+
+The **single-latent** path emits **one** vector per input instead of a set — a bespoke embedding model in a
+geometry you define, and a drop-in Sentence-Transformer body for SetFit. Same one idea: the `target_text` *is*
+the geometry (describe instrumentation and the space clusters by instrumentation; describe vocals and emotion and
+it clusters by those). Rows are `input_text` → a single `target_text`:
+
+```python
+from langset import LangSetModel, Trainer, TrainingArguments
+
+rows = [{"input_text": "an hour-long track of detuned riffs that never break stride, at the pace of continental drift",
+         "target_text": "glacial detuned doom-metal, sludgy and hypnotic, buried roared vocals"},
+        # ...
+       ]
+model = LangSetModel.from_pretrained("HuggingFaceTB/SmolLM2-135M")   # any HF causal LM, single-latent
+Trainer(model, TrainingArguments(), train_dataset=rows).train()
+
+z = model.encode(["a wall of downtuned fuzz that buries the vocals under sheer volume"])
+print(z.shape)   # (1, 576) — a latent in the backbone's own space
+```
+
+See [`examples/sounds_like/`](examples/sounds_like/) for the full reference task (album review → "how it sounds"
+latent).
+
+### With SetFit
+
+The name is the chain: **lang·set·fit** — a *language* model emits into the *set* geometry (langset, usable on
+its own), which then *fit*s a classifier. `model.as_sentence_transformer()` is a drop-in
+[SetFit](https://github.com/huggingface/setfit) `model_body`. The clean distinction: **SetFit answers with a
+*label*; langset answers with a *latent*.**
+
+| | reach for **SetFit** | reach for **langset** |
+|---|---|---|
+| your answer is | a **label** (fixed classes) | a **point in a space** — retrieval, "find similar", ranking, clustering |
+| you define the target by | enumerating classes | a **description** of the geometry ("how it sounds") |
+| your input | text to classify | text *or an identifier* — leans on the LLM's world knowledge |
+
+Use SetFit alone for plain few-shot classification; use langset when the answer is a geometry you'll retrieve /
+rank / cluster in; chain **langset → SetFit** when a task-shaped body helps the classifier.
+
+```bash
+pip install "langset[setfit]"      # pins the verified composition window
+```
+```python
+from sklearn.linear_model import LogisticRegression
+from setfit import SetFitModel
+
+clf = SetFitModel(model_body=langset_model.as_sentence_transformer(),
+                  model_head=LogisticRegression(max_iter=2000),    # direct construction needs an explicit head
+                  labels=[...])
+clf.fit(x_train, y_train, num_epochs=1)        # frozen body + head — the robust path
+clf.predict(["..."])
+```
+
+> **Dependency alignment.** `langset` runs modern backbones (transformers ≥4.41, incl. **Qwen3**).
+> `langset[setfit]` pins **transformers 4.46.x / torch <2.5 / Python 3.10–3.12**: SetFit imports
+> `training_args.default_logdir` (removed after 4.46), and 4.46 + torch ≥2.5 trips a `torch.distributed.tensor`
+> bug. Use the frozen-body `SetFitModel.fit`/`predict` path above; the full `setfit.Trainer` (fine-tunes the
+> body) is fragile in this window.
+
+### A set of latents, outside world models
+
+The variable-length **set** emission is useful even when the set isn't a set of *futures* — anywhere one input
+carries an unknown number of things, and a single averaged vector would blur them together:
+
+* **Multi-item extraction** — a latent per entity / keyphrase / skill / ingredient, retrieved against a reference
+  bank ([`examples/ner-multi-latent/`](examples/ner-multi-latent/) does this for named entities).
+* **Multi-vector retrieval** — represent a query or document as a *set* of latents (ColBERT-style late
+  interaction) instead of one averaged vector.
+* **Multi-aspect / multi-label** — one latent per facet (`{brand, category, material}`) or applicable label.
+
+```python
+from langset import LangSetModel
+import torch.nn.functional as F
+
+m = LangSetModel.load("path/to/checkpoint", device="cpu")
+bank = ["PER: Barack Obama", "LOC: Berlin", "PER: Angela Merkel", "ORG: Apple", "LOC: California"]
+zb = F.normalize(m.emit(bank).float(), dim=-1)
+lat = F.normalize(m.rollout("Barack Obama visited Berlin to meet Angela Merkel.").float(), dim=-1)
+for v in lat:                                                        # one latent per entity, count set by a learned STOP
+    print(bank[int((v @ zb.T).argmax())])                           # PER: Barack Obama / LOC: Berlin / PER: Angela Merkel
+```
