@@ -24,7 +24,9 @@ dependencies = [
 # imports `default_logdir` (removed after 4.46); 4.46 + torch>=2.5 hits a torch.distributed.tensor bug. So:
 setfit = ["setfit>=1.1.0", "transformers>=4.41,<4.47", "torch>=2.2,<2.5", "scikit-learn"]
 wandb = ["wandb>=0.18"]
-dev = ["pytest", "ruff"]
+# world-model property probes (langset.probes): calibration_corr + linear_decodability
+probes = ["scikit-learn", "scipy>=1.10"]
+dev = ["pytest", "ruff", "scikit-learn", "scipy>=1.10"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/langset"]
