@@ -329,10 +329,3 @@ as the latent spreads over a seed's alternatives, so keep the last epoch rather 
 is also a plain `snapshot_every=N` scalar knob that saves the online weights to `{output_dir}_ep{N}`,
 `{output_dir}_ep{2N}`, … after every N epochs — independent of the eval cadence, separate from the best-so-far
 restore — to keep a checkpoint trajectory for offline evaluation.
-
-## Status
-
-v0.4 — **multi-latent is now first-class in `Trainer`** (`{input_text, target_texts: [...]}` rows), plus sdpa
-attention for long inputs. The core engine is validated on a real task (album review → "how it sounds" latent)
-with a downstream SetFit composition; multi-latent is validated on CoNLL-2003 multi-entity extraction across
-SmolLM and Qwen backbones. Apache-2.0.
