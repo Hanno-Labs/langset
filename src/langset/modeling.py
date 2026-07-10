@@ -390,7 +390,8 @@ class LangSetModel(nn.Module):
     # ---- multi-latent autoregressive rollout (drives the feedback / stop_logit seams) ----
     @torch.no_grad()
     def rollout(self, text: Union[str, list[str]], max_steps: int = 8, stop_threshold: float = 0.0,
-                return_lengths: bool = False, return_confidence: bool = False, temperature: float = 0.0
+                return_lengths: bool = False, return_confidence: bool = False, temperature: float = 0.0,
+                return_soft: bool = False
                 ) -> Union[torch.Tensor, tuple[torch.Tensor, ...]]:
         """Autoregressive emission: real text tokens and emitted latents share ONE hidden stream. Each emitted
         latent is fed back into the sequence via `head.feedback` (the latent lives in the backbone's own hidden
@@ -401,7 +402,10 @@ class LangSetModel(nn.Module):
         co-trained uncertainty: 'code' = mean per-dim FSQ digit-softmax certainty, 'stop' = P(STOP) at that step,
         'dig0' = digit-0 level certainty. Returned as (lat, lengths, conf) when set. `temperature` (FSQ path only):
         0 = deterministic argmax (default); >0 = SAMPLE each FSQ digit from softmax(logits/temperature), so K rolls
-        of one seed fan into a DISTRIBUTION of plausible futures (McDonald's multi-rollout)."""
+        of one seed fan into a DISTRIBUTION of plausible futures (McDonald's multi-rollout). `return_soft` returns
+        (lat, lengths, soft_lat, ent) where soft_lat is the EXPECTED latent E[digit]->up_proj (the calibrated
+        superposition, read from the full digit softmax rather than the argmax) and ent is the mean per-dim softmax
+        entropy (the model's native emission fuzziness). On the continuous/out_proj path soft_lat==lat and ent==0."""
         single = isinstance(text, str)
         texts = [text] if single else list(text)
         dev = self.device
@@ -419,6 +423,8 @@ class LangSetModel(nn.Module):
         conf_code: list[torch.Tensor] = []                                  # native per-step confidences (FSQ path)
         conf_stop: list[torch.Tensor] = []
         conf_dig0: list[torch.Tensor] = []
+        soft_cols: list[torch.Tensor] = []                                  # SOFT emission: E[latent] under digit softmax
+        ent_cols: list[torch.Tensor] = []                                   # native uncertainty: mean per-dim softmax entropy
         was_training = self.training
         self.eval()
         for _step in range(max_steps):
@@ -440,6 +446,13 @@ class LangSetModel(nn.Module):
                     conf_stop.append(p0[:, -1])                            # P(STOP) at this step
                     conf_dig0.append(p0[:, :-1].max(-1).values)           # digit-0 level certainty
                     conf_code.append(torch.softmax(dim_lg.float(), -1).max(-1).values.mean(-1))  # mean code certainty
+                if return_soft:                                            # the SUPERPOSITION reads out HERE, not from argmax
+                    levels = torch.arange(self.head.fsq_levels, device=dim_lg.device, dtype=torch.float32)
+                    p = torch.softmax(dim_lg.float(), -1)                  # [B, fsq_dim, L] per-dim digit distribution
+                    soft_z = self.head.reconstruct((p * levels).sum(-1))  # E[digit] -> up_proj = expected latent [B, d]
+                    ent = (-(p.clamp_min(1e-9).log() * p).sum(-1)).mean(-1)  # [B] mean per-dim entropy (native fuzziness)
+                    soft_cols.append(torch.where(emit_now.unsqueeze(1), soft_z, torch.zeros_like(soft_z)))
+                    ent_cols.append(torch.where(emit_now, ent, torch.zeros_like(ent)))
                 digits = torch.cat([dim0.clamp(max=self.head.fsq_levels - 1).unsqueeze(-1), rest], -1)  # [B, fsq_dim]
                 z = self.head.reconstruct(digits)                          # [B, d]
                 cols.append(torch.where(emit_now.unsqueeze(1), z, torch.zeros_like(z)))
@@ -454,6 +467,9 @@ class LangSetModel(nn.Module):
                                                            enc["input_ids"], 0))[:, -1]   # [B, h] PLE-safe
                 z = self.head(hid.unsqueeze(1)).squeeze(1)                   # [B, d] emit via out_proj
                 cols.append(torch.where(alive.unsqueeze(1), z, torch.zeros_like(z)))
+                if return_soft:                                             # continuous/out_proj emission IS the soft
+                    soft_cols.append(torch.where(alive.unsqueeze(1), z, torch.zeros_like(z)))  # readout; entropy undefined
+                    ent_cols.append(torch.zeros(b, device=dev))                                # -> 0
                 lengths = lengths + alive.long()
                 stop = self.head.stop_logit(hid, self.embed) > stop_threshold  # emit-then-check: the hidden that emitted
                 seq = torch.cat([seq, self.head.feedback(z).unsqueeze(1).to(seq.dtype)], 1)  # this latent also carries
@@ -472,6 +488,12 @@ class LangSetModel(nn.Module):
                 conf = {k: v[0, : int(lengths[0])] for k, v in conf.items()}
         if single:
             lat = lat[0, : int(lengths[0])]
+        if return_soft:                                                    # SOFT readout: expected latent + native entropy
+            soft_lat = torch.stack(soft_cols, 1) if soft_cols else lat.new_zeros(b, 0, self.latent_dim)
+            ent_t = torch.stack(ent_cols, 1) if ent_cols else lat.new_zeros(b, 0)
+            if single:
+                soft_lat, ent_t = soft_lat[0, : int(lengths[0])], ent_t[0, : int(lengths[0])]
+            return lat, lengths, soft_lat, ent_t
         if return_confidence:
             return lat, lengths, conf
         if return_lengths:
@@ -581,14 +603,16 @@ class LangSetModel(nn.Module):
             "lora_top_k": self._lora_top_k, "fsq_emit": self.head.fsq_emit, "pool_mode": self.pool_mode}))
 
     @classmethod
-    def load(cls, path: Union[str, Path], *, lora_r: int = 16, device: Optional[str] = None) -> "LangSetModel":
+    def load(cls, path: Union[str, Path], *, lora_r: int = 16, device: Optional[str] = None,
+             attn_implementation: str = "sdpa") -> "LangSetModel":
         import json
         p = Path(path); cfg = json.loads((p / "config.json").read_text())
         m = cls.from_pretrained(cfg["llm_model"], latent_dim=cfg["latent_dim"], n_latents=cfg.get("n_latents", 1),
                                 lora_r=lora_r, max_len=cfg["max_len"], multi_latent=cfg.get("multi_latent", False),
                                 fsq_dim=cfg.get("fsq_dim", 128), fsq_levels=cfg.get("fsq_levels", 8),
                                 lora_top_k=int(cfg.get("lora_top_k", 0)), fsq_emit=cfg.get("fsq_emit", False),
-                                pool_mode=cfg.get("pool_mode", ""), device=device)
+                                pool_mode=cfg.get("pool_mode", ""), device=device,
+                                attn_implementation=attn_implementation)  # 'eager' to read attention weights
         sd = torch.load(p / "langset.pt", map_location=m.device, weights_only=False)
         m.backbone.load_state_dict(sd["lora"], strict=False)
         m.head.load_state_dict(sd["head"])
