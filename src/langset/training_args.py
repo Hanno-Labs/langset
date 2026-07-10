@@ -143,9 +143,10 @@ class TrainingArguments:
     # `TrainingArguments(target_source=SIGRegTarget)`, see the injection block below). SIGRegTarget replaces the EMA
     # twin with a LIVE encoder + an isotropic-Gaussian penalty on the pre-quant z; these tune that penalty. Inert
     # under the default EMATwinTarget. See langset/sigreg.py.
-    sigreg_lambda: float = 1.0            # weight on the SIGReg isotropic-Gaussian loss (~0.3 balances vs recon)
-    sigreg_knots: int = 17               # Epps-Pulley quadrature knots
-    sigreg_slices: int = 256             # random 1-D projection directions (resampled each step)
+    sigreg_lambda: float = 0.3            # weight on the SIGReg isotropic-Gaussian loss (0.3 balances vs recon; higher
+    #                                       over-diversifies and washes out global structure, lower under-constrains)
+    sigreg_knots: int = 17               # Epps-Pulley quadrature knots (>= 2)
+    sigreg_slices: int = 256             # random 1-D projection directions, resampled each step (>= 1)
 
     # ---- MULTI-LATENT STRATEGY INJECTION (dependency injection, not flags) --------------------------------------
     # The multi-latent step is assembled from swappable pieces (see langset/strategies.py). Each field below holds

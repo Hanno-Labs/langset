@@ -7,11 +7,14 @@ empirical characteristic function against the standard normal's, exp(-t^2/2), by
 quadrature on [0, 3]. If every random 1-D projection looks standard-normal, the joint is isotropic
 Gaussian (Cramer-Wold).
 
-Used by trainer.py behind `TrainingArguments.use_sigreg` as the alternative to the EMA twin. TRAINING-ONLY
-(never persisted, never used at eval). For a token-native FSQ head, hook this on the PRE-QUANTIZATION
-z = down_proj(latent) (the raw FSQ input), NOT the emitted reconstruction: regularizing the input to the
-quantizer spreads the encoder's codes across the whole grid, which is what stops the (twin-free) live
-encoder folding every input into one cell.
+Used by SIGRegTarget (inject via `TrainingArguments(target_source=SIGRegTarget)`) as the alternative to the EMA
+twin. TRAINING-ONLY (never persisted, never used at eval). For a token-native FSQ head, apply it NOT to the
+emitted reconstruction but to the quantizer's own coordinates, penalized independently on each side (see
+FSQObjective.z_for_reg): the TARGET side uses the pre-quantization z = down_proj(target_latent) (the raw FSQ
+input), and the PREDICTED side uses the expected digit E[digit] = Σ softmax(dim_logits)·levels (there is no
+down_proj on the predicted path — the model emits digit logits, so its analogue of the pre-quant coordinate is
+the soft digit expectation). Regularizing these spreads the encoder's codes across the whole grid, which is what
+stops the (twin-free) live encoder folding every input into one cell.
 """
 from __future__ import annotations
 
@@ -28,6 +31,10 @@ class SIGReg(nn.Module):
 
     def __init__(self, knots: int = 17, slices: int = 256) -> None:
         super().__init__()
+        if knots < 2:                                          # dt = 3/(knots-1) needs >=2 points (a trapezoid rule)
+            raise ValueError(f"SIGReg needs knots >= 2 (got {knots})")
+        if slices < 1:                                         # >=1 random projection direction
+            raise ValueError(f"SIGReg needs slices >= 1 (got {slices})")
         self.slices = slices
         t = torch.linspace(0, 3, knots)
         dt = 3.0 / (knots - 1)
