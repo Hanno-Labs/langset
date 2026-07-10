@@ -302,10 +302,18 @@ class Trainer:
                     print(f"[langset] FSQ label subspace: "
                           + "; ".join(f"{f}->{args.label_dims[f]} ({len(self.label_codewords[f])} cls)"
                                       for f in args.label_dims), flush=True)
+            # TEXT REPLAY tag (multi-latent): rows marked "learn" rehearse the backbone's plain next-token ability
+            # (interleaved at `learn_ratio` in _train_multi). Must be set HERE — this branch returns before the
+            # single-latent is_learn setup below. learn_field unset / learn_ratio=0 -> all-False (feature off).
+            self.is_learn: list[bool] = [False] * len(self.input_text)
+            if getattr(args, "learn_field", None) is not None and args.learn_ratio > 0:
+                raw = cols[inv.get(args.learn_field, args.learn_field)]
+                self.is_learn = [str(v).lower() == "learn" for v in raw]
             if args.verbose:
                 hn = "" if not self.hard_neg_texts else " (+hard-neg)"
                 sp = "" if not self.sup_labels else " (+supcon)"
-                print(f"[langset] {len(self.input_text)} rows (multi-latent){hn}{sp}", flush=True)
+                lr = "" if sum(self.is_learn) == 0 else f" (+{sum(self.is_learn)} learn @ratio {args.learn_ratio})"
+                print(f"[langset] {len(self.input_text)} rows (multi-latent){hn}{sp}{lr}", flush=True)
             return
         self.target_text = [str(x) for x in get("target_text")]
         # optional false-negative masking: per-row set of facet keys; in-batch pairs sharing any key are masked.
@@ -650,8 +658,9 @@ class Trainer:
             if self.sup_labels is not None:
                 self.sup_labels = [["phase0", *self.sup_labels[i]] for i in range(len(self.sup_labels))]
         n = len(seeds)
-        perm = rng.permutation(n)
-        cut = max(1, int(n * (1 - a.val_frac)))
+        _emb = np.array([i for i in range(n) if not getattr(self, "is_learn", [False] * n)[i]])  # replay rows: not embedded
+        perm = _emb[rng.permutation(len(_emb))]        # learn-tagged rows are rehearsed as text only, kept OUT of the
+        cut = max(1, int(len(perm) * (1 - a.val_frac)))   # latent split (matches the single-latent path)
         tr_idx = perm[:cut].tolist()
         val_idx = perm[cut:].tolist() or perm[:1].tolist()        # never-empty val (a tiny smoke can fill train)
 
@@ -808,6 +817,34 @@ class Trainer:
 
         objective: _EmissionObjective = a.emission(m, a, dev, self)   # emission strategy (INJECTED), built ONCE
         loss_terms = a.loss_terms(a)                           # aux separation/shaping terms (INJECTED), built ONCE
+
+        # optional TEXT REPLAY (multi-latent). Rows tagged `learn` (via `learn_field`) rehearse the backbone's plain
+        # text ability with a next-token CE on (input_text -> target_texts[0]), interleaved with the latent objective
+        # so multi-latent co-training doesn't erode the LM. Ported from the single-latent learn path; projection via
+        # the tied input embedding (no lm_head). learn_ratio=0 / no learn rows = off (byte-identical to before).
+        learn_pool = [i for i in range(len(seeds)) if getattr(self, "is_learn", [False] * len(seeds))[i]]
+        ln_doc_ids = ln_doc_mask = ln_tgt_ids = ln_tgt_mask = None
+        vsz = m.vocab_size
+
+        def _tokm(texts: list[str], mx: int) -> tuple[torch.Tensor, torch.Tensor]:
+            e = tok(texts, padding=True, truncation=True, max_length=mx, return_tensors="pt")
+            return e["input_ids"].to(dev), e["attention_mask"].to(dev)
+
+        if learn_pool:
+            ln_doc_ids, ln_doc_mask = _tokm([seeds[i] for i in learn_pool], a.max_len)
+            ln_tgt_ids, ln_tgt_mask = _tokm([(self.target_texts[i][0] if self.target_texts[i] else " ")
+                                             for i in learn_pool], _LEARN_TGT)
+
+        def learn_loss(pos: torch.Tensor) -> torch.Tensor:
+            di, dm = ln_doc_ids[pos], ln_doc_mask[pos]
+            ti, tm = ln_tgt_ids[pos], ln_tgt_mask[pos]
+            seq = torch.cat([di, ti], dim=1); am = torch.cat([dm, tm], dim=1)
+            hid = m._last_hidden(m._run_backbone(m.embed(seq), am, seq, 0))
+            sd = di.size(1)
+            ph = hid[:, sd - 1: sd - 1 + ti.size(1), :]                     # hidden that predicts each target token
+            lg = F.linear(ph.float(), m.embed.weight.float())
+            return F.cross_entropy(lg.reshape(-1, vsz), ti.masked_fill(tm == 0, -100).reshape(-1), ignore_index=-100)
+
         for ep in range(start_ep, a.epochs):
             m.train()
             order = a.epoch_order(tr_idx, rng_t, a, seeds)     # epoch ordering strategy (INJECTED)
@@ -817,6 +854,11 @@ class Trainer:
             nb = 0
             agg = {"loss_stop": 0.0, "loss_dims": 0.0, "recon_loss": 0.0}
             for i in range(0, len(order), a.batch_size):
+                if learn_pool and float(rng.random()) < a.learn_ratio:      # REPLAY step: rehearse text, own opt.step
+                    lp = torch.as_tensor(rng.choice(len(learn_pool), size=min(a.batch_size, len(learn_pool)),
+                                                    replace=False), device=dev, dtype=torch.long)
+                    opt.zero_grad(); lloss = learn_loss(lp); lloss.backward(); opt.step()
+                    agg["learn_loss"] = agg.get("learn_loss", 0.0) + float(lloss.detach())
                 bidx = [tr_idx[k] for k in order[i:i + a.batch_size]]
                 se = tok([seed_texts[k] for k in bidx], padding=True, truncation=True, max_length=a.max_len,
                          padding_side="left", return_tensors="pt").to(dev)   # left-pad: hid[s_len-1] = last real token

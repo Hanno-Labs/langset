@@ -329,3 +329,24 @@ as the latent spreads over a seed's alternatives, so keep the last epoch rather 
 is also a plain `snapshot_every=N` scalar knob that saves the online weights to `{output_dir}_ep{N}`,
 `{output_dir}_ep{2N}`, … after every N epochs — independent of the eval cadence, separate from the best-so-far
 restore — to keep a checkpoint trajectory for offline evaluation.
+
+### Text replay — `learn_field` / `learn_ratio`
+
+Fine-tuning a backbone on the emit objective can slowly erode its plain next-token ability. **Text replay**
+interleaves ordinary language-model steps into training to rehearse it: tag some rows `learn` (via a
+`learn_field` column) and, with probability `learn_ratio` before each normal batch, the trainer runs a
+next-token cross-entropy on those rows (`input_text` → target, through the tied input embedding — no separate
+LM head) as its own optimizer step. It's the standard **rehearsal** remedy for catastrophic forgetting
+([Robins 1995](https://doi.org/10.1080/09540099550039318)) applied to the backbone.
+
+```python
+rows = [
+    {"input_text": "...", "target_texts": ["...", "..."]},          # normal emit rows
+    {"input_text": "domain fact to keep fluent", "target_texts": ["..."] , "tag": "learn"},   # rehearsed as text
+]
+Trainer(model, TrainingArguments(learn_field="tag", learn_ratio=0.2), rows).train()
+```
+
+Works on **both** the single-latent and multi-latent paths (multi-latent uses `target_texts[0]` as the replay
+target). `learn_ratio=0` or no `learn` rows = off (byte-identical). Use it when the backbone must stay fluent on
+a domain while you retrain its emission geometry; leave it off for pure embedding tasks.
