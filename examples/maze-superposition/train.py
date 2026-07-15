@@ -56,6 +56,15 @@ def main() -> None:
     p.add_argument("--fsq-levels", type=int, default=8)
     p.add_argument("--sigreg", action="store_true", help="EMA-free anti-collapse (LeJEPA) instead of the EMA twin")
     p.add_argument("--sigreg-lambda", type=float, default=0.3)
+    p.add_argument("--random-init", action="store_true",
+                   help="CONTROL ARM: random-init backbone (no pretraining), full-param train, decoupled tokenizer. "
+                        "Tests whether the pretrained LLM matters for THIS world (mechanical maze -> expect it does not).")
+    p.add_argument("--tokenizer", default=None,
+                   help="HF tokenizer id for --random-init (default: same as --backbone)")
+    p.add_argument("--arch-overrides", default=None,
+                   help="JSON dict of config shrinks for --random-init, e.g. "
+                        "'{\"num_hidden_layers\": 6, \"hidden_size\": 384, \"num_attention_heads\": 6, "
+                        "\"num_key_value_heads\": 2, \"intermediate_size\": 1024}'")
     p.add_argument("--device", default="cuda", help="cuda (real runs) or cpu (a tiny smoke)")
     p.add_argument("--wandb", action="store_true", help="log to Weights & Biases (recommended for real runs)")
     p.add_argument("--wandb-project", default="langset-maze")
@@ -65,10 +74,20 @@ def main() -> None:
     rows = build_rows(z, a.max_fut)
     print(f"[train] {len(rows)} maze rows | backbone={a.backbone} | device={a.device}", flush=True)
 
-    model = LangSetModel.from_pretrained(
-        a.backbone, latent_dim=None, n_latents=1, multi_latent=True,
-        fsq_dim=a.fsq_dim, fsq_levels=a.fsq_levels, max_len=a.max_len,
-        bf16=(a.device == "cuda"), device=a.device)
+    if a.random_init:                        # CONTROL ARM: no pretrained knowledge, full-param train, chosen tokenizer
+        import json
+        overrides = json.loads(a.arch_overrides) if a.arch_overrides else None
+        print(f"[train] RANDOM-INIT arch={a.backbone} tokenizer={a.tokenizer or a.backbone} overrides={overrides}",
+              flush=True)
+        model = LangSetModel.from_scratch(
+            a.backbone, tokenizer_id=a.tokenizer, latent_dim=None, n_latents=1, multi_latent=True,
+            fsq_dim=a.fsq_dim, fsq_levels=a.fsq_levels, max_len=a.max_len,
+            bf16=(a.device == "cuda"), device=a.device, arch_overrides=overrides)
+    else:
+        model = LangSetModel.from_pretrained(
+            a.backbone, latent_dim=None, n_latents=1, multi_latent=True,
+            fsq_dim=a.fsq_dim, fsq_levels=a.fsq_levels, max_len=a.max_len,
+            bf16=(a.device == "cuda"), device=a.device)
 
     opts: dict = dict(
         epochs=a.epochs, batch_size=a.bs, lr=a.lr, max_len=a.max_len,
