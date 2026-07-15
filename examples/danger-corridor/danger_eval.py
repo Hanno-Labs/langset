@@ -54,11 +54,13 @@ def main() -> None:
                           for s in range(0, len(cont_txt), 256)])
 
     preds_die, len_pred_die = [], []                             # crux-latent decision; rollout-length decision
+    crux_ent, walk_ent = [], []                                  # cat-in-the-box: FSQ entropy at the animal vs a plain step
     B = 64
     for s0 in range(0, len(seeds), B):
         chunk = seeds[s0:s0 + B]
-        Lat, lengths = m.rollout(chunk, max_steps=L, return_lengths=True)
+        Lat, lengths, _sL, ent = m.rollout(chunk, max_steps=L, return_lengths=True, return_soft=True)
         Lat = F.normalize(Lat.float(), dim=-1).cpu()             # [b, L, d]
+        ent = ent.float().cpu().numpy()                          # [b, L] per-tick FSQ entropy
         for j, gi in enumerate(range(s0, s0 + len(chunk))):
             k, ln = crux[gi], int(lengths[j])
             if ln <= k:                                          # stopped at/before the animal -> a death prediction
@@ -68,8 +70,21 @@ def main() -> None:
                 sim_cont = float(cont_emb[gi] @ Lat[j, k])
                 preds_die.append(1 if sim_die > sim_cont else 0)
             len_pred_die.append(1 if ln < L else 0)              # secondary: did the walk end before the exit?
+            if ln >= 1:                                          # entropy at the crux (the box) vs the first walk step
+                crux_ent.append(float(ent[j, min(k, ln - 1)]))
+                walk_ent.append(float(ent[j, 0]))
+            else:
+                crux_ent.append(float("nan")); walk_ent.append(float("nan"))
 
     y = np.array(danger); pd = np.array(preds_die); pl = np.array(len_pred_die)
+    ce = np.array(crux_ent); we = np.array(walk_ent); ok = (pd == y)
+    box = {
+        "crux_entropy": round(float(np.nanmean(ce)), 4),                 # the cat in the box: how open is die/survive
+        "walk_entropy": round(float(np.nanmean(we)), 4),                 # a certain step -> the model's entropy floor
+        "excess_at_crux": round(float(np.nanmean(ce - we)), 4),          # lift at the decision (knowledge collapses it)
+        "crux_entropy_when_correct": round(float(np.nanmean(ce[ok])), 4) if ok.any() else None,
+        "crux_entropy_when_wrong": round(float(np.nanmean(ce[~ok])), 4) if (~ok).any() else None,
+    }
     def stats(pred):
         acc = float(np.mean(pred == y))
         dang = float(np.mean(pred[y == 1] == 1)) if (y == 1).any() else float("nan")   # recall on dangerous
@@ -77,7 +92,8 @@ def main() -> None:
         return {"acc": round(acc, 4), "dangerous_recall": round(dang, 4), "safe_recall": round(safe, 4)}
 
     out = {"ckpt": a.ckpt, "n": len(y), "corridor_len": L, "frac_dangerous": round(float(y.mean()), 4),
-           "chance": 0.5, "crux_decision": stats(pd), "rollout_length_decision": stats(pl)}
+           "chance": 0.5, "crux_decision": stats(pd), "rollout_length_decision": stats(pl),
+           "cat_in_the_box": box}
     print("=== DANGER-CORRIDOR HELD-OUT DIE-VS-SURVIVE ===")
     print(json.dumps(out))
 

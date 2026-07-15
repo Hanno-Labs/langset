@@ -75,6 +75,26 @@ def train_danger(random_init: bool = False, epochs: int = 30, n_train: int = 600
     hf_cache.commit()
 
 
+@app.function(image=image, gpu="A10G", timeout=3600, volumes={"/cache": hf_cache},
+              secrets=[modal.Secret.from_name("huggingface")])
+def eval_danger(arms: str = "pretrained,random", n_eval: int = 1000, eval_seed: int = 999) -> None:
+    """Re-run the held-out eval (incl. the cat-in-the-box FSQ-entropy readout) against persisted checkpoints,
+    so eval-code changes don't require retraining. Uses the SAME seed-999 held-out animal pool."""
+    import os
+    import subprocess
+    import sys
+
+    ex = "/pkg/example"
+    env = {**os.environ, "PYTHONPATH": "/pkg/src", "HF_HOME": "/cache/hf"}
+    eval_npz = "/tmp/danger_eval.npz"
+    subprocess.run([sys.executable, "gen_danger.py", "build", str(n_eval), eval_npz, str(eval_seed), "heldout"],
+                   cwd=ex, env=env, check=True)
+    for arm in [x.strip() for x in arms.split(",") if x.strip()]:
+        print(f"########## DANGER HELD-OUT EVAL: danger-{arm} ##########", flush=True)
+        subprocess.run([sys.executable, "danger_eval.py", "--data", eval_npz,
+                        "--ckpt", f"/cache/danger-{arm}", "--device", "cuda"], cwd=ex, env=env, check=True)
+
+
 @app.local_entrypoint()
 def main(only: str = "both", epochs: int = 30, n_train: int = 6000, n_eval: int = 1000,
          bs: int = 64, lr: float = 2e-4, arch_overrides: str = "") -> None:
