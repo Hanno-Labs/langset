@@ -9,8 +9,9 @@ essentials so you can read the whole thing top to bottom:
 It is a faithful reduction of `src/langset/modeling.py` + `src/langset/trainer.py`, with every peripheral feature
 STRIPPED OUT so the core is visible. Removed (each lives in the real trainer): the multi-latent / FSQ world-model
 path, the recon + text-replay ([LEARN]) auxiliaries, preempt-resume checkpointing, wandb, hard negatives,
-false-negative masking, the frozen-pool fast path, Per-Layer-Embedding (Gemma) handling, view-fusing, and the
-dependency-injected strategy seams. What remains is the primary objective and the eval/selection that guards it.
+false-negative masking, the frozen-pool fast path, Per-Layer-Embedding (Gemma) handling, view-fusing, the
+dependency-injected strategy seams, and the light uniformity aux term (the in-batch negatives keep the space
+from collapsing on their own). What remains is the primary objective and the collapse-aware selection that guards it.
 
 Minimal external dependencies: torch, transformers, peft, numpy. (No datasets, sentence-transformers, or setfit.)
 
@@ -33,8 +34,6 @@ VOCABULARY (for an engineer new to ML) — the terms used below, once:
 Run:
     python examples/isolated_training_loop.py
 """
-from __future__ import annotations
-
 from dataclasses import dataclass
 
 import numpy as np
@@ -55,7 +54,6 @@ class Config:
     batch_size: int = 8              # how many rows we process per optimizer step
     learning_rate: float = 5e-4      # how big each parameter nudge is
     tau: float = 0.07                # contrastive "temperature" (see the loss): smaller = pickier/sharper
-    lam_uniform: float = 0.1         # weight of the light "spread the embeddings out" auxiliary term
     val_frac: float = 0.2            # fraction of rows held out (never trained on) to score checkpoints
     seed: int = 0                    # fix randomness so runs are reproducible
 
@@ -243,19 +241,13 @@ def train(model: LangSetModel, data: list[dict], cfg: Config) -> LangSetModel:
             # negatives — free, no mining needed ("in-batch negatives"). cross_entropy pushes the diagonal up
             # and the off-diagonal down. This is what prevents collapse: identical vectors can't win this game.
             labels = torch.arange(batch_len, device=device)                # the correct column for each row = its index
-            loss = F.cross_entropy(similarity, labels)                      # primary term
-
-            # Optional light "uniformity" term: actively spread the input embeddings apart on the sphere (a
-            # known trick for healthier embedding geometry). It rewards larger average pairwise distance.
-            if cfg.lam_uniform > 0 and batch_len > 1:
-                pairwise_sq_dist = torch.pdist(F.normalize(pred, p=2, dim=-1), p=2).pow(2)
-                loss = loss + cfg.lam_uniform * pairwise_sq_dist.mul(-2.0).exp().mean().log()
+            loss = F.cross_entropy(similarity, labels)
 
             # ---- Backward pass + parameter update ----
             optimizer.zero_grad()      # clear gradients left over from the previous step
             loss.backward()            # backprop: compute d(loss)/d(parameter) for every trainable parameter
             optimizer.step()           # AdamW nudges each parameter a little to reduce the loss
-            running_loss += float(loss.detach())
+            running_loss += float(loss)
             num_batches += 1
 
         # ---- End of epoch: score on held-out data and remember the best checkpoint ----
