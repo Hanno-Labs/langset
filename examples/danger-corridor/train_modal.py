@@ -45,7 +45,8 @@ def train_danger(random_init: bool = False, train_base: bool = False, epochs: in
     import sys
 
     ex = "/pkg/example"
-    arm = "random" if random_init else ("pretrained-ft" if train_base else "pretrained")
+    # ft arms are LR-tagged so an LR sweep doesn't clobber a shared checkpoint (e.g. pretrained-ft-lr1e-04)
+    arm = "random" if random_init else (f"pretrained-ft-lr{lr:.0e}" if train_base else "pretrained")
     out = f"/cache/danger-{arm}"
     train_npz, eval_npz = "/tmp/danger_train.npz", "/tmp/danger_eval.npz"
     env = {**os.environ, "PYTHONPATH": "/pkg/src", "HF_HOME": "/cache/hf",
