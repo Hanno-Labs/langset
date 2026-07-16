@@ -7,6 +7,7 @@ defines where it should land). Pass a `datasets.Dataset` or `list[dict]`; use `c
 """
 from __future__ import annotations
 
+import random
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional, cast
 
@@ -99,6 +100,29 @@ def _tokenize_replay(tok: Any, texts: list[str], max_len: int, side: str, dev: t
     (right-pad the doc) silently conditions the replay loss on padding for any row shorter than the batch max."""
     e = tok(texts, padding=True, truncation=True, max_length=max_len, padding_side=side, return_tensors="pt")
     return e["input_ids"].to(dev), e["attention_mask"].to(dev)
+
+
+def _snapshot_best(m: LangSetModel) -> dict[str, Any]:
+    """Snapshot best-so-far weights to restore at the end of training. MIRRORS LangSetModel.save_pretrained's
+    branch: a PRETRAINED model rebuilds its backbone from `llm_model`, so LoRA-only is enough; a RANDOM-INIT
+    model (from_scratch) has no source to rebuild from, so we must snapshot the FULL backbone — otherwise the
+    best-so-far restore silently keeps the LAST-epoch backbone (a random-init net has no 'lora' keys, so the
+    old lora-only snapshot restored nothing into it). Applies to single-latent, multi-latent, and masked flows."""
+    snap: dict[str, Any] = {"head": {k: v.detach().cpu().clone() for k, v in m.head.state_dict().items()}}
+    if m._pretrained:
+        snap["lora"] = {k: v.detach().cpu().clone() for k, v in m.backbone.state_dict().items() if "lora" in k}
+    else:
+        snap["backbone"] = {k: v.detach().cpu().clone() for k, v in m.backbone.state_dict().items()}
+    return snap
+
+
+def _restore_best(m: LangSetModel, best_state: dict[str, Any]) -> None:
+    """Restore a _snapshot_best() payload. Back-compat: a legacy resume checkpoint carries only 'lora'."""
+    m.head.load_state_dict(best_state["head"])
+    if "backbone" in best_state:                     # random-init: full backbone
+        m.backbone.load_state_dict(best_state["backbone"], strict=False)
+    else:                                            # pretrained (or legacy checkpoint): LoRA only
+        m.backbone.load_state_dict(best_state["lora"], strict=False)
 
 
 def _replay_ce(model: LangSetModel, doc_ids: torch.Tensor, doc_mask: torch.Tensor,
@@ -269,6 +293,27 @@ class Trainer:
         cols = _columns(train_dataset)
         inv = {v: k for k, v in (column_mapping or {}).items()}   # user-col -> canonical
         get = lambda canon: cols[inv.get(canon, canon)]           # type: ignore[index]  # noqa: E731
+        # JEPA masked-self-prediction: the caller gives a RAW `text` column; the Trainer masks it FRESH EVERY
+        # EPOCH in train() (target = the full text, the EMA-twin teacher; input = a masked view). Nothing is
+        # pre-masked here — we only stash the raw texts + resolved masker. Auto-activates when the dataset has a
+        # `text` column and no `input_text`, or when `args.masker` is set explicitly.
+        _has = lambda c: (inv.get(c, c) in cols)                   # noqa: E731
+        self._masking = (getattr(args, "masker", None) is not None) or (_has("text") and not _has("input_text"))
+        self._masker: Optional[Any] = None
+        self._mask_texts: list[str] = []
+        if self._masking:
+            if self.multi_latent:
+                raise ValueError("masked mode (JEPA) is single-latent only; use a non-multi_latent model")
+            from langset.masking import mask_view, resolve_masker
+            self._masker = resolve_masker(getattr(args, "masker", None), getattr(args, "mask_ratio", 0.15))
+            self._mask_view = mask_view                            # bound for per-epoch re-masking in train()
+            self._mask_texts = [str(x) for x in get("text")]
+            if not self._mask_texts:
+                raise ValueError("masked mode needs a non-empty `text` column")
+            _init = self._mask_view(self._mask_texts, self._masker, random.Random(args.seed))
+            cols = {**cols, "input_text": _init, "target_text": list(self._mask_texts)}
+            inv = {}                                              # canonical names now present directly in cols
+            get = lambda canon: cols[canon]                       # type: ignore[index]  # noqa: E731
         self.input_text = [str(x) for x in get("input_text")]
         if self.multi_latent:
             raw_tt = get("target_texts")                          # per row: a non-empty list of target descriptions
@@ -339,6 +384,17 @@ class Trainer:
                     print(f"[langset] FSQ label subspace: "
                           + "; ".join(f"{f}->{args.label_dims[f]} ({len(self.label_codewords[f])} cls)"
                                       for f in args.label_dims), flush=True)
+            # optional CONTINUOUS EMB SLOTS (multi-latent): per-row facet label columns (named by the emb_slots dict
+            # keys), stashed as raw strings — MIRRORS the single-latent reader below (392-399). The class<->id maps +
+            # transient decoder heads are built in _train_multi(). Set HERE because this branch returns before the
+            # single-latent slot setup. Facet labels are PER-ROW; the multi-latent decode mean-pools the emitted
+            # latent SET before slicing (see the slot loss in _train_multi). None = off (byte-identical).
+            self.slot_labels: Optional[dict[str, list[str]]] = None
+            if getattr(args, "emb_slots", None):
+                self.slot_labels = {}
+                for field in args.emb_slots:
+                    raw = cols[inv.get(field, field)]
+                    self.slot_labels[field] = [("" if v is None else str(v)) for v in raw]
             # TEXT REPLAY tag (multi-latent): rows marked "learn" rehearse the backbone's plain next-token ability
             # (interleaved at `learn_ratio` in _train_multi). Must be set HERE — this branch returns before the
             # single-latent is_learn setup below. learn_field unset / learn_ratio=0 -> all-False (feature off).
@@ -367,6 +423,15 @@ class Trainer:
         if getattr(args, "hard_neg_field", None) is not None:
             raw = cols[inv.get(args.hard_neg_field, args.hard_neg_field)]
             self.hard_neg_text = [str(v) if v not in (None, "") else "" for v in raw]
+        # optional CONTINUOUS EMB SLOTS: per-row facet label columns (named by the emb_slots dict keys). Stashed as raw
+        # strings here; the class<->id maps + transient decoder heads are built in train() (see TrainingArguments.emb_slots).
+        # (type declared once in the multi_latent branch above; plain re-assign here to avoid a mypy no-redef.)
+        self.slot_labels = None
+        if getattr(args, "emb_slots", None):
+            self.slot_labels = {}
+            for field in args.emb_slots:
+                raw = cols[inv.get(field, field)]
+                self.slot_labels[field] = [("" if v is None else str(v)) for v in raw]
         # optional knowledge-injection: rows tagged "learn" train next-token CE (input_text -> target_text) instead
         # of contrastive; they're pulled OUT of the contrastive split and fed as a separate learn pool.
         self.is_learn: list[bool] = [False] * len(self.input_text)
@@ -379,7 +444,10 @@ class Trainer:
             masked = "" if self.mask_keys is None else " (+false-neg mask)"
             hn = "" if self.hard_neg_text is None else " (+hard-neg)"
             lr = "" if n_learn == 0 else f" (+{n_learn} learn @ratio {args.learn_ratio})"
-            print(f"[langset] {len(self.input_text)} rows{masked}{hn}{lr}", flush=True)
+            jepa = "" if not self._masking else (
+                f" (JEPA masked-self: {type(self._masker).__name__} @{getattr(args, 'mask_ratio', 0.15)}, "
+                f"fresh mask/epoch)")
+            print(f"[langset] {len(self.input_text)} rows{jepa}{masked}{hn}{lr}", flush=True)
 
     def train(self) -> LangSetModel:
         if self.multi_latent:
@@ -444,8 +512,28 @@ class Trainer:
             # found missing). Shared _replay_ce (tied-embedding projection on the target span only, no lm_head/OOM).
             return _replay_ce(m, ln_doc_ids[pos], ln_doc_mask[pos], ln_tgt_ids[pos], ln_tgt_mask[pos], vsz)
 
-        opt = torch.optim.AdamW([p for p in m.parameters() if p.requires_grad] + list(connector.parameters()),
-                                lr=a.lr)
+        # CONTINUOUS EMB SLOTS: one TRANSIENT decoder head per facet, each reading ONLY its reserved dim slice of the
+        # emit vector `pred`. CE (classify) / MSE (regress). Grad flows into the encoder through those dims -> the
+        # facet is routed INTO the slice. Heads are trained but NOT saved (like the phase head; eval re-fits its own).
+        slot_plan: list[tuple[str, int, int, str, torch.nn.Module, dict[str, int]]] = []
+        if self.slot_labels is not None:
+            for field, (lo, hi, kind) in a.emb_slots.items():
+                labs = self.slot_labels[field]
+                if kind == "classify":
+                    classes = sorted({v for v in labs if v.lower() not in ("", "unknown", "none", "nan", "na")})
+                    cls2id = {c: i for i, c in enumerate(classes)}
+                    head: torch.nn.Module = torch.nn.Linear(hi - lo, len(classes)).to(dev)
+                else:  # regress
+                    cls2id = {}
+                    head = torch.nn.Linear(hi - lo, 1).to(dev)
+                slot_plan.append((field, lo, hi, kind, head, cls2id))
+            if a.verbose:
+                print("[langset] emb slots: " + "; ".join(
+                    f"{f}->[{lo}:{hi}] {kind}({len(c) if c else 'reg'})"
+                    for f, lo, hi, kind, _, c in slot_plan), flush=True)
+        slot_params = [p for (_, _, _, _, h, _) in slot_plan for p in h.parameters()]
+        opt = torch.optim.AdamW([p for p in m.parameters() if p.requires_grad] + list(connector.parameters())
+                                + slot_params, lr=a.lr)
         run = None
         if a.report_to == "wandb":
             import wandb  # type: ignore[import-untyped]
@@ -467,6 +555,10 @@ class Trainer:
                 if nm in _params:
                     _params[nm].data.copy_(t.to(_params[nm].device, _params[nm].dtype))
             connector.load_state_dict({k: v.to(dev) for k, v in ck["connector"].items()})
+            for field, _, _, _, head, _ in slot_plan:          # transient slot heads (present only if emb_slots on)
+                sd = ck.get("slot_heads", {}).get(field)
+                if sd is not None:
+                    head.load_state_dict({k: v.to(dev) for k, v in sd.items()})
             opt.load_state_dict(ck["opt"])
             for stt in opt.state.values():                     # optimizer state tensors must live on the model's device
                 for k, v in stt.items():
@@ -490,6 +582,8 @@ class Trainer:
             torch.save({
                 "trainable": {nm: p.detach().cpu() for nm, p in m.named_parameters() if p.requires_grad},
                 "connector": {k: v.detach().cpu() for k, v in connector.state_dict().items()},
+                "slot_heads": {f: {k: v.detach().cpu() for k, v in h.state_dict().items()}
+                               for f, _, _, _, h, _ in slot_plan},
                 "opt": opt.state_dict(),
                 "ep": int(next_ep), "best_score": float(best_score), "no_improve": int(no_improve),
                 "best_state": best_state, "np_rng": rng.bit_generator.state, "torch_rng": torch.get_rng_state(),
@@ -533,6 +627,13 @@ class Trainer:
 
         for ep in range(start_ep, a.epochs):
             m.train()
+            # JEPA: RE-MASK the raw text fresh this epoch (new random holes every epoch -> the model never sees
+            # the same (visible, hidden) split twice; target view t2 stays the full text and is untouched).
+            if self._masking:
+                new_in = self._mask_view(self._mask_texts, self._masker, random.Random(a.seed + 1000 + ep))
+                self.input_text = new_in                          # val eval re-encodes from this
+                ids, mask = tok_to(new_in, a.max_len)
+                engine.ids, engine.mask = ids, mask               # backbone re-featurizes from these each step
             order = tr_idx[rng.permutation(len(tr_idx))]
             if a.max_steps_per_epoch:                          # SMALL epochs: cap steps so each <= ~30min (natural save pt)
                 order = order[:a.max_steps_per_epoch * a.batch_size]
@@ -572,6 +673,21 @@ class Trainer:
                 if bool(neg_mask.any()):
                     logits = logits.masked_fill(neg_mask, float("-inf"))   # diagonal (positive) always kept
                 loss = F.cross_entropy(logits, torch.arange(B, device=dev))                 # primary
+                for field, lo, hi, kind, head, cls2id in slot_plan:                          # aux: CONTINUOUS EMB SLOTS
+                    labs = self.slot_labels[field]                                           # decode facet from pred[lo:hi]
+                    sub = pred[:, lo:hi]                                                      # -> encoder routes it there
+                    rows_i = idx.tolist()
+                    if kind == "classify":
+                        yi = torch.tensor([cls2id.get(labs[j], -100) for j in rows_i], device=dev)
+                        if bool((yi >= 0).any()):
+                            loss = loss + a.lam_emb_slots * F.cross_entropy(head(sub), yi, ignore_index=-100)
+                    else:                                                                    # regress: MSE on known rows
+                        keep = [k for k, j in enumerate(rows_i)
+                                if labs[j].lower() not in ("", "unknown", "none", "nan", "na")]
+                        if keep:
+                            ki = torch.tensor(keep, device=dev)
+                            yt = torch.tensor([float(labs[rows_i[k]]) for k in keep], device=dev).unsqueeze(1)
+                            loss = loss + a.lam_emb_slots * F.mse_loss(head(sub[ki]), yt)
                 if engine.supports_recon and a.lam_recon > 0:                                # aux: grounding. At 0 the
                     loss = loss + a.lam_recon * engine.recon(pred, idx)                      # term is zero anyway; SKIP so
                     #  recon's fp32 full-vocab ([B,S,vocab]) projection graph is NOT built every step (that graph, not
@@ -633,9 +749,7 @@ class Trainer:
 
             if sel_score > best_score:
                 best_score = sel_score
-                best_state = {"head": {k: v.detach().cpu().clone() for k, v in m.head.state_dict().items()},
-                              "lora": {k: v.detach().cpu().clone()
-                                       for k, v in m.backbone.state_dict().items() if "lora" in k}}
+                best_state = _snapshot_best(m)       # LoRA-only if pretrained, FULL backbone if random-init
                 no_improve = 0
                 if self.on_checkpoint is not None:            # persist best-so-far + notify (live checkpoint)
                     Path(a.output_dir).mkdir(parents=True, exist_ok=True)
@@ -650,8 +764,7 @@ class Trainer:
             save_resume(ep + 1)          # epoch boundary: durable full-state checkpoint so a preempt resumes HERE, not ep0
 
         if best_state is not None:                            # restore best
-            m.head.load_state_dict(best_state["head"])
-            m.backbone.load_state_dict(best_state["lora"], strict=False)
+            _restore_best(m, best_state)
         m.eval()
         Path(a.output_dir).mkdir(parents=True, exist_ok=True)
         m.save_pretrained(a.output_dir)
@@ -712,10 +825,37 @@ class Trainer:
                            if lb and lb.lower() not in ("unknown", "none", "nan", "")})
             phase_ids = {lb: i for i, lb in enumerate(labs)}
             phase_head = torch.nn.Linear(d, len(phase_ids)).to(dev)
+        # CONTINUOUS EMB SLOTS (multi-latent port): one TRANSIENT decoder head per facet, each reading ONLY its reserved
+        # dim slice of the row's emit. In the single-latent path the emit is one vector; here the model emits a
+        # VARIABLE-LENGTH latent SET (em.recon [B, L, d] + valid [B, L]). DESIGN DECISION: to decode a PER-ROW facet
+        # from a per-row SET we mean-pool the VALID latents over L -> [B, d], then slice [:, lo:hi] — this mirrors
+        # single-latent semantics (one vector per row) exactly and is the safe default. The transient head + CE/MSE loss
+        # (see the slot loss in the step loop) then force the encoder to route the facet into that slice; grad reaches
+        # every emitted latent equally through the mean-pool. ALTERNATIVE (future work): slot a single DESIGNATED latent
+        # (e.g. position 0 / the emit_seed node), or give each latent its OWN per-position slot label — both need a
+        # richer per-position label schema than the per-row columns we have, so pooling is preferred until that lands.
+        # Heads are trained but NOT saved to the model (like phase_head; eval re-fits its own probe on the slice).
+        slot_plan: list[tuple[str, int, int, str, torch.nn.Module, dict[str, int]]] = []
+        if self.slot_labels is not None:
+            for field, (lo, hi, kind) in a.emb_slots.items():
+                labs = self.slot_labels[field]
+                if kind == "classify":
+                    classes = sorted({v for v in labs if v.lower() not in ("", "unknown", "none", "nan", "na")})
+                    cls2id = {c: i for i, c in enumerate(classes)}
+                    slot_head: torch.nn.Module = torch.nn.Linear(hi - lo, len(classes)).to(dev)
+                else:  # regress
+                    cls2id = {}
+                    slot_head = torch.nn.Linear(hi - lo, 1).to(dev)
+                slot_plan.append((field, lo, hi, kind, slot_head, cls2id))
+            if a.verbose:
+                print("[langset] emb slots (multi, mean-pooled): " + "; ".join(
+                    f"{f}->[{lo}:{hi}] {kind}({len(c) if c else 'reg'})"
+                    for f, lo, hi, kind, _, c in slot_plan), flush=True)
+        slot_params = [p for (_, _, _, _, h, _) in slot_plan for p in h.parameters()]
         params = [p for p in m.parameters() if p.requires_grad]
         if phase_head is not None:
             params = params + list(phase_head.parameters())
-        opt = torch.optim.AdamW(params, lr=a.lr)
+        opt = torch.optim.AdamW(params + slot_params, lr=a.lr)
         run = None
         if a.report_to == "wandb":
             import wandb  # type: ignore[import-untyped]
@@ -793,6 +933,10 @@ class Trainer:
                     _params[nm].data.copy_(t.to(_params[nm].device, _params[nm].dtype))
             if phase_head is not None and ck.get("phase_head") is not None:
                 phase_head.load_state_dict({k: v.to(dev) for k, v in ck["phase_head"].items()})
+            for field, _, _, _, s_head, _ in slot_plan:        # transient slot heads (present only if emb_slots on)
+                sd = ck.get("slot_heads", {}).get(field)
+                if sd is not None:
+                    s_head.load_state_dict({k: v.to(dev) for k, v in sd.items()})
             opt.load_state_dict(ck["opt"])
             for stt in opt.state.values():                     # optimizer state tensors must live on the model's device
                 for k, v in stt.items():
@@ -821,6 +965,9 @@ class Trainer:
             }
             if phase_head is not None:
                 payload["phase_head"] = {k: v.detach().cpu() for k, v in phase_head.state_dict().items()}
+            if slot_plan:                                      # transient slot heads (only when emb_slots on)
+                payload["slot_heads"] = {f: {k: v.detach().cpu() for k, v in h.state_dict().items()}
+                                         for f, _, _, _, h, _ in slot_plan}
             torch.save(payload, tmp)
             tmp.replace(d / "resume.pt")
             if self.on_checkpoint is not None:
@@ -924,6 +1071,30 @@ class Trainer:
                     loss_sig = target_source.regularizer(z_pred, z_tgt)
                     loss = loss + a.sigreg_lambda * loss_sig
                     agg["loss_sig"] = agg.get("loss_sig", 0.0) + float(loss_sig.detach())
+                if slot_plan:                                   # aux: CONTINUOUS EMB SLOTS (per-row facet, mean-pooled)
+                    # MEAN-POOL the emitted latent SET over its VALID positions -> one [b, d] vector per row (the
+                    # single-latent analog), then decode each facet from its reserved slice. gradient flows back
+                    # through every valid emitted latent equally, routing the facet INTO those dims.
+                    _vm = valid.unsqueeze(-1).to(em.recon.dtype)               # [b, lmax, 1]
+                    pooled = (em.recon * _vm).sum(1) / _vm.sum(1).clamp(min=1.0)   # [b, d] mean over valid latents
+                    for field, lo, hi, kind, slot_head, cls2id in slot_plan:
+                        labs = self.slot_labels[field]                        # decode facet from pooled[:, lo:hi]
+                        sub = pooled[:, lo:hi]                                 # -> encoder routes it there
+                        if kind == "classify":
+                            yi = torch.tensor([cls2id.get(labs[j], -100) for j in bidx], device=dev)
+                            if bool((yi >= 0).any()):
+                                _sl = F.cross_entropy(slot_head(sub), yi, ignore_index=-100)
+                                loss = loss + a.lam_emb_slots * _sl
+                                agg["loss_slots"] = agg.get("loss_slots", 0.0) + float(_sl.detach())
+                        else:                                                 # regress: MSE on known rows
+                            keep = [k for k, j in enumerate(bidx)
+                                    if labs[j].lower() not in ("", "unknown", "none", "nan", "na")]
+                            if keep:
+                                ki = torch.tensor(keep, device=dev)
+                                yt = torch.tensor([float(labs[bidx[k]]) for k in keep], device=dev).unsqueeze(1)
+                                _sl = F.mse_loss(slot_head(sub[ki]), yt)
+                                loss = loss + a.lam_emb_slots * _sl
+                                agg["loss_slots"] = agg.get("loss_slots", 0.0) + float(_sl.detach())
                 opt.zero_grad()
                 with _rf("backward"):
                     loss.backward()                                 # frees the main graph before any isolated term runs
@@ -1005,9 +1176,7 @@ class Trainer:
                          "eval/n_distinct": metrics["n_distinct"], "eval/avg_emitted": metrics["avg_emitted"]})
             if sel > best:
                 best = sel
-                best_state = {"head": {kk: vv.detach().cpu().clone() for kk, vv in m.head.state_dict().items()},
-                              "lora": {kk: vv.detach().cpu().clone()
-                                       for kk, vv in m.backbone.state_dict().items() if "lora" in kk}}
+                best_state = _snapshot_best(m)                     # LoRA-only if pretrained, FULL backbone if random-init
                 Path(a.output_dir).mkdir(parents=True, exist_ok=True)
                 m.save_pretrained(a.output_dir)                     # persist best-so-far (live checkpoint)
                 if self.on_checkpoint is not None:
@@ -1017,8 +1186,7 @@ class Trainer:
             save_resume(ep + 1)          # epoch boundary: durable full-state checkpoint so a preempt resumes HERE, not ep0
 
         if best_state is not None:                                  # restore best into memory (matches single-latent)
-            m.head.load_state_dict(best_state["head"])
-            m.backbone.load_state_dict(best_state["lora"], strict=False)
+            _restore_best(m, best_state)
         m.eval()
         Path(a.output_dir).mkdir(parents=True, exist_ok=True)
         m.save_pretrained(a.output_dir)

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from langset.strategies import (
     EMATwinTarget,
@@ -97,6 +97,20 @@ class TrainingArguments:
     # not diluted among the ~1000 free reconstruction dims — at weight 1 it sits at parity with loss_dims/recon.
     lam_label_dims: float = 1.0
 
+    # CONTINUOUS EMBEDDING SLOTS — the continuous analog of `label_dims` (which reserves FSQ *digit* indices). Reserve
+    # a CONTIGUOUS slice of dims of the single emitted embedding for a named facet and bind it with a small transient
+    # decoder head (CE for "classify", MSE for "regress") that reads ONLY those dims — so gradient forces the encoder
+    # to route the facet INTO that slice. The facet then lives AS a readable sub-vector (emb[lo:hi] decodes to it)
+    # instead of smeared across all d dims, and WITHOUT a persisted model: like the phase head the slot head is not
+    # saved — its only job is to inject gradient (eval re-fits its own probe on the now-informative slice). The slot
+    # dims still participate in the retrieval InfoNCE; they just ALSO carry a legible facet. Per-item labels come from
+    # a dataset column named by the dict key; unknown/""/"none"/"nan" -> that item ignored for the slot. Works on BOTH
+    # the single-latent path (slots the one emitted embedding) and the multi-latent path (MEAN-POOLS the emitted latent
+    # SET over its valid positions -> one per-row vector, then slots that — same per-row semantics).
+    # None = off (byte-identical). e.g. {"material_bucket": (0, 64, "classify"), "side": (64, 80, "classify")}.
+    emb_slots: Optional[dict[str, tuple[int, int, str]]] = None
+    lam_emb_slots: float = 1.0
+
     # MULTI-HOP training (scheduled sampling). ss_prob=0 = pure teacher forcing, gradients flow 1 hop (default,
     # byte-identical). ss_prob>0: for the first `train_hops` emitted positions (None = ALL), feed the model's OWN
     # predicted latent back with probability ss_prob instead of ground truth — the exposure-bias fix that makes
@@ -138,6 +152,11 @@ class TrainingArguments:
     # abstract, and 64 tokens keeps only its (often boilerplate) intro -> blurry phase-0 identity. Short targets
     # (e.g. future-event strings) are already < 64 so a higher cap only enriches the long ones (mild padding cost).
     target_max_len: int = 64
+    # CachedTarget (two-stage, frozen-encoder) — path to a saved LangSetModel that supplies a FIXED target geometry
+    # the emitter learns to roll forward in. Set together with `target_source=CachedTarget`: the targets and the
+    # hard-negative bank are encoded ONCE and cached, so epochs stop re-encoding fixed data. None (default) = the
+    # co-training EMA twin path (unchanged). Inert unless target_source is CachedTarget.
+    target_encoder_ckpt: Optional[str] = None
 
     # SIGReg (LeJEPA, arXiv:2511.08544) scalar knobs — used only when the target source is SIGRegTarget (inject via
     # `TrainingArguments(target_source=SIGRegTarget)`, see the injection block below). SIGRegTarget replaces the EMA
@@ -178,6 +197,18 @@ class TrainingArguments:
     epoch_order: Callable = multi_epoch_order      # (tr_idx, rng, args, seeds) -> list[int] : per-epoch visiting order
     selector: Callable = multi_select_metric       # (mode, mrr, purity, ep) -> float : the checkpoint-selection signal
     seed_builder: Callable = multi_seed_texts      # (trainer, seeds, args) -> list[str] : the texts the emission reads
+
+    # JEPA MASKED-SELF-PREDICTION mode (single-latent). You give a `text` column of RAW, UNMASKED text; the
+    # Trainer masks it FRESH EVERY EPOCH at runtime (input_text=visible, target_text=full) — no external label,
+    # no pre-built masked training data, and unlimited mask diversity from a small corpus. It auto-activates when
+    # the dataset has a `text` column and no `input_text` (zero-config). `masker` selects the algorithm:
+    #   None / "word"  -> TokenMasker(mask_ratio)  : hide scattered words (the reasonable default)
+    #   "span"         -> SpanMasker(mask_ratio)   : hide one contiguous span
+    #   "field"        -> FieldMasker(ratio=mask_ratio) : hide whole delimited fields
+    #   a Callable (text, rng) -> (visible, hidden) : your own masker (e.g. TokenMasker with a protect predicate)
+    # Set masker explicitly to force masking even when input_text/target_text are present.
+    masker: Optional[Callable[..., Any] | str] = None
+    mask_ratio: float = 0.15
 
     # PREEMPT-RESUME (long big-model runs on preemptible GPUs). Epochs are the natural checkpoint boundary, so instead of
     # fragile mid-epoch state we make epochs SMALL: `max_steps_per_epoch` caps each epoch to N steps (~<=30min of wall
