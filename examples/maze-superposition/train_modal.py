@@ -37,16 +37,17 @@ hf_cache = modal.Volume.from_name("langset-hf-cache", create_if_missing=True)
 
 @app.function(image=image, gpu="A10G", timeout=10800, volumes={"/cache": hf_cache},
               secrets=[modal.Secret.from_name("wandb-api-key"), modal.Secret.from_name("huggingface")])
-def train_maze(random_init: bool = False, epochs: int = 30, n_train: int = 4000, n_eval: int = 800,
-               backbone: str = "HuggingFaceTB/SmolLM2-135M", tokenizer: str = "", arch_overrides: str = "",
-               sigreg: bool = False, bs: int = 16, lr: float = 2e-4, eval_seed: int = 999) -> None:
+def train_maze(random_init: bool = False, train_base: bool = False, epochs: int = 30, n_train: int = 4000,
+               n_eval: int = 800, backbone: str = "HuggingFaceTB/SmolLM2-135M", tokenizer: str = "",
+               arch_overrides: str = "", sigreg: bool = False, bs: int = 16, lr: float = 2e-4,
+               eval_seed: int = 999) -> None:
     """One arm: generate a fixed corpus, train (wandb), then run the calibration/solvability eval."""
     import os
     import subprocess
     import sys
 
     ex = "/pkg/example"
-    arm = "random" if random_init else "pretrained"
+    arm = "random" if random_init else ("pretrained-ft" if train_base else "pretrained")
     out = f"/cache/maze-{arm}"
     train_npz, eval_npz = "/tmp/maze.npz", "/tmp/maze_eval.npz"
     env = {**os.environ, "PYTHONPATH": "/pkg/src", "HF_HOME": "/cache/hf",
@@ -69,6 +70,8 @@ def train_maze(random_init: bool = False, epochs: int = 30, n_train: int = 4000,
             train_cmd += ["--tokenizer", tokenizer]
         if arch_overrides:
             train_cmd += ["--arch-overrides", arch_overrides]
+    if train_base:
+        train_cmd.append("--train-base")
     if sigreg:
         train_cmd.append("--sigreg")
     sh(train_cmd)
@@ -79,17 +82,43 @@ def train_maze(random_init: bool = False, epochs: int = 30, n_train: int = 4000,
     hf_cache.commit()
 
 
+@app.function(image=image, gpu="A10G", timeout=3600, volumes={"/cache": hf_cache},
+              secrets=[modal.Secret.from_name("huggingface")])
+def probe_geometry(arms: str = "random,pretrained", n_eval: int = 800, eval_seed: int = 999) -> None:
+    """Run the cognitive-map geometry probe on each trained arm: does the emitted-latent space mirror the maze
+    grid (strong NEGATIVE spatial_map_spearman_gdist_vs_cos = adjacent cells -> similar readout directions)?
+    Uses the SAME seed-999 eval corpus the arms were scored on. Dumps raw arrays to /cache/geom-<arm>.npz."""
+    import os
+    import subprocess
+    import sys
+
+    ex = "/pkg/example"
+    env = {**os.environ, "PYTHONPATH": "/pkg/src", "HF_HOME": "/cache/hf"}
+    eval_npz = "/tmp/maze_eval.npz"
+    subprocess.run([sys.executable, "gen_maze.py", "build", str(n_eval), eval_npz, str(eval_seed)],
+                   cwd=ex, env=env, check=True)
+    for arm in [x.strip() for x in arms.split(",") if x.strip()]:
+        print(f"########## GEOMETRY PROBE: maze-{arm} ##########", flush=True)
+        subprocess.run([sys.executable, "geom_probe.py", "--data", eval_npz,
+                        "--ckpt", f"/cache/maze-{arm}", "--dump", f"/cache/geom-{arm}.npz"],
+                       cwd=ex, env=env, check=True)
+    hf_cache.commit()
+
+
 @app.local_entrypoint()
 def main(only: str = "both", epochs: int = 30, n_train: int = 4000, n_eval: int = 800,
-         bs: int = 64, lr: float = 2e-4, arch_overrides: str = "", sigreg: bool = False) -> None:
-    """Launch the ablation. `only` = both | pretrained | random. Spawns arms in parallel (detached).
-    bs default 64 (A10G VRAM was ~14% at bs16; a bigger batch fills it AND gives the NCE more negatives)."""
-    kw = dict(epochs=epochs, n_train=n_train, n_eval=n_eval, bs=bs, lr=lr, sigreg=sigreg)
+         bs: int = 64, lr: float = 2e-4, ft_lr: float = 2e-5, arch_overrides: str = "", sigreg: bool = False) -> None:
+    """Launch the ablation. `only` = both | pretrained | random | pretrained_ft | disentangle.
+    pretrained_ft = DISENTANGLER (pretrained backbone, full-param train at ft_lr, so only init differs from random);
+    `disentangle` runs random + pretrained_ft together. bs default 64 (A10G VRAM was ~14% at bs16)."""
+    base = dict(epochs=epochs, n_train=n_train, n_eval=n_eval, bs=bs, sigreg=sigreg)
     handles = []
     if only in ("both", "pretrained"):
-        handles.append(("pretrained", train_maze.spawn(random_init=False, **kw)))
-    if only in ("both", "random"):
-        handles.append(("random", train_maze.spawn(random_init=True, arch_overrides=arch_overrides, **kw)))
+        handles.append(("pretrained", train_maze.spawn(random_init=False, lr=lr, **base)))
+    if only in ("both", "random", "disentangle"):
+        handles.append(("random", train_maze.spawn(random_init=True, lr=lr, arch_overrides=arch_overrides, **base)))
+    if only in ("pretrained_ft", "disentangle"):
+        handles.append(("pretrained-ft", train_maze.spawn(random_init=False, train_base=True, lr=ft_lr, **base)))
     for name, h in handles:
         print(f"spawned maze-{name}: {h.object_id}")
-    print("watch: wandb project `langset-maze` (runs maze-pretrained / maze-random)")
+    print("watch: wandb project `langset-maze`")

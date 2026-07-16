@@ -36,15 +36,16 @@ hf_cache = modal.Volume.from_name("langset-hf-cache", create_if_missing=True)
 
 @app.function(image=image, gpu="A10G", timeout=10800, volumes={"/cache": hf_cache},
               secrets=[modal.Secret.from_name("wandb-api-key"), modal.Secret.from_name("huggingface")])
-def train_danger(random_init: bool = False, epochs: int = 30, n_train: int = 6000, n_eval: int = 1000,
-                 backbone: str = "HuggingFaceTB/SmolLM2-135M", tokenizer: str = "", arch_overrides: str = "",
-                 bs: int = 64, lr: float = 2e-4, max_len: int = 256, eval_seed: int = 999) -> None:
+def train_danger(random_init: bool = False, train_base: bool = False, epochs: int = 30, n_train: int = 6000,
+                 n_eval: int = 1000, backbone: str = "HuggingFaceTB/SmolLM2-135M", tokenizer: str = "",
+                 arch_overrides: str = "", bs: int = 64, lr: float = 2e-4, max_len: int = 256,
+                 eval_seed: int = 999) -> None:
     import os
     import subprocess
     import sys
 
     ex = "/pkg/example"
-    arm = "random" if random_init else "pretrained"
+    arm = "random" if random_init else ("pretrained-ft" if train_base else "pretrained")
     out = f"/cache/danger-{arm}"
     train_npz, eval_npz = "/tmp/danger_train.npz", "/tmp/danger_eval.npz"
     env = {**os.environ, "PYTHONPATH": "/pkg/src", "HF_HOME": "/cache/hf",
@@ -67,6 +68,8 @@ def train_danger(random_init: bool = False, epochs: int = 30, n_train: int = 600
             train_cmd += ["--tokenizer", tokenizer]
         if arch_overrides:
             train_cmd += ["--arch-overrides", arch_overrides]
+    if train_base:
+        train_cmd.append("--train-base")
     sh(train_cmd)
     hf_cache.commit()
 
@@ -77,7 +80,7 @@ def train_danger(random_init: bool = False, epochs: int = 30, n_train: int = 600
 
 @app.function(image=image, gpu="A10G", timeout=3600, volumes={"/cache": hf_cache},
               secrets=[modal.Secret.from_name("huggingface")])
-def eval_danger(arms: str = "pretrained,random", n_eval: int = 1000, eval_seed: int = 999) -> None:
+def eval_danger(arms: str = "pretrained,random,pretrained-ft", n_eval: int = 1000, eval_seed: int = 999) -> None:
     """Re-run the held-out eval (incl. the cat-in-the-box FSQ-entropy readout) against persisted checkpoints,
     so eval-code changes don't require retraining. Uses the SAME seed-999 held-out animal pool."""
     import os
@@ -97,13 +100,18 @@ def eval_danger(arms: str = "pretrained,random", n_eval: int = 1000, eval_seed: 
 
 @app.local_entrypoint()
 def main(only: str = "both", epochs: int = 30, n_train: int = 6000, n_eval: int = 1000,
-         bs: int = 64, lr: float = 2e-4, arch_overrides: str = "") -> None:
-    kw = dict(epochs=epochs, n_train=n_train, n_eval=n_eval, bs=bs, lr=lr)
+         bs: int = 64, lr: float = 2e-4, ft_lr: float = 2e-5, arch_overrides: str = "") -> None:
+    """`only` = both | pretrained | random | pretrained_ft | disentangle.
+    pretrained_ft = the DISENTANGLER arm (pretrained backbone, full-param train at a gentler ft_lr so only
+    initialization differs from the random arm). `disentangle` runs random + pretrained_ft together."""
+    base = dict(epochs=epochs, n_train=n_train, n_eval=n_eval, bs=bs)
     handles = []
     if only in ("both", "pretrained"):
-        handles.append(("pretrained", train_danger.spawn(random_init=False, **kw)))
-    if only in ("both", "random"):
-        handles.append(("random", train_danger.spawn(random_init=True, arch_overrides=arch_overrides, **kw)))
+        handles.append(("pretrained", train_danger.spawn(random_init=False, lr=lr, **base)))
+    if only in ("both", "random", "disentangle"):
+        handles.append(("random", train_danger.spawn(random_init=True, lr=lr, arch_overrides=arch_overrides, **base)))
+    if only in ("pretrained_ft", "disentangle"):
+        handles.append(("pretrained-ft", train_danger.spawn(random_init=False, train_base=True, lr=ft_lr, **base)))
     for name, h in handles:
         print(f"spawned danger-{name}: {h.object_id}")
-    print("watch: wandb project `langset-danger` (runs danger-pretrained / danger-random)")
+    print("watch: wandb project `langset-danger`")

@@ -65,6 +65,10 @@ def main() -> None:
                    help="JSON dict of config shrinks for --random-init, e.g. "
                         "'{\"num_hidden_layers\": 6, \"hidden_size\": 384, \"num_attention_heads\": 6, "
                         "\"num_key_value_heads\": 2, \"intermediate_size\": 1024}'")
+    p.add_argument("--train-base", action="store_true",
+                   help="DISENTANGLER ARM: pretrained backbone, FULL-PARAM train (unfreeze base, not LoRA-only). "
+                        "Removes the LoRA-vs-full-FT regime confound so pretrained-vs-random differs ONLY in init. "
+                        "Use a gentler lr (~2e-5) so full-FT does not overwrite the pretrained knowledge.")
     p.add_argument("--device", default="cuda", help="cuda (real runs) or cpu (a tiny smoke)")
     p.add_argument("--wandb", action="store_true", help="log to Weights & Biases (recommended for real runs)")
     p.add_argument("--wandb-project", default="langset-danger")
@@ -84,10 +88,12 @@ def main() -> None:
             fsq_dim=a.fsq_dim, fsq_levels=a.fsq_levels, max_len=a.max_len,
             bf16=(a.device == "cuda"), device=a.device, arch_overrides=overrides)
     else:
+        if a.train_base:
+            print("[train] PRETRAINED FULL-FT (train_base=True): base unfrozen, disentangler arm", flush=True)
         model = LangSetModel.from_pretrained(
             a.backbone, latent_dim=None, n_latents=1, multi_latent=True,
             fsq_dim=a.fsq_dim, fsq_levels=a.fsq_levels, max_len=a.max_len,
-            bf16=(a.device == "cuda"), device=a.device)
+            train_base=a.train_base, bf16=(a.device == "cuda"), device=a.device)
 
     opts: dict = dict(
         epochs=a.epochs, batch_size=a.bs, lr=a.lr, max_len=a.max_len,
