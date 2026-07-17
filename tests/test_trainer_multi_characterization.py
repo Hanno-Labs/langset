@@ -35,7 +35,10 @@ GOLDEN = HERE / "golden_trainer_multi.npz"
 TINY_MODEL = os.environ.get(
     "LANGSET_TEST_MODEL", "hf-internal-testing/tiny-random-LlamaForCausalLM"
 )
-RTOL, ATOL = 1e-4, 1e-6
+RTOL, ATOL = (
+    1e-4,
+    1e-5,
+)  # atol loose enough for cross-platform float reassociation (macOS golden vs Linux CI)
 
 
 def _seed() -> None:

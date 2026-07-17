@@ -45,8 +45,9 @@ PROBE = [
 ]
 RTOL, ATOL = (
     1e-4,
-    1e-6,
-)  # tight enough to catch any real math change, loose enough for float reassociation
+    1e-5,
+)  # tight enough to catch any real math change (those move by >1e-3), loose enough for
+#    cross-platform float reassociation (macOS-generated golden vs Linux CI drifts ~1e-6/element)
 
 
 def _seed() -> None:
