@@ -18,6 +18,7 @@ Everything runs on CPU/fp32 with a tiny model so it's deterministic and fast (se
 Regenerate the golden ONLY when you intentionally change behavior:
     PYTHONPATH=src_proto python tests/test_trainer_characterization.py --update
 """
+
 from __future__ import annotations
 
 import os
@@ -33,14 +34,19 @@ from langset import LangSetModel, Trainer, TrainingArguments
 HERE = Path(__file__).parent
 GOLDEN = HERE / "golden_trainer.npz"
 # a tiny published checkpoint: fixed weights -> deterministic. Override to characterize a different arch.
-TINY_MODEL = os.environ.get("LANGSET_TEST_MODEL", "hf-internal-testing/tiny-random-LlamaForCausalLM")
+TINY_MODEL = os.environ.get(
+    "LANGSET_TEST_MODEL", "hf-internal-testing/tiny-random-LlamaForCausalLM"
+)
 LATENT_DIM = 32
 PROBE = [
     "a contract dispute about late payment terms",
     "a criminal appeal concerning theft",
     "a tax case over property transfer",
 ]
-RTOL, ATOL = 1e-4, 1e-6   # tight enough to catch any real math change, loose enough for float reassociation
+RTOL, ATOL = (
+    1e-4,
+    1e-6,
+)  # tight enough to catch any real math change, loose enough for float reassociation
 
 
 def _seed() -> None:
@@ -50,37 +56,49 @@ def _seed() -> None:
 
 
 def _build_model(grad_ckpt: bool = False) -> LangSetModel:
-    _seed()   # seed BEFORE building: LoRA-A / EmitHead init are random -> must be pinned
-    return LangSetModel.from_pretrained(TINY_MODEL, latent_dim=LATENT_DIM, bf16=False, device="cpu",
-                                        grad_ckpt=grad_ckpt)
+    _seed()  # seed BEFORE building: LoRA-A / EmitHead init are random -> must be pinned
+    return LangSetModel.from_pretrained(
+        TINY_MODEL, latent_dim=LATENT_DIM, bf16=False, device="cpu", grad_ckpt=grad_ckpt
+    )
 
 
 def _dataset() -> list[dict[str, str]]:
     topics = ["late payment", "theft", "property tax"]
     return [
-        {"input_text": f"case {i}: a dispute concerning {topics[i % 3]}",
-         "target_text": f"holding: the {topics[i % 3]} provisions govern this matter"}
+        {
+            "input_text": f"case {i}: a dispute concerning {topics[i % 3]}",
+            "target_text": f"holding: the {topics[i % 3]} provisions govern this matter",
+        }
         for i in range(8)
     ]
 
 
 def _args(out_dir: str, **over: object) -> TrainingArguments:
     d: dict[str, object] = dict(
-        epochs=2, batch_size=4, lr=1e-3, max_len=64,
-        report_to=None, verbose=False,
-        eval_every=99, patience=99, val_frac=0.25, seed=0,   # no eval/early-stop -> deterministic weights
+        epochs=2,
+        batch_size=4,
+        lr=1e-3,
+        max_len=64,
+        report_to=None,
+        verbose=False,
+        eval_every=99,
+        patience=99,
+        val_frac=0.25,
+        seed=0,  # no eval/early-stop -> deterministic weights
         output_dir=out_dir,
     )
     d.update(over)
-    return TrainingArguments(**d)   # type: ignore[arg-type]
+    return TrainingArguments(**d)  # type: ignore[arg-type]
 
 
 def _flat_trainable(model: LangSetModel) -> np.ndarray:
-    return np.concatenate([
-        p.detach().float().cpu().numpy().ravel()
-        for name, p in sorted(model.named_parameters(), key=lambda kv: kv[0])
-        if p.requires_grad
-    ]).astype(np.float64)
+    return np.concatenate(
+        [
+            p.detach().float().cpu().numpy().ravel()
+            for name, p in sorted(model.named_parameters(), key=lambda kv: kv[0])
+            if p.requires_grad
+        ]
+    ).astype(np.float64)
 
 
 def _embed(model: LangSetModel, texts: list[str]) -> np.ndarray:
@@ -94,7 +112,11 @@ def _run(grad_ckpt: bool = False, **arg_over: object) -> dict[str, np.ndarray]:
     emb_pre = _embed(model, PROBE)
     with tempfile.TemporaryDirectory() as td:
         Trainer(model, _args(td, **arg_over), _dataset()).train()
-    return {"emb_pre": emb_pre, "params_post": _flat_trainable(model), "emb_post": _embed(model, PROBE)}
+    return {
+        "emb_pre": emb_pre,
+        "params_post": _flat_trainable(model),
+        "emb_post": _embed(model, PROBE),
+    }
 
 
 # ---- golden generation --------------------------------------------------------------------------
@@ -106,21 +128,38 @@ def generate_golden() -> None:
 
 # ---- Tier 1: identity (the safety net) ----------------------------------------------------------
 def test_forward_identity() -> None:
-    assert GOLDEN.exists(), "golden missing -> run: python tests/test_trainer_characterization.py --update"
+    assert GOLDEN.exists(), (
+        "golden missing -> run: python tests/test_trainer_characterization.py --update"
+    )
     g = np.load(GOLDEN)
     model = _build_model()
-    np.testing.assert_allclose(_embed(model, PROBE), g["emb_pre"], rtol=RTOL, atol=ATOL,
-                               err_msg="FORWARD / emit path changed (encode() numerics differ)")
+    np.testing.assert_allclose(
+        _embed(model, PROBE),
+        g["emb_pre"],
+        rtol=RTOL,
+        atol=ATOL,
+        err_msg="FORWARD / emit path changed (encode() numerics differ)",
+    )
 
 
 def test_train_identity() -> None:
     assert GOLDEN.exists(), "golden missing -> run with --update"
     g = np.load(GOLDEN)
     out = _run()
-    np.testing.assert_allclose(out["params_post"], g["params_post"], rtol=RTOL, atol=ATOL,
-                               err_msg="TRAIN math changed (3-forward loss / backward / optimizer differ)")
-    np.testing.assert_allclose(out["emb_post"], g["emb_post"], rtol=RTOL, atol=ATOL,
-                               err_msg="post-train embeddings changed")
+    np.testing.assert_allclose(
+        out["params_post"],
+        g["params_post"],
+        rtol=RTOL,
+        atol=ATOL,
+        err_msg="TRAIN math changed (3-forward loss / backward / optimizer differ)",
+    )
+    np.testing.assert_allclose(
+        out["emb_post"],
+        g["emb_post"],
+        rtol=RTOL,
+        atol=ATOL,
+        err_msg="post-train embeddings changed",
+    )
 
 
 def test_grad_ckpt_is_identity() -> None:
@@ -131,8 +170,13 @@ def test_grad_ckpt_is_identity() -> None:
     assert GOLDEN.exists(), "golden missing -> run with --update"
     g = np.load(GOLDEN)
     out = _run(grad_ckpt=True)
-    np.testing.assert_allclose(out["params_post"], g["params_post"], rtol=RTOL, atol=ATOL,
-                               err_msg="grad_ckpt changed the numerics (should be exact) -> recompute is not free-to-optimize")
+    np.testing.assert_allclose(
+        out["params_post"],
+        g["params_post"],
+        rtol=RTOL,
+        atol=ATOL,
+        err_msg="grad_ckpt changed the numerics (should be exact) -> recompute is not free-to-optimize",
+    )
 
 
 # ---- Tier 2: behavioral floor (for math-CHANGING opts) ------------------------------------------
@@ -163,7 +207,9 @@ def test_smoke_training_works() -> None:
     post = _contrastive_margin(model)
     print(f"[smoke] contrastive margin pre={pre:.4f} post={post:.4f}")
     assert np.isfinite(post), f"non-finite embeddings after training (post={post})"
-    assert post > pre + 0.008, f"contrastive training did not widen the margin: pre={pre:.4f} post={post:.4f}"
+    assert post > pre + 0.008, (
+        f"contrastive training did not widen the margin: pre={pre:.4f} post={post:.4f}"
+    )
 
 
 # ---- proof the golden actually guards behavior --------------------------------------------------
@@ -177,16 +223,22 @@ def test_golden_is_sensitive_to_recon() -> None:
     max_delta = float(np.max(np.abs(out["params_post"] - g["params_post"])))
     assert max_delta > 1e-3, (
         f"golden is NOT sensitive to recon (max param delta {max_delta:.2e}) -> the identity test would "
-        "miss a silent behavior change; tighten the snapshot")
+        "miss a silent behavior change; tighten the snapshot"
+    )
 
 
 if __name__ == "__main__":
     if "--update" in sys.argv:
         generate_golden()
     else:
-        test_forward_identity(); print("forward_identity OK")
-        test_train_identity(); print("train_identity OK")
-        test_grad_ckpt_is_identity(); print("grad_ckpt_is_identity OK")
-        test_smoke_training_works(); print("smoke_training_works OK")
-        test_golden_is_sensitive_to_recon(); print("golden_is_sensitive OK")
+        test_forward_identity()
+        print("forward_identity OK")
+        test_train_identity()
+        print("train_identity OK")
+        test_grad_ckpt_is_identity()
+        print("grad_ckpt_is_identity OK")
+        test_smoke_training_works()
+        print("smoke_training_works OK")
+        test_golden_is_sensitive_to_recon()
+        print("golden_is_sensitive OK")
         print("ALL PASS")

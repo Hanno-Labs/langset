@@ -9,6 +9,7 @@ the historical behavior byte-for-byte (guarded by tests/test_trainer_multi_chara
 passing a different implementation — `TrainingArguments(target_source=SIGRegTarget)` — not toggling a flag that
 the trainer then branches on. The trainer builds each once and uses it with no per-feature `if`.
 """
+
 from __future__ import annotations
 
 import copy
@@ -21,8 +22,8 @@ import torch.nn.functional as F
 from langset.modeling import LangSetModel
 from langset.sigreg import SIGReg
 
-if TYPE_CHECKING:                                    # annotations only (from __future__ import annotations -> strings);
-    from langset.trainer import Trainer              # avoids a runtime import cycle trainer <-> strategies
+if TYPE_CHECKING:  # annotations only (from __future__ import annotations -> strings);
+    from langset.trainer import Trainer  # avoids a runtime import cycle trainer <-> strategies
     from langset.training_args import TrainingArguments
 
 
@@ -32,7 +33,11 @@ def supcon_loss(z: torch.Tensor, labels: list[str], tau: float) -> torch.Tensor:
     contrastive loss (each anchor has both positives and negatives) it separates without collapsing. Items whose label
     is ''/'unknown'/'none'/'nan' are dropped. Returns 0 if fewer than two labelled items or no positive pair exists."""
     dev = z.device
-    keep = [k for k, l in enumerate(labels) if str(l).strip().lower() not in ("", "unknown", "none", "nan")]
+    keep = [
+        k
+        for k, l in enumerate(labels)
+        if str(l).strip().lower() not in ("", "unknown", "none", "nan")
+    ]
     if len(keep) < 2:
         return z.new_zeros(())
     zz = F.normalize(z[keep], p=2, dim=-1)
@@ -40,8 +45,10 @@ def supcon_loss(z: torch.Tensor, labels: list[str], tau: float) -> torch.Tensor:
     b = len(keep)
     sim = (zz @ zz.t() / tau).masked_fill(torch.eye(b, device=dev, dtype=torch.bool), -1e9)
     logp = sim - torch.logsumexp(sim, dim=1, keepdim=True)
-    pos = torch.tensor([[1.0 if (i != j and lab[i] == lab[j]) else 0.0 for j in range(b)] for i in range(b)],
-                       device=dev)
+    pos = torch.tensor(
+        [[1.0 if (i != j and lab[i] == lab[j]) else 0.0 for j in range(b)] for i in range(b)],
+        device=dev,
+    )
     npos = pos.sum(1)
     has = npos > 0
     if not bool(has.any()):
@@ -60,32 +67,52 @@ class MultiStepCtx:
     · d = latent dim · V = `fsq_levels`. The canonical flattened view a term works in is `recon[valid]` -> [N, d],
     and `flat_texts` / `lens_l` / `bidx` are all aligned to that same row-major order.
     """
-    trainer: Trainer                    # the owning Trainer; read its PER-ROW data (indexed by dataset row id):
+
+    trainer: Trainer  # the owning Trainer; read its PER-ROW data (indexed by dataset row id):
     #                                     sup_labels / hard_neg_texts / label_plan + label_cols + label_codewords
-    args: TrainingArguments             # the run config — a term reads its own weight/temperature here (a.lam_*, a.tau)
-    model: LangSetModel                 # the online model being trained (rarely needed directly — emit via target_source)
-    dev: torch.device                   # device every tensor below lives on; build new tensors with device=c.dev
-    bidx: list[int]                     # this batch's DATASET ROW IDS (len B) — index trainer.sup_labels[k], etc. with these
-    lens_l: list[int]                   # emitted-item count per row (len B): row r produced lens_l[r] items; Σ = N
-    flat_texts: list[str]               # the N target texts row-major (row0's items, then row1's, ...), aligned to recon[valid]
-    valid: torch.Tensor                 # [B, L] bool mask of real (non-padding) emission slots; recon[valid] -> [N, d]
-    target_lat: torch.Tensor            # [B, L, d] the stop-grad TARGET latents each emission is trained toward
-    recon: torch.Tensor                 # [B, L, d] the model's EMITTED latents this step — gradient flows through these
-    dim_lg: Optional[torch.Tensor]      # [B, L+1, fsq_dim, V] FSQ per-dim digit logits; None for a non-FSQ objective
-    lmax: int                           # L above: the padded emitted-item time dim for this batch
-    fsq_levels: int                     # V above: FSQ quantization levels per digit
-    lab_label: Optional[torch.Tensor]   # [B, L, n_reserved] reserved-dim label targets; None unless FSQ label subspace on
-    target_source: _TargetSource        # the target provider; call .encode(texts) -> [n, d] normalized latents (hard-neg bank)
-    phase_head: Optional[torch.nn.Module]  # transient hidden->phase linear classifier, or None when lam_phase == 0
-    phase_ids: dict[str, int]           # phase-label string -> class index, the CE targets for phase_head
+    args: TrainingArguments  # the run config — a term reads its own weight/temperature here (a.lam_*, a.tau)
+    model: LangSetModel  # the online model being trained (rarely needed directly — emit via target_source)
+    dev: torch.device  # device every tensor below lives on; build new tensors with device=c.dev
+    bidx: list[
+        int
+    ]  # this batch's DATASET ROW IDS (len B) — index trainer.sup_labels[k], etc. with these
+    lens_l: list[int]  # emitted-item count per row (len B): row r produced lens_l[r] items; Σ = N
+    flat_texts: list[
+        str
+    ]  # the N target texts row-major (row0's items, then row1's, ...), aligned to recon[valid]
+    valid: (
+        torch.Tensor
+    )  # [B, L] bool mask of real (non-padding) emission slots; recon[valid] -> [N, d]
+    target_lat: (
+        torch.Tensor
+    )  # [B, L, d] the stop-grad TARGET latents each emission is trained toward
+    recon: (
+        torch.Tensor
+    )  # [B, L, d] the model's EMITTED latents this step — gradient flows through these
+    dim_lg: Optional[
+        torch.Tensor
+    ]  # [B, L+1, fsq_dim, V] FSQ per-dim digit logits; None for a non-FSQ objective
+    lmax: int  # L above: the padded emitted-item time dim for this batch
+    fsq_levels: int  # V above: FSQ quantization levels per digit
+    lab_label: Optional[
+        torch.Tensor
+    ]  # [B, L, n_reserved] reserved-dim label targets; None unless FSQ label subspace on
+    target_source: _TargetSource  # the target provider; call .encode(texts) -> [n, d] normalized latents (hard-neg bank)
+    phase_head: Optional[
+        torch.nn.Module
+    ]  # transient hidden->phase linear classifier, or None when lam_phase == 0
+    phase_ids: dict[str, int]  # phase-label string -> class index, the CE targets for phase_head
 
 
 # ---- aux loss terms -----------------------------------------------------------------------------
 class _LossTerm:
     """Strategy for one weighted, optional term added on top of the base emission loss (one per historical
     `if a.lam_x > 0:` block). Terms are built once and iterated each step; each self-skips when inapplicable."""
-    key: str = ""                       # this term's log/agg name (e.g. "loss_multi_nce"); set by each subclass
-    isolated_backward: bool = False     # if True the term is NOT summed into the shared loss; instead the trainer runs
+
+    key: str = ""  # this term's log/agg name (e.g. "loss_multi_nce"); set by each subclass
+    isolated_backward: bool = (
+        False  # if True the term is NOT summed into the shared loss; instead the trainer runs
+    )
     #                                     its forward+backward SEPARATELY, AFTER the main loss.backward() has freed its
     #                                     graph, so the two graphs never coexist (peak activation = max, not sum). Grads
     #                                     accumulate into .grad before the single opt.step() -> same step, batch unchanged.
@@ -102,7 +129,7 @@ def identical_text_mask(c: MultiStepCtx, fn_mask: torch.Tensor) -> None:
     pairs that must NOT be treated as negatives of each other. Default policy: two emissions with IDENTICAL
     target text share the same true geometry, so they aren't negatives (mirrors the single-latent mask_keys path)."""
     grp: dict[str, list[int]] = {}
-    for ii, tx in enumerate(c.flat_texts):               # flat_texts is row-major aligned with recon[valid]
+    for ii, tx in enumerate(c.flat_texts):  # flat_texts is row-major aligned with recon[valid]
         grp.setdefault(tx, []).append(ii)
     for mem in grp.values():
         if len(mem) > 1:
@@ -116,6 +143,7 @@ class MultiNCETerm(_LossTerm):
     """IN-BATCH-NEGATIVE InfoNCE: each emitted recon vs the batch's EMA targets, own target = positive, others
     = negatives, minus the `maskers`' false-negatives. On by default (lam_multi_nce). Ported from the
     single-latent self-contrastive loss."""
+
     key = "loss_multi_nce"
 
     def __init__(self, maskers: list[Callable[[MultiStepCtx, torch.Tensor], None]]) -> None:
@@ -123,24 +151,27 @@ class MultiNCETerm(_LossTerm):
 
     def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
         a = c.args
-        if c.target_source.suppresses_nce:                   # e.g. SIGReg replaces the NCE with its regularizer
+        if c.target_source.suppresses_nce:  # e.g. SIGReg replaces the NCE with its regularizer
             return None
         if not (a.lam_multi_nce > 0 and int(c.valid.sum()) > 1):
             return None
-        rvn = F.normalize(c.recon[c.valid], dim=-1)          # [N, d] emitted (gradient flows here)
-        tvn = F.normalize(c.target_lat[c.valid], dim=-1)     # [N, d] EMA targets (already stop-grad)
-        nce_logits = (rvn @ tvn.t()) / a.tau                 # [N, N] query x key cosine / temp
+        rvn = F.normalize(c.recon[c.valid], dim=-1)  # [N, d] emitted (gradient flows here)
+        tvn = F.normalize(c.target_lat[c.valid], dim=-1)  # [N, d] EMA targets (already stop-grad)
+        nce_logits = (rvn @ tvn.t()) / a.tau  # [N, N] query x key cosine / temp
         n_nce = rvn.size(0)
         fn_mask = torch.zeros(n_nce, n_nce, dtype=torch.bool, device=c.dev)
         for masker in self.maskers:
             masker(c, fn_mask)
-        nce_logits = nce_logits.masked_fill(fn_mask, float("-inf"))   # diagonal (positive) never masked
+        nce_logits = nce_logits.masked_fill(
+            fn_mask, float("-inf")
+        )  # diagonal (positive) never masked
         loss_nce = F.cross_entropy(nce_logits, torch.arange(n_nce, device=c.dev))
         return (self.key, loss_nce, a.lam_multi_nce)
 
 
 class HardNegTerm(_LossTerm):
     """Each emitted recon: own EMA target (positive) vs a shared bank of the batch's mined hard-negative texts."""
+
     key = "loss_hard_neg"
 
     def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
@@ -150,39 +181,51 @@ class HardNegTerm(_LossTerm):
         hn_flat = [t for k in c.bidx for t in self_.hard_neg_texts[k]]
         if not hn_flat:
             return None
-        hn_bank = c.target_source.encode(hn_flat)            # [Nhn, d] stop-grad normalized hard-neg latents
-        rv = F.normalize(c.recon[c.valid], dim=-1)           # [Nvalid, d] emitted reconstructions
-        pos = (rv * c.target_lat[c.valid]).sum(-1, keepdim=True)   # [Nvalid, 1] cos to own target
-        neg = rv @ hn_bank.t()                               # [Nvalid, Nhn] cos to every hard neg
+        hn_bank = c.target_source.encode(hn_flat)  # [Nhn, d] stop-grad normalized hard-neg latents
+        rv = F.normalize(c.recon[c.valid], dim=-1)  # [Nvalid, d] emitted reconstructions
+        pos = (rv * c.target_lat[c.valid]).sum(-1, keepdim=True)  # [Nvalid, 1] cos to own target
+        neg = rv @ hn_bank.t()  # [Nvalid, Nhn] cos to every hard neg
         logits_hn = torch.cat([pos, neg], dim=1) / a.tau
-        loss_hn = F.cross_entropy(logits_hn, torch.zeros(logits_hn.size(0), dtype=torch.long, device=c.dev))
+        loss_hn = F.cross_entropy(
+            logits_hn, torch.zeros(logits_hn.size(0), dtype=torch.long, device=c.dev)
+        )
         return (self.key, loss_hn, a.lam_hard_neg)
 
 
 class SupConTerm(_LossTerm):
     """Supervised-contrastive shaping over emitted latents by the per-item `sup_field` group labels."""
+
     key = "loss_sup"
 
     def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
         a, self_ = c.args, c.trainer
         if self_.sup_labels is None or a.lam_sup <= 0:
             return None
-        sup_flat = [(self_.sup_labels[k][j] if j < len(self_.sup_labels[k]) else "unknown")
-                    for r, k in enumerate(c.bidx) for j in range(c.lens_l[r])]
-        loss_sup = supcon_loss(c.recon[c.valid], sup_flat, a.sup_tau)   # pull same-stage, push different-stage
+        sup_flat = [
+            (self_.sup_labels[k][j] if j < len(self_.sup_labels[k]) else "unknown")
+            for r, k in enumerate(c.bidx)
+            for j in range(c.lens_l[r])
+        ]
+        loss_sup = supcon_loss(
+            c.recon[c.valid], sup_flat, a.sup_tau
+        )  # pull same-stage, push different-stage
         return (self.key, loss_sup, a.lam_sup)
 
 
 class PhaseTerm(_LossTerm):
     """CE phase classifier on the emitted reconstruction (non-collapsing SupCon alternative)."""
+
     key = "loss_phase"
 
     def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
         a, self_ = c.args, c.trainer
         if c.phase_head is None:
             return None
-        pf = [(self_.sup_labels[k][j] if j < len(self_.sup_labels[k]) else "")
-              for r, k in enumerate(c.bidx) for j in range(c.lens_l[r])]
+        pf = [
+            (self_.sup_labels[k][j] if j < len(self_.sup_labels[k]) else "")
+            for r, k in enumerate(c.bidx)
+            for j in range(c.lens_l[r])
+        ]
         pid = torch.tensor([c.phase_ids.get(x, -100) for x in pf], device=c.dev)
         loss_phase = F.cross_entropy(c.phase_head(c.recon[c.valid]), pid, ignore_index=-100)
         return (self.key, loss_phase, a.lam_phase)
@@ -191,6 +234,7 @@ class PhaseTerm(_LossTerm):
 class LabelDimsTerm(_LossTerm):
     """FSQ LABEL SUBSPACE: full-strength CE on the reserved digit dims so the label lives AS coordinates of the
     emitted code. FSQ-only (reads dim_lg); skipped when the objective produces no digit logits or no label plan."""
+
     key = "loss_label"
 
     def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
@@ -198,8 +242,10 @@ class LabelDimsTerm(_LossTerm):
         if c.lab_label is None or c.dim_lg is None or a.lam_label_dims <= 0:
             return None
         rcols = [cj for (cj, _, _) in self_.label_plan]
-        lab_lg = c.dim_lg[:, :c.lmax, 1:, :][:, :, rcols, :]     # [b, lmax, n_reserved, fsq_levels]
-        loss_label = F.cross_entropy(lab_lg.reshape(-1, c.fsq_levels), c.lab_label.reshape(-1), ignore_index=-100)
+        lab_lg = c.dim_lg[:, : c.lmax, 1:, :][:, :, rcols, :]  # [b, lmax, n_reserved, fsq_levels]
+        loss_label = F.cross_entropy(
+            lab_lg.reshape(-1, c.fsq_levels), c.lab_label.reshape(-1), ignore_index=-100
+        )
         return (self.key, loss_label, a.lam_label_dims)
 
 
@@ -222,17 +268,27 @@ class CoTGenTerm(_LossTerm):
     `isolated_backward` so its (long) CoT graph never coexists with the latent graph. Pairs with the seed+CoT
     conditioning that `cot_seed_texts` applies to the emission forward — inject BOTH (see build_cot_loss_terms).
     Self-skips when the batch's rows carry no CoT text (so it's inert if injected without a `cot_text` column)."""
+
     key = "loss_cot"
     isolated_backward = True
 
     def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
         a, m, dev, self_ = c.args, c.model, c.dev, c.trainer
-        if not any(self_.cot_texts[k] for k in c.bidx):        # no reasoning in this batch -> nothing to learn
+        if not any(
+            self_.cot_texts[k] for k in c.bidx
+        ):  # no reasoning in this batch -> nothing to learn
             return None
         tok, vsz = m.tokenizer, m.vocab_size
 
         def _tokm(texts: list[str], mx: int, side: str) -> tuple[torch.Tensor, torch.Tensor]:
-            e = tok(texts, padding=True, truncation=True, max_length=mx, padding_side=side, return_tensors="pt")
+            e = tok(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=mx,
+                padding_side=side,
+                return_tensors="pt",
+            )
             return e["input_ids"].to(dev), e["attention_mask"].to(dev)
 
         # CoT blocks are long (p50~726, p90~1541 tok) -> keep full a.max_len, don't truncate hard. Pin padding sides
@@ -243,14 +299,17 @@ class CoTGenTerm(_LossTerm):
         # silently condition short seeds' CoT on padding.)
         di, dm = _tokm([self_.input_text[k] for k in c.bidx], a.max_len, "left")
         ti, tm = _tokm([self_.cot_texts[k] or " " for k in c.bidx], a.max_len, "right")
-        seq = torch.cat([di, ti], dim=1); am = torch.cat([dm, tm], dim=1)
+        seq = torch.cat([di, ti], dim=1)
+        am = torch.cat([dm, tm], dim=1)
         hid = m._last_hidden(m._run_backbone(m.embed(seq), am, seq, 0))
         sd = di.size(1)
-        ph = hid[:, sd - 1: sd - 1 + ti.size(1), :]                     # hidden that predicts each CoT token
+        ph = hid[:, sd - 1 : sd - 1 + ti.size(1), :]  # hidden that predicts each CoT token
         # bf16 vocab projection (NOT .float()): the fp32 [b, T, |V|] logits were the OOM driver on the 80GB A100;
         # CE reduces the softmax in fp32 internally, so bf16 logits are a numerically fine training signal.
         lg = F.linear(ph, m.embed.weight)
-        loss_cot = F.cross_entropy(lg.reshape(-1, vsz), ti.masked_fill(tm == 0, -100).reshape(-1), ignore_index=-100)
+        loss_cot = F.cross_entropy(
+            lg.reshape(-1, vsz), ti.masked_fill(tm == 0, -100).reshape(-1), ignore_index=-100
+        )
         return (self.key, loss_cot, a.lam_cot)
 
 
@@ -267,11 +326,20 @@ class EmissionOut:
     """Result of one emission forward (shapes as in MultiStepCtx: B rows · L=lmax · d latent · V=fsq_levels).
     The trainer sets `loss = base_loss`, folds `logs` into its running averages, and passes `recon`/`dim_lg`/
     `lab_label` on to the aux terms via MultiStepCtx."""
-    recon: torch.Tensor                 # [B, L, d] the model's emitted latents — gradient flows through these
-    base_loss: torch.Tensor             # scalar: the objective's own loss (FSQ: loss_stop + loss_dims + recon_loss)
-    logs: dict[str, torch.Tensor]       # UNWEIGHTED scalar components for logging (FSQ: loss_stop / loss_dims / recon_loss)
-    dim_lg: Optional[torch.Tensor]      # [B, L+1, fsq_dim, V] FSQ per-dim digit logits; None for a non-FSQ objective
-    lab_label: Optional[torch.Tensor]   # [B, L, n_reserved] reserved-dim label targets; None unless FSQ label subspace on
+
+    recon: torch.Tensor  # [B, L, d] the model's emitted latents — gradient flows through these
+    base_loss: (
+        torch.Tensor
+    )  # scalar: the objective's own loss (FSQ: loss_stop + loss_dims + recon_loss)
+    logs: dict[
+        str, torch.Tensor
+    ]  # UNWEIGHTED scalar components for logging (FSQ: loss_stop / loss_dims / recon_loss)
+    dim_lg: Optional[
+        torch.Tensor
+    ]  # [B, L+1, fsq_dim, V] FSQ per-dim digit logits; None for a non-FSQ objective
+    lab_label: Optional[
+        torch.Tensor
+    ]  # [B, L, n_reserved] reserved-dim label targets; None unless FSQ label subspace on
 
 
 class _EmissionObjective:
@@ -280,13 +348,25 @@ class _EmissionObjective:
     emission `if`s. `codebook` is a class flag the free-run rollout reads to pick which emission head to use
     (True = FSQ digit head, False = a raw-vector head). All objectives share the __init__ signature
     (model, args, dev, trainer) so they are interchangeable as an injected `TrainingArguments.emission`."""
+
     codebook: bool = True
 
-    def __init__(self, model: LangSetModel, args: TrainingArguments, dev: torch.device, trainer: Trainer) -> None:
+    def __init__(
+        self, model: LangSetModel, args: TrainingArguments, dev: torch.device, trainer: Trainer
+    ) -> None:
         self.m, self.a, self.dev, self.trainer = model, args, dev, trainer
 
-    def emit(self, se: dict[str, torch.Tensor], target_lat: torch.Tensor, valid: torch.Tensor,
-             lens_l: list[int], bidx: list[int], b: int, lmax: int, ep: int) -> EmissionOut:
+    def emit(
+        self,
+        se: dict[str, torch.Tensor],
+        target_lat: torch.Tensor,
+        valid: torch.Tensor,
+        lens_l: list[int],
+        bidx: list[int],
+        b: int,
+        lmax: int,
+        ep: int,
+    ) -> EmissionOut:
         """Run the emission forward and its base loss for one step.
 
         se:         tokenized seed batch (input_ids/attention_mask) already on device — the model reads this.
@@ -300,8 +380,9 @@ class _EmissionObjective:
         """
         raise NotImplementedError
 
-    def z_for_reg(self, em: EmissionOut, target_lat: torch.Tensor, valid: torch.Tensor,
-                  lmax: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def z_for_reg(
+        self, em: EmissionOut, target_lat: torch.Tensor, valid: torch.Tensor, lmax: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """The (predicted, target) latents a TargetSource.regularizer (e.g. SIGReg) constrains. Default =
         the emitted vs target latents directly ([N, d]); FSQ overrides this to use the pre-quantization z."""
         return em.recon[valid], target_lat[valid]
@@ -311,33 +392,53 @@ class FSQObjective(_EmissionObjective):
     """DEFAULT emission: predict each item's per-dim FSQ digits (a STOP folded into dim-0's softmax) + a cosine
     reconstruction to the target. Byte-identical to the historical inline FSQ block. Reads the FSQ grid geometry
     (fsq_dim/fsq_levels) off model.head, so it takes the uniform (model, args, dev, trainer) signature."""
+
     codebook = True
 
-    def __init__(self, model: LangSetModel, args: TrainingArguments, dev: torch.device, trainer: Trainer) -> None:
+    def __init__(
+        self, model: LangSetModel, args: TrainingArguments, dev: torch.device, trainer: Trainer
+    ) -> None:
         super().__init__(model, args, dev, trainer)
         head = model.head
         self.fsq_dim = int(head.fsq_dim)
         self.fsq_levels = int(head.fsq_levels)
-        self.stop_idx = self.fsq_levels                      # STOP is the extra class folded into dim-0's softmax
+        self.stop_idx = self.fsq_levels  # STOP is the extra class folded into dim-0's softmax
 
-    def emit(self, se: dict[str, torch.Tensor], target_lat: torch.Tensor, valid: torch.Tensor,
-             lens_l: list[int], bidx: list[int], b: int, lmax: int, ep: int) -> EmissionOut:
+    def emit(
+        self,
+        se: dict[str, torch.Tensor],
+        target_lat: torch.Tensor,
+        valid: torch.Tensor,
+        lens_l: list[int],
+        bidx: list[int],
+        b: int,
+        lmax: int,
+        ep: int,
+    ) -> EmissionOut:
         m, a, dev, self_ = self.m, self.a, self.dev, self.trainer
         fsq_dim, fsq_levels = self.fsq_dim, self.fsq_levels
         eff_ss = a.ss_prob if a.ss_warmup <= 0 else a.ss_prob * min(1.0, ep / a.ss_warmup)
         dim_lg, stop_lg, digits, recon = m.rollout_train_codebook(
-            se["input_ids"], se["attention_mask"], target_lat, a.tau,
-            train_hops=a.train_hops, ss_prob=eff_ss, ss_sample=a.ss_sample)
+            se["input_ids"],
+            se["attention_mask"],
+            target_lat,
+            a.tau,
+            train_hops=a.train_hops,
+            ss_prob=eff_ss,
+            ss_sample=a.ss_sample,
+        )
         dim0 = torch.cat([dim_lg[:, :, 0, :], stop_lg], -1)  # [b, lmax+1, L+1] — digit-0 + STOP
         lab0 = torch.full((b, lmax + 1), -100, dtype=torch.long, device=dev)
         lab_rest = torch.full((b, lmax, fsq_dim - 1), -100, dtype=torch.long, device=dev)
         for r, nl in enumerate(lens_l):
             lab0[r, :nl] = digits[r, :nl, 0]
-            lab0[r, nl] = self.stop_idx                          # emit digit-0 per item, then STOP after the last
+            lab0[r, nl] = self.stop_idx  # emit digit-0 per item, then STOP after the last
             lab_rest[r, :nl] = digits[r, :nl, 1:]
-        lab_label = None                                         # FSQ LABEL SUBSPACE: reserved dims -> a SEPARATE
-        if self_.label_plan is not None:                         # weighted label CE (NOT diluted inside loss_dims)
-            lab_label = torch.full((b, lmax, len(self_.label_plan)), -100, dtype=torch.long, device=dev)
+        lab_label = None  # FSQ LABEL SUBSPACE: reserved dims -> a SEPARATE
+        if self_.label_plan is not None:  # weighted label CE (NOT diluted inside loss_dims)
+            lab_label = torch.full(
+                (b, lmax, len(self_.label_plan)), -100, dtype=torch.long, device=dev
+            )
             for s_i, (col_j, field, pos) in enumerate(self_.label_plan):
                 labs, cw = self_.label_cols[field], self_.label_codewords[field]
                 for r, kk in enumerate(bidx):
@@ -345,23 +446,33 @@ class FSQObjective(_EmissionObjective):
                     for j in range(lens_l[r]):
                         code = cw.get(row_labs[j] if j < len(row_labs) else "")
                         lab_label[r, j, s_i] = code[pos] if code is not None else -100
-                lab_rest[:, :, col_j] = -100                     # reserved dims leave the reconstruction CE
-        loss_stop = F.cross_entropy(dim0.reshape(-1, fsq_levels + 1), lab0.reshape(-1), ignore_index=-100)
-        loss_dims = F.cross_entropy(dim_lg[:, :lmax, 1:, :].reshape(-1, fsq_levels),
-                                    lab_rest.reshape(-1), ignore_index=-100)
+                lab_rest[:, :, col_j] = -100  # reserved dims leave the reconstruction CE
+        loss_stop = F.cross_entropy(
+            dim0.reshape(-1, fsq_levels + 1), lab0.reshape(-1), ignore_index=-100
+        )
+        loss_dims = F.cross_entropy(
+            dim_lg[:, :lmax, 1:, :].reshape(-1, fsq_levels), lab_rest.reshape(-1), ignore_index=-100
+        )
         recon_loss = (1.0 - F.cosine_similarity(recon[valid], target_lat[valid], dim=-1)).mean()
-        return EmissionOut(recon=recon, base_loss=loss_stop + loss_dims + recon_loss,
-                           logs={"loss_stop": loss_stop, "loss_dims": loss_dims, "recon_loss": recon_loss},
-                           dim_lg=dim_lg, lab_label=lab_label)
+        return EmissionOut(
+            recon=recon,
+            base_loss=loss_stop + loss_dims + recon_loss,
+            logs={"loss_stop": loss_stop, "loss_dims": loss_dims, "recon_loss": recon_loss},
+            dim_lg=dim_lg,
+            lab_label=lab_label,
+        )
 
-    def z_for_reg(self, em: EmissionOut, target_lat: torch.Tensor, valid: torch.Tensor,
-                  lmax: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def z_for_reg(
+        self, em: EmissionOut, target_lat: torch.Tensor, valid: torch.Tensor, lmax: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # Regularize the PRE-QUANTIZATION z = down_proj(latent) — the actual FSQ input, before the tanh+round —
         # so the penalty spreads the encoder's codes across the whole grid. z_pred = predicted E[digit].
         assert self.m.head.down_proj is not None
-        z_tgt = self.m.head.down_proj(target_lat[valid].float())            # [N, fsq_dim]
+        z_tgt = self.m.head.down_proj(target_lat[valid].float())  # [N, fsq_dim]
         lvls = torch.arange(self.fsq_levels, device=self.dev, dtype=torch.float32)
-        soft = (em.dim_lg[:, :lmax].float().softmax(-1) * lvls).sum(-1)     # predicted E[digit] [b, lmax, fsq_dim]
+        soft = (em.dim_lg[:, :lmax].float().softmax(-1) * lvls).sum(
+            -1
+        )  # predicted E[digit] [b, lmax, fsq_dim]
         return soft[valid], z_tgt
 
 
@@ -371,11 +482,17 @@ class _TargetSource:
     Default = stop-grad EMA twin. Selected ONCE per run. All sources share the __init__ signature
     (model, args, tok, dev) so they are interchangeable as an injected `TrainingArguments.target_source`."""
 
-    suppresses_nce: bool = False        # if True the trainer skips the in-batch NCE term (a live-target source that
+    suppresses_nce: bool = (
+        False  # if True the trainer skips the in-batch NCE term (a live-target source that
+    )
     #                                     already prevents collapse via `regularizer` doesn't need — and fights — it)
-    wants_regularizer: bool = False     # if True the trainer computes objective.z_for_reg and adds `regularizer` to the
+    wants_regularizer: bool = (
+        False  # if True the trainer computes objective.z_for_reg and adds `regularizer` to the
+    )
     #                                     loss; keeps that (non-trivial) work off the default path when False
-    twin: Optional[LangSetModel] = None  # the model the EVAL block encodes its retrieval bank with (the EMA copy for the
+    twin: Optional[LangSetModel] = (
+        None  # the model the EVAL block encodes its retrieval bank with (the EMA copy for the
+    )
     #                                      default; the online model itself for a live-target source). Set by subclasses.
 
     def encode(self, texts: list[str]) -> torch.Tensor:
@@ -396,23 +513,30 @@ class _TargetSource:
 class EMATwinTarget(_TargetSource):
     """DEFAULT: a stop-grad EMA copy of the online model supplies the target latents (BYOL/JEPA) so both sides
     don't move together and collapse. Byte-identical to the historical inline twin + emit_texts + ema_update."""
+
     suppresses_nce = False
 
-    def __init__(self, model: LangSetModel, args: TrainingArguments, tok: Any, dev: torch.device) -> None:
+    def __init__(
+        self, model: LangSetModel, args: TrainingArguments, tok: Any, dev: torch.device
+    ) -> None:
         self.m, self.a, self.tok, self.dev = model, args, tok, dev
         self.twin = copy.deepcopy(model)
         for p in self.twin.parameters():
             p.requires_grad_(False)
         self.twin.eval()
         self._online = [po for po in model.parameters() if po.requires_grad]
-        self._ema = [pe for pe, po in zip(self.twin.parameters(), model.parameters()) if po.requires_grad]
+        self._ema = [
+            pe for pe, po in zip(self.twin.parameters(), model.parameters()) if po.requires_grad
+        ]
 
     def encode(self, texts: list[str]) -> torch.Tensor:
         # Single-latent emission of each text -> [N, d] normalized, no_grad. Truncated to target_max_len
         # (default 64: targets are short descriptors; raise it when a target is a DOCUMENT, e.g. emit_seed's
         # phase-0 target is a full abstract). Short future strings are already < 64 so unaffected.
         a, tok, dev = self.a, self.tok, self.dev
-        e = tok(texts, padding=True, truncation=True, max_length=a.target_max_len, return_tensors="pt").to(dev)
+        e = tok(
+            texts, padding=True, truncation=True, max_length=a.target_max_len, return_tensors="pt"
+        ).to(dev)
         with torch.no_grad():
             z = self.twin(e["input_ids"], e["attention_mask"])
         return F.normalize(z.float(), dim=-1)
@@ -437,29 +561,40 @@ class CachedTarget(_TargetSource):
     when it already starts from a good encoder). INJECT via
     `TrainingArguments(target_source=CachedTarget, target_encoder_ckpt="path/to/encoder")`. `update()` is a no-op
     (the geometry is fixed) and the eval retrieval bank encodes through the same frozen geometry (`twin = enc`)."""
+
     suppresses_nce = False
 
-    def __init__(self, model: LangSetModel, args: TrainingArguments, tok: Any, dev: torch.device) -> None:
+    def __init__(
+        self, model: LangSetModel, args: TrainingArguments, tok: Any, dev: torch.device
+    ) -> None:
         self.a, self.dev = args, dev
         ckpt = getattr(args, "target_encoder_ckpt", None)
         if ckpt:
-            from langset.modeling import LangSetModel as _LSM    # local import avoids a strategies<->modeling cycle
+            from langset.modeling import (
+                LangSetModel as _LSM,
+            )  # local import avoids a strategies<->modeling cycle
+
             enc = _LSM.load(ckpt, device=str(dev))
         else:
-            enc = copy.deepcopy(model)                           # frozen snapshot of the online model at init
+            enc = copy.deepcopy(model)  # frozen snapshot of the online model at init
         for p in enc.parameters():
             p.requires_grad_(False)
         enc.eval()
         self.enc = enc
-        self.twin = enc                                          # eval retrieval bank encodes with the fixed geometry
+        self.twin = enc  # eval retrieval bank encodes with the fixed geometry
         self._cache: dict[str, torch.Tensor] = {}
 
     def encode(self, texts: list[str]) -> torch.Tensor:
-        miss = [t for t in dict.fromkeys(texts) if t not in self._cache]   # unique, order-preserving
+        miss = [t for t in dict.fromkeys(texts) if t not in self._cache]  # unique, order-preserving
         if miss:
             a, dev = self.a, self.dev
-            e = self.enc.tokenizer(miss, padding=True, truncation=True, max_length=a.target_max_len,
-                                   return_tensors="pt").to(dev)
+            e = self.enc.tokenizer(
+                miss,
+                padding=True,
+                truncation=True,
+                max_length=a.target_max_len,
+                return_tensors="pt",
+            ).to(dev)
             with torch.no_grad():
                 z = F.normalize(self.enc(e["input_ids"], e["attention_mask"]).float(), dim=-1)
             for t, v in zip(miss, z):
@@ -467,7 +602,7 @@ class CachedTarget(_TargetSource):
         return torch.stack([self._cache[t] for t in texts])
 
     def update(self) -> None:
-        return None                                              # fixed geometry — nothing to track
+        return None  # fixed geometry — nothing to track
 
 
 class SIGRegTarget(_TargetSource):
@@ -476,19 +611,24 @@ class SIGRegTarget(_TargetSource):
     SIGReg penalty on the pre-quant z (via `regularizer`) instead of by a twin. So it drops the twin's VRAM + target
     forward, the in-batch NCE is suppressed (the regularizer replaces it), and eval encodes with the live model itself.
     Reads scalar knobs off args: sigreg_lambda (loss weight, applied in the trainer), sigreg_knots, sigreg_slices."""
+
     suppresses_nce = True
     wants_regularizer = True
 
-    def __init__(self, model: LangSetModel, args: TrainingArguments, tok: Any, dev: torch.device) -> None:
+    def __init__(
+        self, model: LangSetModel, args: TrainingArguments, tok: Any, dev: torch.device
+    ) -> None:
         self.m, self.a, self.tok, self.dev = model, args, tok, dev
-        self.twin = model                                        # no separate twin — eval encodes with the live model
+        self.twin = model  # no separate twin — eval encodes with the live model
         self.sig_reg = SIGReg(knots=args.sigreg_knots, slices=args.sigreg_slices).to(dev)
 
     def encode(self, texts: list[str]) -> torch.Tensor:
         # LIVE target WITH gradient (no no_grad, no twin): both the emitted and target latents move, and SIGReg —
         # not a stop-grad twin — is what stops them collapsing together.
         a, tok, dev = self.a, self.tok, self.dev
-        e = tok(texts, padding=True, truncation=True, max_length=a.target_max_len, return_tensors="pt").to(dev)
+        e = tok(
+            texts, padding=True, truncation=True, max_length=a.target_max_len, return_tensors="pt"
+        ).to(dev)
         z = self.m(e["input_ids"], e["attention_mask"])
         return F.normalize(z.float(), dim=-1)
 
@@ -499,8 +639,9 @@ class SIGRegTarget(_TargetSource):
 
 
 # ---- small function-strategies ------------------------------------------------------------------
-def multi_epoch_order(tr_idx: list[int], rng_t: torch.Generator, args: TrainingArguments,
-                      seeds: list[str]) -> list[int]:
+def multi_epoch_order(
+    tr_idx: list[int], rng_t: torch.Generator, args: TrainingArguments, seeds: list[str]
+) -> list[int]:
     """DEFAULT epoch ordering: a plain shuffle of the training positions. Inject a different `epoch_order` to
     change it."""
     return torch.randperm(len(tr_idx), generator=rng_t).tolist()

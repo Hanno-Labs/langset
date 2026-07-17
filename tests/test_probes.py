@@ -1,4 +1,5 @@
 """Unit tests for langset.probes — the graduated world-model property probes."""
+
 import numpy as np
 import pytest
 
@@ -33,6 +34,7 @@ def test_calibration_corr_group_restriction_matches_manual():
     got = calibration_corr(ent, card, groups=groups, test_groups={1, 2})
     # manual: keep indices where group in {1,2} -> entries 2,3,4,5
     from scipy.stats import pearsonr
+
     keep = [2, 3, 4, 5]
     want = pearsonr([ent[i] for i in keep], [float(card[i]) for i in keep])[0]
     assert got == pytest.approx(want)
@@ -40,10 +42,9 @@ def test_calibration_corr_group_restriction_matches_manual():
 
 def test_linear_decodability_separable_labels():
     rng = np.random.default_rng(0)
-    X = np.vstack([rng.normal([0, 0, 0, 0], 0.1, (10, 4)),
-                   rng.normal([4, 4, 4, 4], 0.1, (10, 4))])
+    X = np.vstack([rng.normal([0, 0, 0, 0], 0.1, (10, 4)), rng.normal([4, 4, 4, 4], 0.1, (10, 4))])
     y = np.array([0] * 10 + [1] * 10)
-    groups = np.arange(20)                       # one emission per group -> split is by row
+    groups = np.arange(20)  # one emission per group -> split is by row
     out = linear_decodability(X, y, groups, test_frac=0.4, seed=0)
     assert out["acc"] == 1.0 and out["bal_acc"] == 1.0
     assert out["baseline_majority"] == pytest.approx(0.5, abs=0.2)
@@ -55,7 +56,7 @@ def test_linear_decodability_group_disjoint_split():
     rng = np.random.default_rng(1)
     X = np.vstack([rng.normal(0, 1, (10, 4)), rng.normal(0, 1, (10, 4))])
     y = np.array([0] * 10 + [1] * 10)
-    groups = np.array([0] * 10 + [1] * 10)       # label perfectly confounded with group
+    groups = np.array([0] * 10 + [1] * 10)  # label perfectly confounded with group
     out = linear_decodability(X, y, groups, test_frac=0.5, seed=0)
     # only one label present in train -> undefined probe -> graceful None, no crash
     assert out["acc"] is None
@@ -72,8 +73,8 @@ def test_n_classes_is_from_full_labels_not_test_set():
     y = np.array([0, 1] * 5 + [0, 1] * 5 + [2] * 10)
     groups = np.array([0] * 10 + [1] * 10 + [2] * 10)
     out = linear_decodability(X, y, groups, test_groups={0})
-    assert out["acc"] is not None                # normal path
-    assert out["n_classes"] == 3                 # full label set, not the 2 present in the test split
+    assert out["acc"] is not None  # normal path
+    assert out["n_classes"] == 3  # full label set, not the 2 present in the test split
 
 
 def test_explicit_test_groups_gives_one_shared_cut():
@@ -82,10 +83,13 @@ def test_explicit_test_groups_gives_one_shared_cut():
     rng = np.random.default_rng(4)
     X = np.vstack([rng.normal([0, 0, 0, 0], 0.1, (15, 4)), rng.normal([4, 4, 4, 4], 0.1, (15, 4))])
     y = np.array([0, 1, 0, 1, 0] * 3 + [1, 0, 1, 0, 1] * 3)
-    groups = np.repeat(np.arange(6), 5)          # 6 groups, mixed labels within each -> train always sees both
+    groups = np.repeat(
+        np.arange(6), 5
+    )  # 6 groups, mixed labels within each -> train always sees both
     # reconstruct the split the default path would pick, then feed it back explicitly
-    order = np.unique(groups).copy(); np.random.default_rng(0).shuffle(order)
-    picked = set(order[:max(1, int(round(len(order) * 0.4)))].tolist())
+    order = np.unique(groups).copy()
+    np.random.default_rng(0).shuffle(order)
+    picked = set(order[: max(1, int(round(len(order) * 0.4)))].tolist())
     internal = linear_decodability(X, y, groups, test_frac=0.4, seed=0)
     explicit = linear_decodability(X, y, groups, test_groups=picked)
     assert internal["n_test"] == explicit["n_test"] and internal["n_train"] == explicit["n_train"]

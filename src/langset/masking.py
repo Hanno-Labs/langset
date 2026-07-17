@@ -26,6 +26,7 @@ you want one, but for training just give `text`.
 
 A Masker is any callable `(text: str, rng: random.Random) -> (visible_text, hidden_text)`.
 """
+
 from __future__ import annotations
 
 import random
@@ -51,8 +52,8 @@ class SpanMasker:
             return text, ""
         k = max(1, min(len(toks) - 1, round(len(toks) * self.ratio)))
         start = rng.randint(0, len(toks) - k)
-        hidden = toks[start:start + k]
-        visible = toks[:start] + [self.sentinel] + toks[start + k:]
+        hidden = toks[start : start + k]
+        visible = toks[:start] + [self.sentinel] + toks[start + k :]
         return " ".join(visible), " ".join(hidden)
 
 
@@ -64,14 +65,17 @@ class TokenMasker:
     for chess movetext `protect=lambda t: t.endswith(".")` masks moves but keeps the `1.`/`2.` numbering
     so positions stay anchored (mask a random % of the actual MOVES, both players)."""
 
-    def __init__(self, ratio: float = 0.15, sentinel: str = "[MASK]",
-                 protect: Callable[[str], bool] | None = None) -> None:
+    def __init__(
+        self,
+        ratio: float = 0.15,
+        sentinel: str = "[MASK]",
+        protect: Callable[[str], bool] | None = None,
+    ) -> None:
         self.ratio, self.sentinel, self.protect = ratio, sentinel, protect
 
     def __call__(self, text: str, rng: random.Random) -> tuple[str, str]:
         toks = text.split()
-        maskable = [i for i, t in enumerate(toks)
-                    if self.protect is None or not self.protect(t)]
+        maskable = [i for i, t in enumerate(toks) if self.protect is None or not self.protect(t)]
         if len(maskable) < 1 or len(toks) < 2:
             return text, ""
         k = max(1, min(len(maskable), round(len(maskable) * self.ratio)))
@@ -87,8 +91,13 @@ class FieldMasker:
     (e.g. cells `e1:K` -> `e1:[MASK]`), so the model must infer WHAT is at a KNOWN slot — the sharp form of
     "represent the fine detail." This is the masker for a chess board render (cells) or any key:value record."""
 
-    def __init__(self, sep: str = " ", ratio: float = 0.2, sentinel: str = "[MASK]",
-                 kv_sep: str | None = None) -> None:
+    def __init__(
+        self,
+        sep: str = " ",
+        ratio: float = 0.2,
+        sentinel: str = "[MASK]",
+        kv_sep: str | None = None,
+    ) -> None:
         self.sep, self.ratio, self.sentinel, self.kv_sep = sep, ratio, sentinel, kv_sep
 
     def __call__(self, text: str, rng: random.Random) -> tuple[str, str]:
@@ -124,7 +133,9 @@ def resolve_masker(spec: Masker | str | None, ratio: float = 0.15) -> Masker:
         return SpanMasker(ratio)
     if spec == "field":
         return FieldMasker(ratio=ratio)
-    raise ValueError(f"unknown masker spec {spec!r}; use 'word', 'span', 'field', a callable, or None")
+    raise ValueError(
+        f"unknown masker spec {spec!r}; use 'word', 'span', 'field', a callable, or None"
+    )
 
 
 def mask_view(texts: list[str], masker: Masker, rng: random.Random) -> list[str]:
@@ -139,8 +150,9 @@ def mask_view(texts: list[str], masker: Masker, rng: random.Random) -> list[str]
     return out
 
 
-def build_masked(texts: list[str], masker: Masker, views: int = 1, seed: int = 0,
-                 target_mode: str = "full") -> list[dict[str, str]]:
+def build_masked(
+    texts: list[str], masker: Masker, views: int = 1, seed: int = 0, target_mode: str = "full"
+) -> list[dict[str, str]]:
     """Whole texts -> langset JEPA rows. Each text yields `views` masked pairs with different random masks
     (mask diversity, like JEPA re-masking). target_mode: 'full' = predict the WHOLE text's latent from the
     masked view (masked-view -> full-view alignment); 'hidden' = predict only the withheld content's latent."""
@@ -152,14 +164,22 @@ def build_masked(texts: list[str], masker: Masker, views: int = 1, seed: int = 0
         for _ in range(views):
             visible, hidden = masker(t, rng)
             if not visible.strip() or not hidden.strip() or visible.strip() == t.strip():
-                continue                                          # skip degenerate (nothing hidden)
-            out.append({"input_text": visible, "target_text": t if target_mode == "full" else hidden})
+                continue  # skip degenerate (nothing hidden)
+            out.append(
+                {"input_text": visible, "target_text": t if target_mode == "full" else hidden}
+            )
     return out
 
 
-def build_masked_pairs(pairs: list[tuple[str, str]], masker: Masker, views: int = 1, seed: int = 0,
-                       sep: str = " ", mask_region: str = "target",
-                       target_mode: str = "full") -> list[dict[str, str]]:
+def build_masked_pairs(
+    pairs: list[tuple[str, str]],
+    masker: Masker,
+    views: int = 1,
+    seed: int = 0,
+    sep: str = " ",
+    mask_region: str = "target",
+    target_mode: str = "full",
+) -> list[dict[str, str]]:
     """FUSE (input, target) then mask — the "state + facets you want to predict" JEPA.
 
     Each pair is `(input, target)`: `input` is the state of the world you ALWAYS have; `target` is the
@@ -186,10 +206,12 @@ def build_masked_pairs(pairs: list[tuple[str, str]], masker: Masker, views: int 
         for _ in range(views):
             if mask_region == "all":
                 visible, hidden = masker(merged, rng)
-            else:                                                 # mask only the target span; keep input whole
+            else:  # mask only the target span; keep input whole
                 vis_t, hidden = masker(tgt, rng)
                 visible = f"{inp}{sep}{vis_t}"
             if not visible.strip() or not hidden.strip() or visible.strip() == merged.strip():
-                continue                                          # skip degenerate (nothing hidden)
-            out.append({"input_text": visible, "target_text": merged if target_mode == "full" else hidden})
+                continue  # skip degenerate (nothing hidden)
+            out.append(
+                {"input_text": visible, "target_text": merged if target_mode == "full" else hidden}
+            )
     return out

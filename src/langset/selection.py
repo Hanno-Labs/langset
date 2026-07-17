@@ -1,6 +1,7 @@
 """Validation metrics for early-stop. The hard-won rule: NEVER select on training loss — a contrastive objective
 can minimize it by COLLAPSING the geometry. Selection scores held-out input-view <-> target-view retrieval and
 held-out reconstruction, with a hard collapse penalty (see Trainer)."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -28,15 +29,19 @@ def knn_purity(X: np.ndarray, labels: list[str], k: int = 5) -> float:
     this attribute? The selection signal for label-shaping (SupCon) runs — retrieval MRR measures event IDENTITY and is
     suppressed when same-label items are pulled together, so it can't select a stage-separated checkpoint; this can.
     Labels ''/'unknown'/'none'/'nan' are dropped. Returns the fraction of held-out items whose kNN majority matches."""
-    keep = [i for i, l in enumerate(labels) if str(l).strip().lower() not in ("", "unknown", "none", "nan")]
+    keep = [
+        i
+        for i, l in enumerate(labels)
+        if str(l).strip().lower() not in ("", "unknown", "none", "nan")
+    ]
     if len(keep) < k + 1:
         return 0.0
     Xk = X[keep]
     Xn = Xk / (np.linalg.norm(Xk, axis=1, keepdims=True) + 1e-9)
     lab = [labels[i] for i in keep]
     sims = Xn @ Xn.T
-    np.fill_diagonal(sims, -1e9)                                # leave-one-out: never vote for yourself
-    nbr = np.argsort(-sims, axis=1)[:, :k]                      # k nearest by cosine
+    np.fill_diagonal(sims, -1e9)  # leave-one-out: never vote for yourself
+    nbr = np.argsort(-sims, axis=1)[:, :k]  # k nearest by cosine
     correct = 0
     for i in range(len(lab)):
         votes: dict[str, int] = {}

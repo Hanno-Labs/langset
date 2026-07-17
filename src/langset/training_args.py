@@ -1,4 +1,5 @@
 """Training configuration for langset."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -20,14 +21,16 @@ class TrainingArguments:
     epochs: int = 40
     batch_size: int = 32
     lr: float = 5e-4
-    tau: float = 0.07                     # contrastive temperature
+    tau: float = 0.07  # contrastive temperature
     max_len: int = 512
 
     # loss weights. The self-contrastive term (emit(input) <-> emit(target_text)) is the primary at weight 1.0;
     # these are light aux terms: recon grounds the latent in the target text, uniform keeps the space spread.
-    lam_recon: float = 0.3                # aux: the latent must also DECODE target_text
-    lam_uniform: float = 0.1              # aux: light uniformity (spread latents on the sphere)
-    lam_hard_neg: float = 0.0             # MULTI-LATENT hard-neg InfoNCE weight (0 = off, byte-identical to before)
+    lam_recon: float = 0.3  # aux: the latent must also DECODE target_text
+    lam_uniform: float = 0.1  # aux: light uniformity (spread latents on the sphere)
+    lam_hard_neg: float = (
+        0.0  # MULTI-LATENT hard-neg InfoNCE weight (0 = off, byte-identical to before)
+    )
     # MULTI-LATENT in-batch-negative InfoNCE — the separation term the multi-latent path was MISSING. The base
     # multi-latent loss (loss_stop + loss_dims + recon) is pure reconstruction: it MATCHES each emitted latent to
     # its EMA target but never pushes DIFFERENT items apart, so the geometry is capped by the base embedding and
@@ -147,9 +150,9 @@ class TrainingArguments:
     # the Trainer reads a `target_texts` (list[str] per row) column, emits an EMA-twin target for each item, and
     # trains the token-native FSQ emitter (per-dim digits + a learned STOP). Ignored on the single-latent path.
     # `fsq_dim`/`fsq_levels` are MODEL internals (read from `model.head`), NOT args.
-    ema_m: float = 0.99                   # EMA-twin momentum supplying the (stop-grad) target latents
-    max_target_items: int = 12            # cap on target latents emitted/supervised per row
-    max_steps: int = 16                   # free-rollout cap used in multi-latent eval
+    ema_m: float = 0.99  # EMA-twin momentum supplying the (stop-grad) target latents
+    max_target_items: int = 12  # cap on target latents emitted/supervised per row
+    max_steps: int = 16  # free-rollout cap used in multi-latent eval
     # target-text encode length for the EMA target latents. 64 (default) suits SHORT targets (labels/tags/one-liners
     # — the library's premise). Raise it when a target is a DOCUMENT: emit_seed's phase-0 target is a full science
     # abstract, and 64 tokens keeps only its (often boilerplate) intro -> blurry phase-0 identity. Short targets
@@ -165,17 +168,19 @@ class TrainingArguments:
     # `TrainingArguments(target_source=SIGRegTarget)`, see the injection block below). SIGRegTarget replaces the EMA
     # twin with a LIVE encoder + an isotropic-Gaussian penalty on the pre-quant z; these tune that penalty. Inert
     # under the default EMATwinTarget. See langset/sigreg.py.
-    sigreg_lambda: float = 0.3            # weight on the SIGReg isotropic-Gaussian loss (0.3 balances vs recon; higher
+    sigreg_lambda: float = (
+        0.3  # weight on the SIGReg isotropic-Gaussian loss (0.3 balances vs recon; higher
+    )
     #                                       over-diversifies and washes out global structure, lower under-constrains)
-    sigreg_knots: int = 17               # Epps-Pulley quadrature knots (>= 2)
-    sigreg_slices: int = 256             # random 1-D projection directions, resampled each step (>= 1)
+    sigreg_knots: int = 17  # Epps-Pulley quadrature knots (>= 2)
+    sigreg_slices: int = 256  # random 1-D projection directions, resampled each step (>= 1)
 
     # Exp-B — CoT-conditioned emission. Activated by INJECTING the pair `loss_terms=build_cot_loss_terms` +
     # `seed_builder=cot_seed_texts` (see the injection block below) with a `cot_text` dataset column: the model is
     # co-trained to GENERATE each row's chain-of-thought (its own isolated backward, so the two autograd graphs never
     # coexist) and the latent forward is conditioned on seed+CoT. No injection / absent cot_text column = OFF
     # (byte-identical FSQ path). Not a flag — inject the strategies; this scalar just weights the CoT next-token CE.
-    lam_cot: float = 1.0                  # weight on the CoT next-token CE (used only with the CoT strategies)
+    lam_cot: float = 1.0  # weight on the CoT next-token CE (used only with the CoT strategies)
 
     # SUPERPOSITION (multi-latent) — to make one emitted latent hold a calibrated MIXTURE of several possible next
     # states, supervise it DIRECTLY: describe the whole SET of futures in a target text (see examples/maze-superposition)
@@ -194,12 +199,20 @@ class TrainingArguments:
     # To change a behavior, INJECT a different implementation, e.g.
     #     TrainingArguments(target_source=SIGRegTarget)          # EMA-free anti-collapse
     # rather than toggling a boolean the trainer then branches on. See strategies.py for the interface each must meet.
-    emission: Callable = FSQObjective              # (model, args, dev, trainer) -> _EmissionObjective : seed->latents + base loss
-    target_source: Callable = EMATwinTarget        # (model, args, tok, dev) -> _TargetSource : the target latents + anti-collapse
-    loss_terms: Callable = build_loss_terms        # (args) -> list[_LossTerm] : the weighted aux separation/shaping terms
-    epoch_order: Callable = multi_epoch_order      # (tr_idx, rng, args, seeds) -> list[int] : per-epoch visiting order
-    selector: Callable = multi_select_metric       # (mode, mrr, purity, ep) -> float : the checkpoint-selection signal
-    seed_builder: Callable = multi_seed_texts      # (trainer, seeds, args) -> list[str] : the texts the emission reads
+    emission: Callable = FSQObjective  # (model, args, dev, trainer) -> _EmissionObjective : seed->latents + base loss
+    target_source: Callable = EMATwinTarget  # (model, args, tok, dev) -> _TargetSource : the target latents + anti-collapse
+    loss_terms: Callable = (
+        build_loss_terms  # (args) -> list[_LossTerm] : the weighted aux separation/shaping terms
+    )
+    epoch_order: Callable = (
+        multi_epoch_order  # (tr_idx, rng, args, seeds) -> list[int] : per-epoch visiting order
+    )
+    selector: Callable = (
+        multi_select_metric  # (mode, mrr, purity, ep) -> float : the checkpoint-selection signal
+    )
+    seed_builder: Callable = (
+        multi_seed_texts  # (trainer, seeds, args) -> list[str] : the texts the emission reads
+    )
 
     # JEPA MASKED-SELF-PREDICTION mode (single-latent). You give a `text` column of RAW, UNMASKED text; the
     # Trainer masks it FRESH EVERY EPOCH at runtime (input_text=visible, target_text=full) — no external label,
@@ -223,9 +236,13 @@ class TrainingArguments:
     # from ep0. Atomic (tmp+rename) so a mid-write preempt can't corrupt it. Works on BOTH the single- and multi-latent
     # paths. None/0 = OFF (byte-identical).
     resume_dir: Optional[str] = None
-    max_steps_per_epoch: int = 0          # >0: cap each epoch to N steps (bound the max work lost on preempt to ~N*step_s)
-    run_sig: Optional[str] = None         # identity fingerprint (base+data+config); resume REFUSES on mismatch -> fresh,
-                                          # so a DIFFERENT model/run can never wrongly load THIS run's checkpoint
+    max_steps_per_epoch: int = (
+        0  # >0: cap each epoch to N steps (bound the max work lost on preempt to ~N*step_s)
+    )
+    run_sig: Optional[str] = (
+        None  # identity fingerprint (base+data+config); resume REFUSES on mismatch -> fresh,
+    )
+    # so a DIFFERENT model/run can never wrongly load THIS run's checkpoint
 
     # validation / early-stop
     val_frac: float = 0.2
@@ -245,6 +262,6 @@ class TrainingArguments:
 
     # io / logging
     output_dir: str = "langset-out"
-    report_to: Optional[str] = None       # "wandb" or None
+    report_to: Optional[str] = None  # "wandb" or None
     wandb_project: str = "langset"
     verbose: bool = True

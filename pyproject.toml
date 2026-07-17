@@ -35,3 +35,23 @@ packages = ["src/langset"]
 # src_proto/ is untracked scratch/prototype code — never ship it to PyPI (the wheel already
 # only packages src/langset; this keeps the sdist from sweeping the scratch dir in).
 exclude = ["/src_proto"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "ANN"]
+ignore = [
+    "E501",    # long lines are intentional — dense aligned inline-comment style; ruff format still reflows code
+    "E702",    # dense `p = Path(x); p.mkdir()` single-line compound statements are a deliberate style here
+    "ANN401",  # `Any` is the honest annotation for the torch / transformers / HF objects passed through the API
+    "N806",    # single-letter math locals (H=hops, L=levels, B=batch, Lv=levels·vocab) are deliberate notation
+    "N803",    # same math notation for function args
+    "N812",    # `import torch.nn.functional as F` — F is the canonical alias
+    "N814",    # constant-case import aliases, same reason
+    "E741",    # l / L / I read as math notation in this codebase, not ambiguous names
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ANN"]   # test bodies don't need full type annotations

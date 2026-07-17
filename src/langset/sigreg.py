@@ -16,6 +16,7 @@ down_proj on the predicted path — the model emits digit logits, so its analogu
 the soft digit expectation). Regularizing these spreads the encoder's codes across the whole grid, which is what
 stops the (twin-free) live encoder folding every input into one cell.
 """
+
 from __future__ import annotations
 
 import torch
@@ -31,19 +32,21 @@ class SIGReg(nn.Module):
 
     def __init__(self, knots: int = 17, slices: int = 256) -> None:
         super().__init__()
-        if knots < 2:                                          # dt = 3/(knots-1) needs >=2 points (a trapezoid rule)
+        if knots < 2:  # dt = 3/(knots-1) needs >=2 points (a trapezoid rule)
             raise ValueError(f"SIGReg needs knots >= 2 (got {knots})")
-        if slices < 1:                                         # >=1 random projection direction
+        if slices < 1:  # >=1 random projection direction
             raise ValueError(f"SIGReg needs slices >= 1 (got {slices})")
         self.slices = slices
         t = torch.linspace(0, 3, knots)
         dt = 3.0 / (knots - 1)
         weights = torch.full((knots,), 2 * dt)
-        weights[[0, -1]] = dt                                  # trapezoid endpoints
-        window = torch.exp(-t.square() / 2.0)                 # standard-normal characteristic function
+        weights[[0, -1]] = dt  # trapezoid endpoints
+        window = torch.exp(-t.square() / 2.0)  # standard-normal characteristic function
         self.register_buffer("t", t)
         self.register_buffer("phi", window)
-        self.register_buffer("weights", weights * window)     # window the quadrature so the tail is down-weighted
+        self.register_buffer(
+            "weights", weights * window
+        )  # window the quadrature so the tail is down-weighted
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [..., N, D]. CENTER ONLY — do NOT divide by std. The target is the STANDARD normal N(0,1), whose unit
@@ -54,8 +57,12 @@ class SIGReg(nn.Module):
         # collapse the dominant penalty.
         x = x - x.mean(-2, keepdim=True)
         A = torch.randn(x.size(-1), self.slices, device=x.device, dtype=x.dtype)
-        A = A / A.norm(p=2, dim=0, keepdim=True)               # unit-norm slice directions, resampled each call
-        x_t = (x @ A).unsqueeze(-1) * self.t                   # [..., N, slices, knots]
-        err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()   # emp. CF vs target CF
-        statistic = (err @ self.weights) * x.size(-2)          # Epps-Pulley statistic per slice, scaled by N
+        A = A / A.norm(p=2, dim=0, keepdim=True)  # unit-norm slice directions, resampled each call
+        x_t = (x @ A).unsqueeze(-1) * self.t  # [..., N, slices, knots]
+        err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(
+            -3
+        ).square()  # emp. CF vs target CF
+        statistic = (err @ self.weights) * x.size(
+            -2
+        )  # Epps-Pulley statistic per slice, scaled by N
         return statistic.mean()

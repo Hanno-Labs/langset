@@ -19,24 +19,29 @@ Both are deliberately model-agnostic: you pass in the arrays that `rollout(retur
 never leaks one trajectory across both sides). scikit-learn and scipy are imported lazily, so importing langset
 never requires them — `pip install "langset[probes]"` (or bring your own sklearn/scipy) only when you probe.
 """
+
 from __future__ import annotations
 
-from typing import Iterable, Optional, Sequence
+from typing import Any, Iterable, Optional, Sequence
 
 import numpy as np
 
 
-def _require(mod: str, pkg: str):
+def _require(mod: str, pkg: str) -> Any:
     try:
         return __import__(mod, fromlist=["_"])
     except ImportError as e:  # pragma: no cover - trivial guard
         raise ImportError(
-            f"langset.probes needs {pkg} — `pip install \"langset[probes]\"` (or `pip install {pkg}`)."
+            f'langset.probes needs {pkg} — `pip install "langset[probes]"` (or `pip install {pkg}`).'
         ) from e
 
 
-def calibration_corr(entropy: Sequence[float], cardinality: Sequence[int],
-                     groups: Optional[Sequence] = None, test_groups: Optional[set] = None) -> Optional[float]:
+def calibration_corr(
+    entropy: Sequence[float],
+    cardinality: Sequence[int],
+    groups: Optional[Sequence] = None,
+    test_groups: Optional[set] = None,
+) -> Optional[float]:
     """Superposition CALIBRATION: Pearson corr between the emitted latent's native entropy and the ground-truth
     number of possible next states at that emission.
 
@@ -60,9 +65,15 @@ def calibration_corr(entropy: Sequence[float], cardinality: Sequence[int],
     return float(pearsonr(ent, k)[0])
 
 
-def linear_decodability(latents: np.ndarray, labels: Sequence, groups: Sequence,
-                        test_frac: float = 0.4, seed: int = 0, balanced: bool = True,
-                        test_groups: Optional[Iterable] = None) -> dict:
+def linear_decodability(
+    latents: np.ndarray,
+    labels: Sequence,
+    groups: Sequence,
+    test_frac: float = 0.4,
+    seed: int = 0,
+    balanced: bool = True,
+    test_groups: Optional[Iterable] = None,
+) -> dict:
     """Linear DECODABILITY of a per-emission label from the emitted latent, on a GROUP-DISJOINT split.
 
     latents   [N, d] emitted latents (the `lat`/`soft_lat` rows from `rollout`, one per emission).
@@ -83,9 +94,9 @@ def linear_decodability(latents: np.ndarray, labels: Sequence, groups: Sequence,
     X = np.asarray(latents, dtype=float)
     y = np.asarray(labels)
     g = np.asarray(groups)
-    n_classes = int(len(np.unique(y)))                     # always report classes from the FULL label vector
+    n_classes = int(len(np.unique(y)))  # always report classes from the FULL label vector
     if test_groups is not None:
-        test_g = set(test_groups)                          # caller-supplied cut -> both probes stay comparable
+        test_g = set(test_groups)  # caller-supplied cut -> both probes stay comparable
     else:
         order = np.unique(g).copy()
         np.random.default_rng(seed).shuffle(order)
@@ -94,15 +105,26 @@ def linear_decodability(latents: np.ndarray, labels: Sequence, groups: Sequence,
     te = np.array([gi in test_g for gi in g], dtype=bool)
     tr = ~te
     if tr.sum() == 0 or te.sum() == 0 or len(np.unique(y[tr])) < 2:
-        return {"acc": None, "bal_acc": None, "baseline_majority": None,
-                "n_train": int(tr.sum()), "n_test": int(te.sum()), "n_classes": n_classes}
+        return {
+            "acc": None,
+            "bal_acc": None,
+            "baseline_majority": None,
+            "n_train": int(tr.sum()),
+            "n_test": int(te.sum()),
+            "n_classes": n_classes,
+        }
     yt = y[te]
     _, counts = np.unique(yt, return_counts=True)
-    baseline = float(counts.max() / counts.sum())          # majority-class accuracy on the test set
-    clf = skl.LogisticRegression(max_iter=2000,
-                                 class_weight="balanced" if balanced else None).fit(X[tr], y[tr])
+    baseline = float(counts.max() / counts.sum())  # majority-class accuracy on the test set
+    clf = skl.LogisticRegression(max_iter=2000, class_weight="balanced" if balanced else None).fit(
+        X[tr], y[tr]
+    )
     pr = clf.predict(X[te])
-    return {"acc": round(float((pr == yt).mean()), 4),
-            "bal_acc": round(float(metrics.balanced_accuracy_score(yt, pr)), 4),
-            "baseline_majority": round(baseline, 4),
-            "n_train": int(tr.sum()), "n_test": int(te.sum()), "n_classes": n_classes}
+    return {
+        "acc": round(float((pr == yt).mean()), 4),
+        "bal_acc": round(float(metrics.balanced_accuracy_score(yt, pr)), 4),
+        "baseline_majority": round(baseline, 4),
+        "n_train": int(tr.sum()),
+        "n_test": int(te.sum()),
+        "n_classes": n_classes,
+    }

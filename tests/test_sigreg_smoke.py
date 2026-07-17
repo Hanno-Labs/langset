@@ -6,6 +6,7 @@ isotropic-Gaussian penalty), so it needs its own coverage. This is a fast CPU/fp
 proves the injected `target_source=SIGRegTarget` path RUNS, stays finite, and actually changes training vs the
 EMA default — plus the SIGReg quadrature-arg guards. Run:  .venv/bin/python tests/test_sigreg_smoke.py
 """
+
 from __future__ import annotations
 
 import sys
@@ -42,10 +43,12 @@ def test_sigreg_runs_and_is_finite() -> None:
 def test_sigreg_diverges_from_ema_default() -> None:
     """SIGReg must be a REAL alternative to the EMA twin, not a silent no-op: injecting target_source=SIGRegTarget
     has to change the learned weights vs the default EMATwinTarget beyond tolerance."""
-    base = M._run()["params_post"]                 # default EMATwinTarget
+    base = M._run()["params_post"]  # default EMATwinTarget
     sig = _run_sigreg()
     max_delta = float(np.max(np.abs(sig - base)))
-    assert max_delta > 1e-4, f"SIGReg did not change training vs EMA default (max param delta {max_delta:.2e})"
+    assert max_delta > 1e-4, (
+        f"SIGReg did not change training vs EMA default (max param delta {max_delta:.2e})"
+    )
 
 
 def test_sigreg_arg_guards() -> None:
@@ -57,12 +60,15 @@ def test_sigreg_arg_guards() -> None:
         except ValueError:
             continue
         raise AssertionError(f"SIGReg({bad}) should have raised ValueError")
-    SIGReg(knots=2, slices=1)                       # minimal valid config must construct
+    SIGReg(knots=2, slices=1)  # minimal valid config must construct
 
 
 if __name__ == "__main__":
     torch.use_deterministic_algorithms(True, warn_only=True)
-    test_sigreg_arg_guards(); print("sigreg_arg_guards OK")
-    test_sigreg_runs_and_is_finite(); print("sigreg_runs_and_is_finite OK")
-    test_sigreg_diverges_from_ema_default(); print("sigreg_diverges_from_ema_default OK")
+    test_sigreg_arg_guards()
+    print("sigreg_arg_guards OK")
+    test_sigreg_runs_and_is_finite()
+    print("sigreg_runs_and_is_finite OK")
+    test_sigreg_diverges_from_ema_default()
+    print("sigreg_diverges_from_ema_default OK")
     print("ALL PASS")
