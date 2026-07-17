@@ -44,7 +44,7 @@ def build_rows(z, max_fut: int) -> list[dict]:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--data", required=True, help="corpus npz from gen_maze.py")
+    p.add_argument("--data", required=True, help="corpus npz from gen_eco.py")
     p.add_argument("--out", required=True, help="checkpoint output dir")
     p.add_argument("--backbone", default="HuggingFaceTB/SmolLM2-135M")
     p.add_argument("--epochs", type=int, default=30)
@@ -69,10 +69,19 @@ def main() -> None:
                    help="DISENTANGLER ARM: pretrained backbone, FULL-PARAM train (unfreeze base, not LoRA-only). "
                         "Removes the LoRA-vs-full-FT regime confound so pretrained-vs-random differs ONLY in init. "
                         "Use a gentler lr (~2e-5) so full-FT does not overwrite the pretrained knowledge.")
+    p.add_argument("--seed", type=int, default=0,
+                   help="RNG seed for weight init (random arm), data order, and dropout -> seed-stability sweeps")
     p.add_argument("--device", default="cuda", help="cuda (real runs) or cpu (a tiny smoke)")
     p.add_argument("--wandb", action="store_true", help="log to Weights & Biases (recommended for real runs)")
-    p.add_argument("--wandb-project", default="langset-maze")
+    p.add_argument("--wandb-project", default="langset-danger")
     a = p.parse_args()
+
+    import random as _random
+    import torch
+    _random.seed(a.seed); np.random.seed(a.seed); torch.manual_seed(a.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(a.seed)
+    print(f"[train] seed={a.seed}", flush=True)
 
     z = np.load(a.data, allow_pickle=True)
     rows = build_rows(z, a.max_fut)

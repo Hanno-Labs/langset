@@ -110,6 +110,19 @@ def _cfg_int(config: Any, name: str) -> int:
     return int(v)
 
 
+def _cfg_set(config: Any, name: str, val: Any) -> None:
+    """Set a scalar on a config, mirroring `_cfg_int`'s composite-config handling: write it on the top-level
+    config and on a `text_config` sub-config if that is where the field lives (e.g. vocab_size on a VLM)."""
+    wrote = False
+    if hasattr(config, name):
+        setattr(config, name, val); wrote = True
+    sub = getattr(config, "text_config", None)
+    if sub is not None and hasattr(sub, name):
+        setattr(sub, name, val); wrote = True
+    if not wrote:                                        # brand-new field (e.g. overriding a default not present)
+        setattr(config, name, val)
+
+
 def _text_tower(model: Any) -> Any:
     """Descend a (peft-wrapped) causal/conditional-generation model to its TEXT transformer — the module that
     returns hidden states directly, with NO lm_head. Skips the huge-vocab logits projection (Gemma's 262k-vocab
@@ -128,14 +141,40 @@ def _text_tower(model: Any) -> Any:
 
 def build_backbone(llm_model: str, lora_r: int, dropout: float, bf16: bool, dev: str,
                    attn_implementation: str = "sdpa", train_base: bool = False, grad_ckpt: bool = False,
-                   lora_top_k: int = 0) -> Any:
+                   lora_top_k: int = 0, pretrained: bool = True,
+                   arch_overrides: Optional[dict] = None, vocab_size: Optional[int] = None) -> Any:
     def _top_k_layers(n_layers: int) -> Optional[list[int]]:
         # LoRA ONLY the top-K transformer layers -> fewer adapters, smaller activation graph -> bigger batch. Emission
         # reads the FINAL hidden state, so the top layers carry the task-shaping. 0 = all layers (default, unchanged).
         return list(range(max(0, n_layers - lora_top_k), n_layers)) if lora_top_k and n_layers else None
-    from peft import LoraConfig, get_peft_model  # type: ignore[import-untyped]
     from transformers import AutoModelForCausalLM  # type: ignore[import-untyped]
     dt = torch.bfloat16 if bf16 else torch.float32
+
+    if not pretrained:
+        # RANDOM-INIT control arm: copy `llm_model`'s ARCHITECTURE (config) but NOT its weights, then train the whole
+        # net (no LoRA — a low-rank adapter over random weights is meaningless). `arch_overrides` shrinks the net; a
+        # decoupled tokenizer sets `vocab_size` so the fresh embedding table matches it. This is the "does pretraining
+        # matter" baseline: same emission/anti-collapse machinery, zero inherited knowledge.
+        from transformers import AutoConfig  # type: ignore[import-untyped]
+        cfg = AutoConfig.from_pretrained(llm_model)
+        for k, v in (arch_overrides or {}).items():
+            _cfg_set(cfg, k, v)
+        if vocab_size is not None:
+            _cfg_set(cfg, "vocab_size", vocab_size)
+        try:
+            base = AutoModelForCausalLM.from_config(cfg, attn_implementation=attn_implementation or "sdpa")
+        except TypeError:                            # older transformers: from_config takes no attn_implementation
+            base = AutoModelForCausalLM.from_config(cfg)
+        if hasattr(base, "language_model"):          # unwrap conditional-generation wrapper to the text tower
+            base = base.language_model
+        base = base.to(dtype=dt).to(dev)             # weights already random; all params require_grad by default
+        if grad_ckpt:
+            base.config.use_cache = False
+            base.gradient_checkpointing_enable()
+            base.enable_input_require_grads()
+        return _text_tower(base)
+
+    from peft import LoraConfig, get_peft_model  # type: ignore[import-untyped]
 
     def _try_load(dtype_key: str, attn: Optional[str]) -> Any:
         # sdpa (default) avoids materializing the O(S^2) eager-attention score matrix — a long seed (3072 tokens)
@@ -246,6 +285,15 @@ class LangSetModel(nn.Module):
         # (default, byte-identical: forward() takes the learned-query path exactly as before).
         self.pool_mode = pool_mode
         self._frozen_bb = False        # set by from_pretrained(freeze_backbone=True); gates the no-grad backbone read
+        # RANDOM-INIT bookkeeping (set by from_scratch). A pretrained model rebuilds its backbone from `llm_model`, so
+        # persistence stores only LoRA; a random-init model has no such source, so save/load must carry the FULL net.
+        self._pretrained = True
+        # FULL-FINETUNE bookkeeping (set by from_pretrained(train_base=True)). A pretrained model normally stores only
+        # LoRA on save (base rebuilds from `llm_model`), but train_base=True trains the WHOLE base — those weights have
+        # no source to rebuild from, so save/snapshot/load must carry the FULL backbone exactly like a random-init net.
+        self._full_ft = False
+        self._tokenizer_id: Optional[str] = None       # decoupled HF tokenizer id (None => same as llm_model/arch)
+        self._arch_overrides: Optional[dict] = None    # config shrink applied to the from-scratch backbone
 
     # ---- construction ----
     @classmethod
@@ -268,6 +316,7 @@ class LangSetModel(nn.Module):
         model = cls(backbone, tok, latent_dim, n_latents, llm_model, dropout, max_len,
                     multi_latent, fsq_dim, fsq_levels, fsq_emit=fsq_emit, pool_mode=pool_mode)
         model._lora_top_k = int(lora_top_k)                      # persisted in config so load() rebuilds same adapters
+        model._full_ft = bool(train_base)                        # train_base trains the whole base -> persist FULL backbone
         if pool_mode == "last":                      # WARM-START the pool head at the base's NATIVE embedding: identity
             torch.nn.init.eye_(model.head.out_proj.weight)   # out_proj -> head_project == normalize(last-token hidden) ==
             torch.nn.init.zeros_(model.head.out_proj.bias)   # the base's own readout (last-token pool) -> starts at base
@@ -276,6 +325,37 @@ class LangSetModel(nn.Module):
             for p in model.backbone.parameters():
                 p.requires_grad_(False)
             model._frozen_bb = True
+        return model.to(dev)
+
+    @classmethod
+    def from_scratch(cls, arch: str, *, tokenizer_id: Optional[str] = None,
+                     latent_dim: Optional[int] = None, n_latents: int = 1, dropout: float = 0.0,
+                     bf16: bool = False, max_len: int = 512, multi_latent: bool = False,
+                     fsq_dim: int = 128, fsq_levels: int = 8, device: Optional[str] = None,
+                     attn_implementation: str = "sdpa", grad_ckpt: bool = False, fsq_emit: bool = False,
+                     arch_overrides: Optional[dict] = None) -> "LangSetModel":
+        """RANDOM-INIT control arm (the "does pretraining matter" baseline). `arch` names an HF model whose
+        ARCHITECTURE is copied, but the weights are NOT loaded — the backbone starts from scratch and trains fully
+        (no LoRA). The tokenizer is decoupled: pass any HF `tokenizer_id` (default = `arch`) and the fresh embedding
+        table is sized to it, so there is no baked-in tokenizer. `arch_overrides` shrinks the net, e.g.
+        `{"num_hidden_layers": 4, "hidden_size": 256, "num_attention_heads": 4, "num_key_value_heads": 4,
+        "intermediate_size": 1024}`. Everything downstream (emit head, FSQ, EMA-twin/SIGReg targets, losses) is
+        identical to `from_pretrained`; only the source of the backbone weights differs."""
+        from transformers import AutoTokenizer  # type: ignore[import-untyped]
+        dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        tok = AutoTokenizer.from_pretrained(tokenizer_id or arch)
+        if tok.pad_token_id is None:
+            tok.pad_token = tok.eos_token
+        backbone = build_backbone(arch, 0, dropout, bf16, dev, attn_implementation,
+                                  grad_ckpt=grad_ckpt, pretrained=False,
+                                  arch_overrides=arch_overrides, vocab_size=len(tok))
+        if latent_dim is None:                                   # default: emit in the backbone's own hidden space
+            latent_dim = _cfg_int(backbone.config, "hidden_size")
+        model = cls(backbone, tok, latent_dim, n_latents, arch, dropout, max_len,
+                    multi_latent, fsq_dim, fsq_levels, fsq_emit=fsq_emit)
+        model._pretrained = False
+        model._tokenizer_id = tokenizer_id
+        model._arch_overrides = dict(arch_overrides) if arch_overrides else None
         return model.to(dev)
 
     @property
@@ -595,28 +675,44 @@ class LangSetModel(nn.Module):
     def save_pretrained(self, path: Union[str, Path]) -> None:
         import json
         p = Path(path); p.mkdir(parents=True, exist_ok=True)
-        torch.save({"head": self.head.state_dict(),
-                    "lora": {k: v.cpu() for k, v in self.backbone.state_dict().items() if "lora" in k}},
-                   p / "langset.pt")
+        if self._pretrained and not self._full_ft:       # pretrained + frozen base: backbone rebuilds from `llm_model` -> LoRA only
+            weights = {"head": self.head.state_dict(),
+                       "lora": {k: v.cpu() for k, v in self.backbone.state_dict().items() if "lora" in k}}
+        else:                                            # random-init OR train_base full-FT: no source to rebuild from -> FULL backbone
+            weights = {"head": self.head.state_dict(),
+                       "backbone": {k: v.cpu() for k, v in self.backbone.state_dict().items()}}
+        torch.save(weights, p / "langset.pt")
         (p / "config.json").write_text(json.dumps({
             "llm_model": self.llm_model, "latent_dim": self.latent_dim,
             "n_latents": self.head.n_latents, "max_len": self.max_len,
             "multi_latent": self.multi_latent, "fsq_dim": self.fsq_dim, "fsq_levels": self.fsq_levels,
-            "lora_top_k": self._lora_top_k, "fsq_emit": self.head.fsq_emit, "pool_mode": self.pool_mode}))
+            "lora_top_k": self._lora_top_k, "fsq_emit": self.head.fsq_emit, "pool_mode": self.pool_mode,
+            "pretrained": self._pretrained, "full_ft": self._full_ft, "tokenizer_id": self._tokenizer_id,
+            "arch_overrides": self._arch_overrides}))
 
     @classmethod
     def load(cls, path: Union[str, Path], *, lora_r: int = 16, device: Optional[str] = None,
              attn_implementation: str = "sdpa") -> "LangSetModel":
         import json
         p = Path(path); cfg = json.loads((p / "config.json").read_text())
-        m = cls.from_pretrained(cfg["llm_model"], latent_dim=cfg["latent_dim"], n_latents=cfg.get("n_latents", 1),
-                                lora_r=lora_r, max_len=cfg["max_len"], multi_latent=cfg.get("multi_latent", False),
-                                fsq_dim=cfg.get("fsq_dim", 128), fsq_levels=cfg.get("fsq_levels", 8),
-                                lora_top_k=int(cfg.get("lora_top_k", 0)), fsq_emit=cfg.get("fsq_emit", False),
-                                pool_mode=cfg.get("pool_mode", ""), device=device,
-                                attn_implementation=attn_implementation)  # 'eager' to read attention weights
+        if cfg.get("pretrained", True):
+            m = cls.from_pretrained(cfg["llm_model"], latent_dim=cfg["latent_dim"], n_latents=cfg.get("n_latents", 1),
+                                    lora_r=lora_r, max_len=cfg["max_len"], multi_latent=cfg.get("multi_latent", False),
+                                    fsq_dim=cfg.get("fsq_dim", 128), fsq_levels=cfg.get("fsq_levels", 8),
+                                    lora_top_k=int(cfg.get("lora_top_k", 0)), fsq_emit=cfg.get("fsq_emit", False),
+                                    pool_mode=cfg.get("pool_mode", ""), device=device,
+                                    attn_implementation=attn_implementation)  # 'eager' to read attention weights
+        else:                                            # random-init: rebuild the same arch from scratch, then load full weights
+            m = cls.from_scratch(cfg["llm_model"], tokenizer_id=cfg.get("tokenizer_id"),
+                                  latent_dim=cfg["latent_dim"], n_latents=cfg.get("n_latents", 1),
+                                  max_len=cfg["max_len"], multi_latent=cfg.get("multi_latent", False),
+                                  fsq_dim=cfg.get("fsq_dim", 128), fsq_levels=cfg.get("fsq_levels", 8),
+                                  fsq_emit=cfg.get("fsq_emit", False), arch_overrides=cfg.get("arch_overrides"),
+                                  device=device, attn_implementation=attn_implementation)
+        m._full_ft = bool(cfg.get("full_ft", False))     # restore the flag so a re-save round-trips the same way
         sd = torch.load(p / "langset.pt", map_location=m.device, weights_only=False)
-        m.backbone.load_state_dict(sd["lora"], strict=False)
+        # select by the ACTUAL payload (not the flag): a full-FT pretrained model persists "backbone", not "lora".
+        m.backbone.load_state_dict(sd["backbone"] if "backbone" in sd else sd["lora"], strict=False)
         m.head.load_state_dict(sd["head"])
         m.eval()
         return m

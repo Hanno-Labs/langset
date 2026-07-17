@@ -423,6 +423,53 @@ class EMATwinTarget(_TargetSource):
             torch._foreach_add_(self._ema, self._online, alpha=1.0 - self.a.ema_m)
 
 
+class CachedTarget(_TargetSource):
+    """FROZEN-ENCODER target source with an encode-once cache — the two-stage (V-JEPA) split for the multi-latent
+    world model. The target geometry is a FIXED encoder, so every text->latent map is CONSTANT for the whole run:
+    encode each unique text ONCE, memoize, then serve lookups. The step loop stops re-encoding BOTH the per-step
+    targets (trainer flat_texts) and the batch-pooled hard-negative bank (HardNegTerm) — bringing the 'train only
+    the head on cached vectors, epochs in seconds' win that langset's single-latent frozen-pool path already has
+    to the multi-latent rollout. It's the fix for re-encoding fixed data every epoch.
+
+    Encoder source: `args.target_encoder_ckpt` (a saved LangSetModel dir) when set — the intended use, a SEPARATE
+    already-good geometry (e.g. a trained affordance/embedding model) that the emitter learns to roll FORWARD in,
+    so no encoder is co-trained at all. Otherwise a frozen snapshot of the online model at init (only meaningful
+    when it already starts from a good encoder). INJECT via
+    `TrainingArguments(target_source=CachedTarget, target_encoder_ckpt="path/to/encoder")`. `update()` is a no-op
+    (the geometry is fixed) and the eval retrieval bank encodes through the same frozen geometry (`twin = enc`)."""
+    suppresses_nce = False
+
+    def __init__(self, model: LangSetModel, args: TrainingArguments, tok: Any, dev: torch.device) -> None:
+        self.a, self.dev = args, dev
+        ckpt = getattr(args, "target_encoder_ckpt", None)
+        if ckpt:
+            from langset.modeling import LangSetModel as _LSM    # local import avoids a strategies<->modeling cycle
+            enc = _LSM.load(ckpt, device=str(dev))
+        else:
+            enc = copy.deepcopy(model)                           # frozen snapshot of the online model at init
+        for p in enc.parameters():
+            p.requires_grad_(False)
+        enc.eval()
+        self.enc = enc
+        self.twin = enc                                          # eval retrieval bank encodes with the fixed geometry
+        self._cache: dict[str, torch.Tensor] = {}
+
+    def encode(self, texts: list[str]) -> torch.Tensor:
+        miss = [t for t in dict.fromkeys(texts) if t not in self._cache]   # unique, order-preserving
+        if miss:
+            a, dev = self.a, self.dev
+            e = self.enc.tokenizer(miss, padding=True, truncation=True, max_length=a.target_max_len,
+                                   return_tensors="pt").to(dev)
+            with torch.no_grad():
+                z = F.normalize(self.enc(e["input_ids"], e["attention_mask"]).float(), dim=-1)
+            for t, v in zip(miss, z):
+                self._cache[t] = v.detach()
+        return torch.stack([self._cache[t] for t in texts])
+
+    def update(self) -> None:
+        return None                                              # fixed geometry — nothing to track
+
+
 class SIGRegTarget(_TargetSource):
     """EMA-free anti-collapse (LeJEPA, arXiv:2511.08544). INJECT via `TrainingArguments(target_source=SIGRegTarget)`.
     Targets come from the LIVE model WITH gradient (no stop-grad twin); collapse is prevented by an isotropic-Gaussian
