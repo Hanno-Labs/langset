@@ -288,6 +288,10 @@ class LangSetModel(nn.Module):
         # RANDOM-INIT bookkeeping (set by from_scratch). A pretrained model rebuilds its backbone from `llm_model`, so
         # persistence stores only LoRA; a random-init model has no such source, so save/load must carry the FULL net.
         self._pretrained = True
+        # FULL-FINETUNE bookkeeping (set by from_pretrained(train_base=True)). A pretrained model normally stores only
+        # LoRA on save (base rebuilds from `llm_model`), but train_base=True trains the WHOLE base — those weights have
+        # no source to rebuild from, so save/snapshot/load must carry the FULL backbone exactly like a random-init net.
+        self._full_ft = False
         self._tokenizer_id: Optional[str] = None       # decoupled HF tokenizer id (None => same as llm_model/arch)
         self._arch_overrides: Optional[dict] = None    # config shrink applied to the from-scratch backbone
 
@@ -312,6 +316,7 @@ class LangSetModel(nn.Module):
         model = cls(backbone, tok, latent_dim, n_latents, llm_model, dropout, max_len,
                     multi_latent, fsq_dim, fsq_levels, fsq_emit=fsq_emit, pool_mode=pool_mode)
         model._lora_top_k = int(lora_top_k)                      # persisted in config so load() rebuilds same adapters
+        model._full_ft = bool(train_base)                        # train_base trains the whole base -> persist FULL backbone
         if pool_mode == "last":                      # WARM-START the pool head at the base's NATIVE embedding: identity
             torch.nn.init.eye_(model.head.out_proj.weight)   # out_proj -> head_project == normalize(last-token hidden) ==
             torch.nn.init.zeros_(model.head.out_proj.bias)   # the base's own readout (last-token pool) -> starts at base
@@ -670,10 +675,10 @@ class LangSetModel(nn.Module):
     def save_pretrained(self, path: Union[str, Path]) -> None:
         import json
         p = Path(path); p.mkdir(parents=True, exist_ok=True)
-        if self._pretrained:                             # pretrained: backbone rebuilds from `llm_model` -> store LoRA only
+        if self._pretrained and not self._full_ft:       # pretrained + frozen base: backbone rebuilds from `llm_model` -> LoRA only
             weights = {"head": self.head.state_dict(),
                        "lora": {k: v.cpu() for k, v in self.backbone.state_dict().items() if "lora" in k}}
-        else:                                            # random-init: no source to rebuild from -> persist the FULL backbone
+        else:                                            # random-init OR train_base full-FT: no source to rebuild from -> FULL backbone
             weights = {"head": self.head.state_dict(),
                        "backbone": {k: v.cpu() for k, v in self.backbone.state_dict().items()}}
         torch.save(weights, p / "langset.pt")
@@ -682,7 +687,7 @@ class LangSetModel(nn.Module):
             "n_latents": self.head.n_latents, "max_len": self.max_len,
             "multi_latent": self.multi_latent, "fsq_dim": self.fsq_dim, "fsq_levels": self.fsq_levels,
             "lora_top_k": self._lora_top_k, "fsq_emit": self.head.fsq_emit, "pool_mode": self.pool_mode,
-            "pretrained": self._pretrained, "tokenizer_id": self._tokenizer_id,
+            "pretrained": self._pretrained, "full_ft": self._full_ft, "tokenizer_id": self._tokenizer_id,
             "arch_overrides": self._arch_overrides}))
 
     @classmethod
@@ -704,8 +709,10 @@ class LangSetModel(nn.Module):
                                   fsq_dim=cfg.get("fsq_dim", 128), fsq_levels=cfg.get("fsq_levels", 8),
                                   fsq_emit=cfg.get("fsq_emit", False), arch_overrides=cfg.get("arch_overrides"),
                                   device=device, attn_implementation=attn_implementation)
+        m._full_ft = bool(cfg.get("full_ft", False))     # restore the flag so a re-save round-trips the same way
         sd = torch.load(p / "langset.pt", map_location=m.device, weights_only=False)
-        m.backbone.load_state_dict(sd["lora"] if cfg.get("pretrained", True) else sd["backbone"], strict=False)
+        # select by the ACTUAL payload (not the flag): a full-FT pretrained model persists "backbone", not "lora".
+        m.backbone.load_state_dict(sd["backbone"] if "backbone" in sd else sd["lora"], strict=False)
         m.head.load_state_dict(sd["head"])
         m.eval()
         return m

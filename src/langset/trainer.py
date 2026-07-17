@@ -104,12 +104,13 @@ def _tokenize_replay(tok: Any, texts: list[str], max_len: int, side: str, dev: t
 
 def _snapshot_best(m: LangSetModel) -> dict[str, Any]:
     """Snapshot best-so-far weights to restore at the end of training. MIRRORS LangSetModel.save_pretrained's
-    branch: a PRETRAINED model rebuilds its backbone from `llm_model`, so LoRA-only is enough; a RANDOM-INIT
-    model (from_scratch) has no source to rebuild from, so we must snapshot the FULL backbone — otherwise the
-    best-so-far restore silently keeps the LAST-epoch backbone (a random-init net has no 'lora' keys, so the
-    old lora-only snapshot restored nothing into it). Applies to single-latent, multi-latent, and masked flows."""
+    branch: a PRETRAINED + frozen-base model rebuilds its backbone from `llm_model`, so LoRA-only is enough; a
+    RANDOM-INIT model (from_scratch) OR a train_base=True full-finetune has no source to rebuild from, so we must
+    snapshot the FULL backbone — otherwise the best-so-far restore silently keeps the LAST-epoch backbone (a
+    random-init net has no 'lora' keys, so the old lora-only snapshot restored nothing into it; a full-FT run
+    trains base weights the lora-only snapshot never captured). Applies to single-latent, multi-latent, and masked."""
     snap: dict[str, Any] = {"head": {k: v.detach().cpu().clone() for k, v in m.head.state_dict().items()}}
-    if m._pretrained:
+    if m._pretrained and not getattr(m, "_full_ft", False):
         snap["lora"] = {k: v.detach().cpu().clone() for k, v in m.backbone.state_dict().items() if "lora" in k}
     else:
         snap["backbone"] = {k: v.detach().cpu().clone() for k, v in m.backbone.state_dict().items()}
@@ -307,6 +308,19 @@ class Trainer:
                     "You cannot roll out what you did not train.")
         elif args.ss_prob is None:
             args.ss_prob = 0.0                                    # single-latent never rolls; teacher-forced is correct
+        # VALIDATE emb_slots up front (both paths): a bad slice/kind otherwise fails deep in train() with an opaque
+        # Linear-shape or CE error. Enforce 0 <= lo < hi <= latent_dim (contiguous, in-bounds) and a supported kind.
+        if getattr(args, "emb_slots", None):
+            d = model.latent_dim
+            for field, spec in args.emb_slots.items():
+                if not (isinstance(spec, (tuple, list)) and len(spec) == 3):
+                    raise ValueError(f"emb_slots[{field!r}] must be (lo, hi, kind); got {spec!r}")
+                lo, hi, kind = spec
+                if kind not in ("classify", "regress"):
+                    raise ValueError(f"emb_slots[{field!r}] kind must be 'classify' or 'regress'; got {kind!r}")
+                if not (isinstance(lo, int) and isinstance(hi, int) and 0 <= lo < hi <= d):
+                    raise ValueError(f"emb_slots[{field!r}] slice must satisfy 0 <= lo < hi <= latent_dim ({d}); "
+                                     f"got [{lo}:{hi}]")
         cols = _columns(train_dataset)
         inv = {v: k for k, v in (column_mapping or {}).items()}   # user-col -> canonical
         get = lambda canon: cols[inv.get(canon, canon)]           # type: ignore[index]  # noqa: E731
@@ -329,7 +343,10 @@ class Trainer:
                 raise ValueError("masked mode needs a non-empty `text` column")
             _init = self._mask_view(self._mask_texts, self._masker, random.Random(args.seed))
             cols = {**cols, "input_text": _init, "target_text": list(self._mask_texts)}
-            inv = {}                                              # canonical names now present directly in cols
+            # input_text/target_text are now SYNTHESIZED under their canonical keys -> read them directly (any
+            # column_mapping for them is meaningless: their source is `text`, not a real input/target column). But
+            # KEEP `inv` intact so the optional fields below (mask_field, hard_neg_field, emb_slots, learn_field)
+            # still honor column_mapping exactly as the non-masked path does -> same dataset+mapping, same behavior.
             get = lambda canon: cols[canon]                       # type: ignore[index]  # noqa: E731
         self.input_text = [str(x) for x in get("input_text")]
         if self.multi_latent:
