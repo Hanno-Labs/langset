@@ -16,4 +16,4 @@ __all__ = ["LangSetModel", "EmitHead", "Trainer", "TrainingArguments",
            "calibration_corr", "linear_decodability",
            "build_masked", "build_masked_pairs", "mask_view", "resolve_masker",
            "SpanMasker", "TokenMasker", "FieldMasker"]
-__version__ = "0.14.0"   # + emb_slots: continuous sub-embedding subspaces (transient per-slot decoder heads)
+__version__ = "0.11.0"   # keep in sync with pyproject [project].version
