@@ -111,12 +111,15 @@ class TrainingArguments:
     emb_slots: Optional[dict[str, tuple[int, int, str]]] = None
     lam_emb_slots: float = 1.0
 
-    # MULTI-HOP training (scheduled sampling). ss_prob=0 = pure teacher forcing, gradients flow 1 hop (default,
-    # byte-identical). ss_prob>0: for the first `train_hops` emitted positions (None = ALL), feed the model's OWN
-    # predicted latent back with probability ss_prob instead of ground truth — the exposure-bias fix that makes
-    # multi-hop rollout trained rather than emergent. ss_sample samples the self-fed digits instead of argmax.
+    # MULTI-HOP training (scheduled sampling). For the first `train_hops` emitted positions (None = ALL), feed the
+    # model's OWN predicted latent back with probability ss_prob instead of ground truth — the exposure-bias fix that
+    # makes multi-hop rollout TRAINED rather than emergent. ss_sample samples the self-fed digits instead of argmax.
+    # ss_prob SENTINEL: None = UNSET (resolved by the Trainer against the model). A multi_latent model rolls out
+    # AUTOREGRESSIVELY at inference, so teacher-forced-only (ss_prob=0) is invalid — the Trainer defaults an unset
+    # ss_prob to 0.25 and REJECTS an explicit ss_prob=0 ("you cannot roll out what you did not train"). Single-latent
+    # never rolls, so None -> 0.0 there.
     train_hops: Optional[int] = None
-    ss_prob: float = 0.0
+    ss_prob: Optional[float] = None
     ss_sample: bool = False
     # scheduled-sampling WARMUP: linearly ramp the effective ss_prob 0 -> ss_prob over the first `ss_warmup` epochs.
     # 0 = constant ss_prob (no warmup). REQUIRED for deep train_hops (feeding own predictions for many hops from

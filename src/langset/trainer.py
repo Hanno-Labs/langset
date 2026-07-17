@@ -290,6 +290,23 @@ class Trainer:
         # a `target_texts` (list[str] per row) column and runs the FSQ token-native loop; otherwise the single-latent
         # self-contrastive path (byte-for-byte unchanged) reads a scalar `target_text` column.
         self.multi_latent = bool(model.head.multi_latent)
+        # ROLLOUT MUST BE TRAINED. A multi_latent model emits its latent set AUTOREGRESSIVELY at inference (rollout()
+        # feeds each emitted latent back), so training PURELY teacher-forced (ss_prob=0) is exposure-biased and the
+        # rollout is never actually trained — you cannot roll out what you did not train. Enforce it against the
+        # ss_prob sentinel: unset (None) -> 0.25 (scheduled sampling on); an EXPLICIT ss_prob=0 -> hard error.
+        if self.multi_latent:
+            if args.ss_prob is None:
+                args.ss_prob = 0.25
+                print("[langset] multi_latent + ss_prob unset -> ss_prob=0.25 (rollout must be trained; set ss_prob "
+                      "explicitly to override, and ss_warmup>0 for deep train_hops)", flush=True)
+            elif args.ss_prob <= 0.0:
+                raise ValueError(
+                    "multi_latent=True with ss_prob=0 trains PURELY teacher-forced but rolls out AUTOREGRESSIVELY at "
+                    "inference -> exposure bias: the rollout is never trained. Set ss_prob>0 (e.g. 0.25) so the "
+                    "emitter learns to consume its own predictions, or use multi_latent=False. "
+                    "You cannot roll out what you did not train.")
+        elif args.ss_prob is None:
+            args.ss_prob = 0.0                                    # single-latent never rolls; teacher-forced is correct
         cols = _columns(train_dataset)
         inv = {v: k for k, v in (column_mapping or {}).items()}   # user-col -> canonical
         get = lambda canon: cols[inv.get(canon, canon)]           # type: ignore[index]  # noqa: E731
