@@ -116,7 +116,8 @@ def linear_decodability(
         }
     yt = y[te]
     _, counts = np.unique(yt, return_counts=True)
-    baseline = float(counts.max() / counts.sum())  # majority-class accuracy on the test set
+    majority = counts.max()  # ty: ignore[invalid-argument-type]  # numpy .max() overload stub edge
+    baseline = float(majority / counts.sum())  # majority-class accuracy on the test set
     clf = skl.LogisticRegression(max_iter=2000, class_weight="balanced" if balanced else None).fit(
         X[tr], y[tr]
     )

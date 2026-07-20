@@ -51,7 +51,8 @@ def _wandb_config(a: TrainingArguments) -> dict[str, Any]:
 
 def _columns(dataset: Dataset | list[dict[str, Any]]) -> dict[str, list[Any]]:
     if hasattr(dataset, "column_names"):  # datasets.Dataset
-        return {c: list(dataset[c]) for c in dataset.column_names}
+        ds = cast("Dataset", dataset)
+        return {c: list(ds[c]) for c in ds.column_names}
     rows = list(dataset)  # list[dict]
     return {k: [r[k] for r in rows] for k in rows[0]}
 
@@ -248,7 +249,7 @@ class BackboneStepEngine(_StepEngine):
                 self.mask[idx],
                 self.t2_ids[idx],
                 self.t2_mask[idx],
-                self.tok.pad_token_id,
+                cast("int", self.tok.pad_token_id),  # tokenizer always has a pad id at train time
             )  # math identical (padding masked); split back at row B
             both = m(fi, fm)
             _nb = len(idx)
@@ -269,6 +270,7 @@ class BackboneStepEngine(_StepEngine):
             with (
                 torch.no_grad()
             ):  # no 4th backward) — gradient still flows to `pred`, off the negs.
+                assert self.hn_mask is not None  # populated alongside hn_ids
                 hn = m(*_dyn_trim(self.hn_ids[idx], self.hn_mask[idx]))
         return pred, target, hn
 
@@ -335,7 +337,11 @@ class FrozenPoolStepEngine(_StepEngine):
         _t = _time.time()
         self.feat_in = _pool_all(self.ids, self.mask)
         self.feat_tg = _pool_all(self.t2_ids, self.t2_mask)
-        self.feat_hn = _pool_all(self.hn_ids, self.hn_mask) if self.hn_ids is not None else None
+        self.feat_hn = (
+            _pool_all(self.hn_ids, cast("torch.Tensor", self.hn_mask))
+            if self.hn_ids is not None
+            else None
+        )
         m.train()
         if a.verbose:
             fi = self.feat_in
@@ -414,9 +420,10 @@ class Trainer:
             args.ss_prob = 0.0  # single-latent never rolls; teacher-forced is correct
         # VALIDATE emb_slots up front (both paths): a bad slice/kind otherwise fails deep in train() with an opaque
         # Linear-shape or CE error. Enforce 0 <= lo < hi <= latent_dim (contiguous, in-bounds) and a supported kind.
-        if getattr(args, "emb_slots", None):
+        slots = getattr(args, "emb_slots", None)
+        if slots:
             d = model.latent_dim
-            for field, spec in args.emb_slots.items():
+            for field, spec in slots.items():
                 if not (isinstance(spec, (tuple, list)) and len(spec) == 3):
                     raise ValueError(f"emb_slots[{field!r}] must be (lo, hi, kind); got {spec!r}")
                 lo, hi, kind = spec
@@ -490,8 +497,9 @@ class Trainer:
             # optional MULTI-latent hard negatives: a per-row LIST of texts the emitted latents must be pushed AWAY
             # from (batch-pooled InfoNCE bank, weight lam_hard_neg). Empty/None rows contribute no negatives.
             self.hard_neg_texts: Optional[list[list[str]]] = None
-            if getattr(args, "hard_neg_field", None) is not None:
-                raw_hn = cols[inv.get(args.hard_neg_field, args.hard_neg_field)]
+            hn_field = getattr(args, "hard_neg_field", None)
+            if hn_field is not None:
+                raw_hn = cols[inv.get(hn_field, hn_field)]
                 self.hard_neg_texts = [
                     [
                         str(x)
@@ -506,8 +514,9 @@ class Trainer:
             # optional MULTI-latent supervised-contrastive: a per-row LIST of group labels aligned 1:1 with
             # target_texts (each emitted item's stage/group). Shapes emissions into separate regions (weight lam_sup).
             self.sup_labels: Optional[list[list[str]]] = None
-            if getattr(args, "sup_field", None) is not None:
-                raw_sup = cols[inv.get(args.sup_field, args.sup_field)]
+            sup_field = getattr(args, "sup_field", None)
+            if sup_field is not None:
+                raw_sup = cols[inv.get(sup_field, sup_field)]
                 self.sup_labels = [
                     [str(x) for x in (v if isinstance(v, (list, tuple)) else [v])] for v in raw_sup
                 ]
@@ -519,11 +528,12 @@ class Trainer:
             self.label_plan: Optional[list[tuple[int, str, int]]] = (
                 None  # (rest_col = dim-1, field, digit_pos)
             )
-            if getattr(args, "label_dims", None):
+            label_dims = getattr(args, "label_dims", None)
+            if label_dims:
                 fsq_levels = int(model.head.fsq_levels)
                 self.label_cols = {}
                 plan: list[tuple[int, str, int]] = []
-                for field, dims in args.label_dims.items():
+                for field, dims in label_dims.items():
                     raw = cols[inv.get(field, field)]
                     seqs = [
                         [str(x) for x in (v if isinstance(v, (list, tuple)) else [v])] for v in raw
@@ -562,8 +572,8 @@ class Trainer:
                     print(
                         "[langset] FSQ label subspace: "
                         + "; ".join(
-                            f"{f}->{args.label_dims[f]} ({len(self.label_codewords[f])} cls)"
-                            for f in args.label_dims
+                            f"{f}->{label_dims[f]} ({len(self.label_codewords[f])} cls)"
+                            for f in label_dims
                         ),
                         flush=True,
                     )
@@ -573,17 +583,19 @@ class Trainer:
             # single-latent slot setup. Facet labels are PER-ROW; the multi-latent decode mean-pools the emitted
             # latent SET before slicing (see the slot loss in _train_multi). None = off (byte-identical).
             self.slot_labels: Optional[dict[str, list[str]]] = None
-            if getattr(args, "emb_slots", None):
+            slot_specs = getattr(args, "emb_slots", None)
+            if slot_specs:
                 self.slot_labels = {}
-                for field in args.emb_slots:
+                for field in slot_specs:
                     raw = cols[inv.get(field, field)]
                     self.slot_labels[field] = [("" if v is None else str(v)) for v in raw]
             # TEXT REPLAY tag (multi-latent): rows marked "learn" rehearse the backbone's plain next-token ability
             # (interleaved at `learn_ratio` in _train_multi). Must be set HERE — this branch returns before the
             # single-latent is_learn setup below. learn_field unset / learn_ratio=0 -> all-False (feature off).
             self.is_learn: list[bool] = [False] * len(self.input_text)
-            if getattr(args, "learn_field", None) is not None and args.learn_ratio > 0:
-                raw = cols[inv.get(args.learn_field, args.learn_field)]
+            learn_field = getattr(args, "learn_field", None)
+            if learn_field is not None and args.learn_ratio > 0:
+                raw = cols[inv.get(learn_field, learn_field)]
                 self.is_learn = [str(v).lower() == "learn" for v in raw]
             _require_emit_rows(self.is_learn, args.learn_field)
             if args.verbose:
@@ -611,23 +623,26 @@ class Trainer:
             ]
         # optional hard negatives: a mined near-miss target per row (encoded as an extra negative each step).
         self.hard_neg_text: Optional[list[str]] = None
-        if getattr(args, "hard_neg_field", None) is not None:
-            raw = cols[inv.get(args.hard_neg_field, args.hard_neg_field)]
+        hn_field = getattr(args, "hard_neg_field", None)
+        if hn_field is not None:
+            raw = cols[inv.get(hn_field, hn_field)]
             self.hard_neg_text = [str(v) if v not in (None, "") else "" for v in raw]
         # optional CONTINUOUS EMB SLOTS: per-row facet label columns (named by the emb_slots dict keys). Stashed as raw
         # strings here; the class<->id maps + transient decoder heads are built in train() (see TrainingArguments.emb_slots).
         # (type declared once in the multi_latent branch above; plain re-assign here to avoid a mypy no-redef.)
         self.slot_labels = None
-        if getattr(args, "emb_slots", None):
+        slot_specs = getattr(args, "emb_slots", None)
+        if slot_specs:
             self.slot_labels = {}
-            for field in args.emb_slots:
+            for field in slot_specs:
                 raw = cols[inv.get(field, field)]
                 self.slot_labels[field] = [("" if v is None else str(v)) for v in raw]
         # optional knowledge-injection: rows tagged "learn" train next-token CE (input_text -> target_text) instead
         # of contrastive; they're pulled OUT of the contrastive split and fed as a separate learn pool.
         self.is_learn: list[bool] = [False] * len(self.input_text)
-        if getattr(args, "learn_field", None) is not None and args.learn_ratio > 0:
-            raw = cols[inv.get(args.learn_field, args.learn_field)]
+        learn_field = getattr(args, "learn_field", None)
+        if learn_field is not None and args.learn_ratio > 0:
+            raw = cols[inv.get(learn_field, learn_field)]
             self.is_learn = [str(v).lower() == "learn" for v in raw]
         _require_emit_rows(self.is_learn, args.learn_field)
         n_learn = sum(self.is_learn)
@@ -721,6 +736,10 @@ class Trainer:
             # [LEARN] rows: teacher-forced causal LM. Condition on the LEFT-padded case, CE ONLY on the substance
             # tokens -> forces the backbone's hidden states to REPRESENT the substance (builds the axis the probe
             # found missing). Shared _replay_ce (tied-embedding projection on the target span only, no lm_head/OOM).
+            assert (
+                ln_doc_ids is not None and ln_doc_mask is not None
+            )  # learn_loss runs only when learn_pool set them
+            assert ln_tgt_ids is not None and ln_tgt_mask is not None
             return _replay_ce(
                 m, ln_doc_ids[pos], ln_doc_mask[pos], ln_tgt_ids[pos], ln_tgt_mask[pos], vsz
             )
@@ -730,7 +749,9 @@ class Trainer:
         # facet is routed INTO the slice. Heads are trained but NOT saved (like the phase head; eval re-fits its own).
         slot_plan: list[tuple[str, int, int, str, torch.nn.Module, dict[str, int]]] = []
         if self.slot_labels is not None:
-            for field, (lo, hi, kind) in a.emb_slots.items():
+            emb_slots = a.emb_slots
+            assert emb_slots is not None  # slot_labels is populated iff emb_slots was set
+            for field, (lo, hi, kind) in emb_slots.items():
                 labs = self.slot_labels[field]
                 if kind == "classify":
                     classes = sorted(
@@ -760,7 +781,7 @@ class Trainer:
         )
         run = None
         if a.report_to == "wandb":
-            import wandb  # type: ignore[import-untyped]
+            import wandb  # type: ignore[import-untyped]  # ty: ignore[unresolved-import]  # optional dep, not installed
 
             run = wandb.init(project=a.wandb_project, config=_wandb_config(a))
 
@@ -913,8 +934,10 @@ class Trainer:
             # JEPA: RE-MASK the raw text fresh this epoch (new random holes every epoch -> the model never sees
             # the same (visible, hidden) split twice; target view t2 stays the full text and is untouched).
             if self._masking:
+                masker = self._masker
+                assert masker is not None  # set whenever _masking is on
                 new_in = self._mask_view(
-                    self._mask_texts, self._masker, random.Random(a.seed + 1000 + ep)
+                    self._mask_texts, masker, random.Random(a.seed + 1000 + ep)
                 )
                 self.input_text = new_in  # val eval re-encodes from this
                 ids, mask = tok_to(new_in, a.max_len)
@@ -964,7 +987,9 @@ class Trainer:
                     # PER-ANCHOR-ONLY hard neg: anchor i sees ONLY its own mined hard neg (col B+i), never the other
                     # anchors' (a batch-SHARED negative cluster herds every emit off one region -> geometry collapse,
                     # observed: collapse 0.03 -> 0.28/0.57). Keep the valid diagonal of the hard-neg block; mask rest.
-                    valid = [bool(self.hard_neg_text[j]) for j in idx.tolist()]
+                    hnt = self.hard_neg_text
+                    assert hnt is not None  # populated whenever hn_ids is
+                    valid = [bool(hnt[j]) for j in idx.tolist()]
                     for r in range(B):
                         for c in range(B):
                             if not (r == c and valid[c]):
@@ -975,7 +1000,9 @@ class Trainer:
                     )  # diagonal (positive) always kept
                 loss = F.cross_entropy(logits, torch.arange(B, device=dev))  # primary
                 for field, lo, hi, kind, head, cls2id in slot_plan:  # aux: CONTINUOUS EMB SLOTS
-                    labs = self.slot_labels[field]  # decode facet from pred[lo:hi]
+                    sl = self.slot_labels
+                    assert sl is not None  # slot_plan is non-empty only when slot_labels is set
+                    labs = sl[field]  # decode facet from pred[lo:hi]
                     sub = pred[:, lo:hi]  # -> encoder routes it there
                     rows_i = idx.tolist()
                     if kind == "classify":
@@ -1203,7 +1230,9 @@ class Trainer:
         # Heads are trained but NOT saved to the model (like phase_head; eval re-fits its own probe on the slice).
         slot_plan: list[tuple[str, int, int, str, torch.nn.Module, dict[str, int]]] = []
         if self.slot_labels is not None:
-            for field, (lo, hi, kind) in a.emb_slots.items():
+            emb_slots = a.emb_slots
+            assert emb_slots is not None  # slot_labels is populated iff emb_slots was set
+            for field, (lo, hi, kind) in emb_slots.items():
                 labs = self.slot_labels[field]
                 if kind == "classify":
                     classes = sorted(
@@ -1231,7 +1260,7 @@ class Trainer:
         opt = torch.optim.AdamW(params + slot_params, lr=a.lr)
         run = None
         if a.report_to == "wandb":
-            import wandb  # type: ignore[import-untyped]
+            import wandb  # type: ignore[import-untyped]  # ty: ignore[unresolved-import]  # optional dep, not installed
 
             run = wandb.init(project=a.wandb_project, config=_wandb_config(a))
 
@@ -1256,8 +1285,10 @@ class Trainer:
             if not bank_texts:
                 m.train()
                 return {"retr_mrr": 0.0, "purity": 0.0, "n_distinct": 0, "avg_emitted": 0.0}
+            eval_twin = target_source.twin
+            assert eval_twin is not None  # every _TargetSource builds its twin in __init__
             zb = F.normalize(
-                target_source.twin.emit(bank_texts).to(dev).float(), dim=-1
+                eval_twin.emit(bank_texts).to(dev).float(), dim=-1
             )  # [Nbank, d] target-space bank
             chain_t = torch.tensor(bank_chain, device=dev)
             rr: list[float] = []
@@ -1435,7 +1466,10 @@ class Trainer:
         def _rf(
             name: str,
         ) -> AbstractContextManager[Any]:  # named phase range when profiling, no-op otherwise
-            return _rfn(name) if _prof is not None else _nullctx()
+            if _prof is not None:
+                assert _rfn is not None  # imported together with _prof under LANGSET_PROFILE_STEPS
+                return _rfn(name)
+            return _nullctx()
 
         objective: _EmissionObjective = a.emission(
             m, a, dev, self
@@ -1465,6 +1499,10 @@ class Trainer:
             )  # target RIGHT-pad
 
         def learn_loss(pos: torch.Tensor) -> torch.Tensor:  # shared teacher-forced replay CE
+            assert (
+                ln_doc_ids is not None and ln_doc_mask is not None
+            )  # runs only when learn_pool set them
+            assert ln_tgt_ids is not None and ln_tgt_mask is not None
             return _replay_ce(
                 m, ln_doc_ids[pos], ln_doc_mask[pos], ln_tgt_ids[pos], ln_tgt_mask[pos], vsz
             )
@@ -1561,6 +1599,9 @@ class Trainer:
                 ):  # e.g. SIGReg anti-collapse penalty
                     z_pred, z_tgt = objective.z_for_reg(em, target_lat, valid, lmax)
                     loss_sig = target_source.regularizer(z_pred, z_tgt)
+                    assert (
+                        loss_sig is not None
+                    )  # wants_regularizer=True sources return a tensor here
                     loss = loss + a.sigreg_lambda * loss_sig
                     agg["loss_sig"] = agg.get("loss_sig", 0.0) + float(loss_sig.detach())
                 if slot_plan:  # aux: CONTINUOUS EMB SLOTS (per-row facet, mean-pooled)
@@ -1572,7 +1613,9 @@ class Trainer:
                         min=1.0
                     )  # [b, d] mean over valid latents
                     for field, lo, hi, kind, slot_head, cls2id in slot_plan:
-                        labs = self.slot_labels[field]  # decode facet from pooled[:, lo:hi]
+                        sl = self.slot_labels
+                        assert sl is not None  # slot_plan is non-empty only when slot_labels is set
+                        labs = sl[field]  # decode facet from pooled[:, lo:hi]
                         sub = pooled[:, lo:hi]  # -> encoder routes it there
                         if kind == "classify":
                             yi = torch.tensor([cls2id.get(labs[j], -100) for j in bidx], device=dev)
@@ -1665,7 +1708,7 @@ class Trainer:
                                 )
                             except Exception:
                                 continue
-                        return  # diagnostic run: stop after profiling
+                        return None  # ty: ignore[invalid-return-type]  # diagnostic profiling run: bails early (LangSetModel path unaffected)
 
             # per-epoch ONLINE-weights snapshot to {output_dir}_ep{N,2N,...} (1-based) — INDEPENDENT of the eval
             # cadence (a trajectory to eval offline, separate from the best-so-far restore). snapshot_every=0 = off.

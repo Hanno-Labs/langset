@@ -223,8 +223,12 @@ class PhaseTerm(_LossTerm):
         a, self_ = c.args, c.trainer
         if c.phase_head is None:
             return None
+        sup = self_.sup_labels
+        assert (
+            sup is not None
+        )  # set whenever a phase head exists (ty can't see the cross-attr invariant)
         pf = [
-            (self_.sup_labels[k][j] if j < len(self_.sup_labels[k]) else "")
+            (sup[k][j] if j < len(sup[k]) else "")
             for r, k in enumerate(c.bidx)
             for j in range(c.lens_l[r])
         ]
@@ -243,7 +247,9 @@ class LabelDimsTerm(_LossTerm):
         a, self_ = c.args, c.trainer
         if c.lab_label is None or c.dim_lg is None or a.lam_label_dims <= 0:
             return None
-        rcols = [cj for (cj, _, _) in self_.label_plan]
+        plan = self_.label_plan
+        assert plan is not None  # a label plan is what produced lab_label upstream
+        rcols = [cj for (cj, _, _) in plan]
         lab_lg = c.dim_lg[:, : c.lmax, 1:, :][:, :, rcols, :]  # [b, lmax, n_reserved, fsq_levels]
         loss_label = F.cross_entropy(
             lab_lg.reshape(-1, c.fsq_levels), c.lab_label.reshape(-1), ignore_index=-100
@@ -419,7 +425,9 @@ class FSQObjective(_EmissionObjective):
     ) -> EmissionOut:
         m, a, dev, self_ = self.m, self.a, self.dev, self.trainer
         fsq_dim, fsq_levels = self.fsq_dim, self.fsq_levels
-        eff_ss = a.ss_prob if a.ss_warmup <= 0 else a.ss_prob * min(1.0, ep / a.ss_warmup)
+        ss_prob = a.ss_prob
+        assert ss_prob is not None  # Trainer resolves the None sentinel to a float before any emit
+        eff_ss = ss_prob if a.ss_warmup <= 0 else ss_prob * min(1.0, ep / a.ss_warmup)
         dim_lg, stop_lg, digits, recon = m.rollout_train_codebook(
             se["input_ids"],
             se["attention_mask"],
@@ -438,11 +446,12 @@ class FSQObjective(_EmissionObjective):
             lab_rest[r, :nl] = digits[r, :nl, 1:]
         lab_label = None  # FSQ LABEL SUBSPACE: reserved dims -> a SEPARATE
         if self_.label_plan is not None:  # weighted label CE (NOT diluted inside loss_dims)
-            lab_label = torch.full(
-                (b, lmax, len(self_.label_plan)), -100, dtype=torch.long, device=dev
-            )
-            for s_i, (col_j, field, pos) in enumerate(self_.label_plan):
-                labs, cw = self_.label_cols[field], self_.label_codewords[field]
+            plan = self_.label_plan
+            cols = self_.label_cols
+            assert cols is not None  # label_cols is populated alongside label_plan
+            lab_label = torch.full((b, lmax, len(plan)), -100, dtype=torch.long, device=dev)
+            for s_i, (col_j, field, pos) in enumerate(plan):
+                labs, cw = cols[field], self_.label_codewords[field]
                 for r, kk in enumerate(bidx):
                     row_labs = labs[kk]
                     for j in range(lens_l[r]):
@@ -472,7 +481,9 @@ class FSQObjective(_EmissionObjective):
         assert self.m.head.down_proj is not None
         z_tgt = self.m.head.down_proj(target_lat[valid].float())  # [N, fsq_dim]
         lvls = torch.arange(self.fsq_levels, device=self.dev, dtype=torch.float32)
-        soft = (em.dim_lg[:, :lmax].float().softmax(-1) * lvls).sum(
+        dim_lg = em.dim_lg
+        assert dim_lg is not None  # FSQ path always populates dim_lg
+        soft = (dim_lg[:, :lmax].float().softmax(-1) * lvls).sum(
             -1
         )  # predicted E[digit] [b, lmax, fsq_dim]
         return soft[valid], z_tgt
@@ -543,14 +554,16 @@ class EMATwinTarget(_TargetSource):
         e = tok(
             texts, padding=True, truncation=True, max_length=a.target_max_len, return_tensors="pt"
         ).to(dev)
+        twin = self.twin
+        assert twin is not None  # built in __init__ (deepcopy of the model)
         with torch.no_grad():
-            z = self.twin(e["input_ids"], e["attention_mask"])
+            z = twin(e["input_ids"], e["attention_mask"])
         return F.normalize(z.float(), dim=-1)
 
     def update(self) -> None:
         with torch.no_grad():
-            torch._foreach_mul_(self._ema, self.a.ema_m)
-            torch._foreach_add_(self._ema, self._online, alpha=1.0 - self.a.ema_m)
+            torch._foreach_mul_(self._ema, self.a.ema_m)  # ty: ignore[no-matching-overload]  # torch _foreach_ stub overloads
+            torch._foreach_add_(self._ema, self._online, alpha=1.0 - self.a.ema_m)  # ty: ignore[no-matching-overload]  # torch _foreach_ stub overloads
 
 
 class CachedTarget(_TargetSource):
@@ -678,7 +691,7 @@ def last_epoch_selector(mode: str, mrr: float, pur: float, ep: int) -> float:
 # The trainer evaluates/selects only on `ep % eval_every == 0`; a "keep the last epoch" selector must still see the
 # FINAL epoch even when eval_every>1, or it silently restores an earlier (last-evaluated) epoch. This flag tells the
 # trainer to always evaluate the final epoch for this selector; the default selector lacks it, so its path is unchanged.
-last_epoch_selector.needs_final_epoch = True  # type: ignore[attr-defined]
+last_epoch_selector.needs_final_epoch = True  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]  # function-attribute flag
 
 
 def multi_seed_texts(trainer: Trainer, seeds: list[str], args: TrainingArguments) -> list[str]:

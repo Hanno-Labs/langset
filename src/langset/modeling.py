@@ -19,6 +19,9 @@ from torch import nn
 if TYPE_CHECKING:  # type-only: no runtime import cost, and the optional-dep types stay import-safe
     from sentence_transformers import SentenceTransformer
     from transformers import PretrainedConfig, PreTrainedTokenizerBase
+    from ty_extensions import (
+        Unknown,
+    )  # ty's gradual type — for genuine passthrough boundaries (not typing.Any)
 
 
 class _HiddenOutput(Protocol):
@@ -196,7 +199,9 @@ def _text_tower(model: _Backbone) -> _Backbone:
             node = node.model
             continue
         break
-    return node
+    return cast(
+        "_Backbone", node
+    )  # getattr-descended node is `object` to ty; runtime is the text tower
 
 
 def build_backbone(
@@ -301,7 +306,9 @@ def build_backbone(
         base = _load(None)  # sdpa/eager only: fall back to the model's default attention
     if hasattr(base, "language_model"):  # unwrap conditional-generation wrapper to the text tower
         base = base.language_model
-    base = base.to(dev)
+    base = cast("Unknown", base).to(
+        dev
+    )  # raw HF-model plumbing (device/ckpt); typed _Backbone only after _text_tower
     _active = getattr(getattr(base, "config", None), "_attn_implementation", None)
     if _strict and _active != attn_implementation:  # HF loaded but silently downgraded the module
         raise RuntimeError(
@@ -343,7 +350,9 @@ def build_backbone(
         base.config.use_cache = False
         peft.gradient_checkpointing_enable()
         peft.enable_input_require_grads()
-    return _text_tower(peft)
+    return _text_tower(
+        cast("_Backbone", peft)
+    )  # PeftModel|PeftMixedModel don't structurally match the Protocol
 
 
 class LangSetModel(nn.Module):
@@ -585,8 +594,12 @@ class LangSetModel(nn.Module):
         if self._ple_dim:
             b, s = inputs_embeds.shape[:2]
             ple = inputs_embeds.new_zeros(b, s, self._n_layers, self._ple_dim)
-            if real_ids is not None:
-                real = self.backbone.get_per_layer_inputs(real_ids, None).to(ple.dtype)
+            # PLE models (Gemma-E) expose get_per_layer_inputs; bind to a local so hasattr narrows _Backbone
+            # to the intersection that has it (ty narrows locals, not member access) — checked, not cast away.
+            # Non-PLE backbones never reach here (_ple_dim==0), so they stay plain _Backbone members.
+            bb = self.backbone
+            if real_ids is not None and hasattr(bb, "get_per_layer_inputs"):
+                real = cast("Unknown", bb).get_per_layer_inputs(real_ids, None).to(ple.dtype)
                 ple[:, real_start : real_start + real_ids.size(1)] = real
             kw["per_layer_inputs"] = ple
         return self.backbone(
@@ -684,8 +697,10 @@ class LangSetModel(nn.Module):
         emb = emb[0] if single else emb
         return emb.numpy() if convert_to_numpy else emb
 
-    def emit(self, sentences: Union[str, list[str]], **kw: object) -> torch.Tensor:
-        return self.encode(sentences, convert_to_numpy=False, **kw)  # type: ignore[return-value]
+    def emit(self, sentences: Union[str, list[str]], **kw: Unknown) -> torch.Tensor:
+        # kw is a genuine passthrough to encode() -> Unknown (gradual) so it forwards into encode's typed
+        # params without ANN401 tripping on Any. cast the union return (encode -> ndarray | Tensor).
+        return cast("torch.Tensor", self.encode(sentences, convert_to_numpy=False, **kw))
 
     @torch.no_grad()
     def generate_text(self, prompt: str, max_new: int = 200) -> str:
@@ -706,7 +721,9 @@ class LangSetModel(nn.Module):
             enc = tok.apply_chat_template(
                 msgs, add_generation_prompt=True, return_tensors="pt", return_dict=True
             )
-        ids = enc["input_ids"].to(dev)
+        ids = cast("Unknown", enc)["input_ids"].to(
+            dev
+        )  # tokenizer BatchEncoding: apply_chat_template union stub edge
         eos = int(tok.eos_token_id or 0)
         out: list[int] = []
         for _ in range(max_new):
@@ -731,7 +748,11 @@ class LangSetModel(nn.Module):
         return_confidence: bool = False,
         temperature: float = 0.0,
         return_soft: bool = False,
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, ...]]:
+    ) -> Union[
+        torch.Tensor,
+        tuple[torch.Tensor, ...],
+        tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]],
+    ]:
         """Autoregressive emission: real text tokens and emitted latents share ONE hidden stream. Each emitted
         latent is fed back into the sequence via `head.feedback` (the latent lives in the backbone's own hidden
         space, so an emitted latent and a real token embedding are the same kind of vector — they intermingle).

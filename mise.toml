@@ -2,9 +2,12 @@
 uv = "latest"
 
 [tasks.lint]
-description = "Lint with ruff"
+description = "Lint with ruff + type-check with ty"
 sources = ["src/**/*.py", "tests/**/*.py", "pyproject.toml"]
-run = "uv run ruff check src tests"
+run = [
+    "uv run ruff check src tests",
+    "uv run ty check src",
+]
 
 [tasks.format]
 description = "Format code with ruff"

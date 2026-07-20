@@ -30,7 +30,7 @@ A Masker is any callable `(text: str, rng: random.Random) -> (visible_text, hidd
 from __future__ import annotations
 
 import random
-from typing import Callable, Protocol
+from typing import Callable, Protocol, cast
 
 Masker = Callable[[str, random.Random], tuple[str, str]]
 
@@ -126,7 +126,7 @@ def resolve_masker(spec: Masker | str | None, ratio: float = 0.15) -> Masker:
     is the reasonable default ('word' = scattered-word masking). Used by the Trainer so callers can write
     `masker="span"` / `masker=None` and never build a masker by hand."""
     if callable(spec):
-        return spec
+        return cast("Masker", spec)
     if spec in (None, "word", "token"):
         return TokenMasker(ratio)
     if spec == "span":
