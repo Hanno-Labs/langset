@@ -7,16 +7,21 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
+
+if TYPE_CHECKING:  # type-only: ST is an optional dep, LangSetModel would cycle at runtime
+    from sentence_transformers import SentenceTransformer
+
+    from langset.modeling import LangSetModel
 
 
 class LangSetSTModule(nn.Module):
     """A Sentence-Transformers custom module: tokenizes text and emits the langset latent as `sentence_embedding`."""
 
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: LangSetModel) -> None:
         super().__init__()
         self.model = model  # registered submodule -> .to(device) propagates
         # attributes SentenceTransformer / SetFit's trainer expect a body to expose
@@ -29,7 +34,7 @@ class LangSetSTModule(nn.Module):
         features["sentence_embedding"] = z
         return features
 
-    def tokenize(self, texts: list[str], **kw: Any) -> dict[str, torch.Tensor]:
+    def tokenize(self, texts: list[str], **kw: object) -> dict[str, torch.Tensor]:
         enc = self.model.tokenizer(
             list(texts),
             padding=True,
@@ -48,17 +53,17 @@ class LangSetSTModule(nn.Module):
     def get_config_dict(self) -> dict[str, Any]:
         return {}
 
-    def save(self, output_path: str, **kw: Any) -> None:
+    def save(self, output_path: str, **kw: object) -> None:
         self.model.save_pretrained(output_path)
 
     @staticmethod
-    def load(input_path: str, **kw: Any) -> "LangSetSTModule":
+    def load(input_path: str, **kw: object) -> "LangSetSTModule":
         from langset.modeling import LangSetModel
 
         return LangSetSTModule(LangSetModel.load(input_path))
 
 
-def to_sentence_transformer(model: Any) -> Any:
+def to_sentence_transformer(model: LangSetModel) -> SentenceTransformer:
     from sentence_transformers import SentenceTransformer  # type: ignore[import-untyped]
 
     st = SentenceTransformer(modules=[LangSetSTModule(model)], device=str(model.device))

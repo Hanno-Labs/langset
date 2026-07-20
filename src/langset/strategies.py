@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 import torch.nn.functional as F
@@ -23,6 +23,8 @@ from langset.modeling import LangSetModel
 from langset.sigreg import SIGReg
 
 if TYPE_CHECKING:  # annotations only (from __future__ import annotations -> strings);
+    from transformers import PreTrainedTokenizerBase
+
     from langset.trainer import Trainer  # avoids a runtime import cycle trainer <-> strategies
     from langset.training_args import TrainingArguments
 
@@ -517,7 +519,11 @@ class EMATwinTarget(_TargetSource):
     suppresses_nce = False
 
     def __init__(
-        self, model: LangSetModel, args: TrainingArguments, tok: Any, dev: torch.device
+        self,
+        model: LangSetModel,
+        args: TrainingArguments,
+        tok: PreTrainedTokenizerBase,
+        dev: torch.device,
     ) -> None:
         self.m, self.a, self.tok, self.dev = model, args, tok, dev
         self.twin = copy.deepcopy(model)
@@ -565,7 +571,11 @@ class CachedTarget(_TargetSource):
     suppresses_nce = False
 
     def __init__(
-        self, model: LangSetModel, args: TrainingArguments, tok: Any, dev: torch.device
+        self,
+        model: LangSetModel,
+        args: TrainingArguments,
+        tok: PreTrainedTokenizerBase,
+        dev: torch.device,
     ) -> None:
         self.a, self.dev = args, dev
         ckpt = getattr(args, "target_encoder_ckpt", None)
@@ -616,7 +626,11 @@ class SIGRegTarget(_TargetSource):
     wants_regularizer = True
 
     def __init__(
-        self, model: LangSetModel, args: TrainingArguments, tok: Any, dev: torch.device
+        self,
+        model: LangSetModel,
+        args: TrainingArguments,
+        tok: PreTrainedTokenizerBase,
+        dev: torch.device,
     ) -> None:
         self.m, self.a, self.tok, self.dev = model, args, tok, dev
         self.twin = model  # no separate twin — eval encodes with the live model

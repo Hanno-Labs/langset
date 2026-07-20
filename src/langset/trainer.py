@@ -9,6 +9,7 @@ defines where it should land). Pass a `datasets.Dataset` or `list[dict]`; use `c
 from __future__ import annotations
 
 import random
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional, cast
 
@@ -26,6 +27,9 @@ from langset.strategies import (
 from langset.training_args import TrainingArguments
 
 if TYPE_CHECKING:  # only for local annotations of the injected strategy instances
+    from datasets import Dataset
+    from transformers import PreTrainedTokenizerBase
+
     from langset.strategies import _EmissionObjective, _TargetSource
 
 _RECON_K = 8  # soft-prompt tokens the latent expands into for the recon decoder
@@ -45,7 +49,7 @@ def _wandb_config(a: TrainingArguments) -> dict[str, Any]:
     return cfg
 
 
-def _columns(dataset: Any) -> dict[str, list[Any]]:
+def _columns(dataset: Dataset | list[dict[str, Any]]) -> dict[str, list[Any]]:
     if hasattr(dataset, "column_names"):  # datasets.Dataset
         return {c: list(dataset[c]) for c in dataset.column_names}
     rows = list(dataset)  # list[dict]
@@ -103,7 +107,7 @@ def _require_emit_rows(is_learn: list[bool], learn_field: Optional[str]) -> None
 
 
 def _tokenize_replay(
-    tok: Any, texts: list[str], max_len: int, side: str, dev: torch.device
+    tok: PreTrainedTokenizerBase, texts: list[str], max_len: int, side: str, dev: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Tokenize replay text with an EXPLICIT padding side. The doc (the conditioning context) MUST be left-padded
     so every row's last real token lands in the final column — that's the position whose hidden predicts the first
@@ -215,7 +219,7 @@ class BackboneStepEngine(_StepEngine):
         self,
         model: LangSetModel,
         args: TrainingArguments,
-        tok: Any,
+        tok: PreTrainedTokenizerBase,
         ids: torch.Tensor,
         mask: torch.Tensor,
         t2_ids: torch.Tensor,
@@ -373,8 +377,8 @@ class Trainer:
         self,
         model: LangSetModel,
         args: TrainingArguments,
-        train_dataset: Any,
-        eval_dataset: Optional[Any] = None,
+        train_dataset: Dataset | list[dict[str, Any]],
+        eval_dataset: Optional[Dataset | list[dict[str, Any]]] = None,
         column_mapping: Optional[dict[str, str]] = None,
         on_checkpoint: Optional[Callable[[], None]] = None,
     ) -> None:
@@ -1428,7 +1432,9 @@ class Trainer:
             _prof_t0 = _time.perf_counter()
             print(f"[PROFILE] capturing {_prof_steps} training steps then exiting ...", flush=True)
 
-        def _rf(name: str) -> Any:  # named phase range when profiling, no-op otherwise
+        def _rf(
+            name: str,
+        ) -> AbstractContextManager[Any]:  # named phase range when profiling, no-op otherwise
             return _rfn(name) if _prof is not None else _nullctx()
 
         objective: _EmissionObjective = a.emission(
@@ -1616,7 +1622,7 @@ class Trainer:
                         _prof.__exit__(None, None, None)
                         _ka = _prof.key_averages()
 
-                        def _sc(e: Any) -> float:  # self-CUDA us across torch versions
+                        def _sc(e: object) -> float:  # self-CUDA us across torch versions
                             return float(
                                 getattr(e, "self_cuda_time_total", 0)
                                 or getattr(e, "self_device_time_total", 0)

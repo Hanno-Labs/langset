@@ -7,13 +7,41 @@ as a `model_body`.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Optional, Protocol, Union, cast
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+if TYPE_CHECKING:  # type-only: no runtime import cost, and the optional-dep types stay import-safe
+    from sentence_transformers import SentenceTransformer
+    from transformers import PretrainedConfig, PreTrainedTokenizerBase
+
+
+class _HiddenOutput(Protocol):
+    """A backbone forward result, read only for hidden states: a text tower exposes `last_hidden_state`, a raw
+    ForCausalLM exposes `hidden_states` (and `logits` when an lm_head is present). `_last_hidden` reads whichever
+    is there — see its getattr fallback."""
+
+    hidden_states: tuple[torch.Tensor, ...]
+
+
+class _Backbone(Protocol):
+    """The structural surface `LangSetModel` uses on its (peft-wrapped, maybe text-tower-unwrapped) backbone —
+    one Protocol spanning plain Llama/Qwen `ForCausalLM`, text towers, and Gemma-E PLE models. The PLE-only
+    `get_per_layer_inputs` is deliberately NOT declared: it exists on Gemma-E alone and is reached through the
+    `_ple_dim` runtime guard, so pinning it here would wrongly exclude every non-PLE backbone."""
+
+    config: PretrainedConfig
+
+    def __call__(self, **kwargs: object) -> _HiddenOutput: ...
+    def get_input_embeddings(self) -> nn.Module: ...
+    def parameters(self, recurse: bool = ...) -> Iterator[nn.Parameter]: ...
+    def state_dict(self, *args: object, **kwargs: object) -> dict[str, Any]: ...
+    def load_state_dict(self, *args: object, **kwargs: object) -> object: ...
 
 
 class EmitHead(nn.Module):
@@ -122,7 +150,7 @@ class EmitHead(nn.Module):
         return hidden.float() @ emb_eos
 
 
-def _cfg_int(config: Any, name: str) -> int:
+def _cfg_int(config: PretrainedConfig, name: str) -> int:
     """Read a scalar (hidden_size / vocab_size) that may live on a composite config's text sub-config."""
     v = getattr(config, name, None)
     if v is None and hasattr(config, "text_config"):
@@ -134,7 +162,7 @@ def _cfg_int(config: Any, name: str) -> int:
     return int(v)
 
 
-def _cfg_set(config: Any, name: str, val: Any) -> None:
+def _cfg_set(config: PretrainedConfig, name: str, val: object) -> None:
     """Set a scalar on a config, mirroring `_cfg_int`'s composite-config handling: write it on the top-level
     config and on a `text_config` sub-config if that is where the field lives (e.g. vocab_size on a VLM)."""
     wrote = False
@@ -149,7 +177,7 @@ def _cfg_set(config: Any, name: str, val: Any) -> None:
         setattr(config, name, val)
 
 
-def _text_tower(model: Any) -> Any:
+def _text_tower(model: _Backbone) -> _Backbone:
     """Descend a (peft-wrapped) causal/conditional-generation model to its TEXT transformer — the module that
     returns hidden states directly, with NO lm_head. Skips the huge-vocab logits projection (Gemma's 262k-vocab
     lm_head over a full sequence OOMs — we only ever read hidden states) and any vision tower. LoRA is injected
@@ -184,7 +212,7 @@ def build_backbone(
     pretrained: bool = True,
     arch_overrides: Optional[dict] = None,
     vocab_size: Optional[int] = None,
-) -> Any:
+) -> _Backbone:
     def _top_k_layers(n_layers: int) -> Optional[list[int]]:
         # LoRA ONLY the top-K transformer layers -> fewer adapters, smaller activation graph -> bigger batch. Emission
         # reads the FINAL hidden state, so the top layers carry the task-shaping. 0 = all layers (default, unchanged).
@@ -231,7 +259,7 @@ def build_backbone(
 
     from peft import LoraConfig, get_peft_model  # type: ignore[import-untyped]
 
-    def _try_load(dtype_key: str, attn: Optional[str]) -> Any:
+    def _try_load(dtype_key: str, attn: Optional[str]) -> _Backbone:
         # sdpa (default) avoids materializing the O(S^2) eager-attention score matrix — a long seed (3072 tokens)
         # OOM'd a 0.6B model at 72GB on eager. attention_dropout is dropped for multimodal wrappers that reject it.
         kw: dict[str, Any] = {dtype_key: dt}
@@ -242,7 +270,7 @@ def build_backbone(
         except TypeError:  # multimodal wrappers (e.g. Gemma4ForConditionalGeneration) reject it
             return AutoModelForCausalLM.from_pretrained(llm_model, **kw)
 
-    def _load(attn: Optional[str]) -> Any:
+    def _load(attn: Optional[str]) -> _Backbone:
         # transformers renamed `torch_dtype` -> `dtype` (~4.56); langset declares transformers>=4.41, so try the
         # new kwarg then fall back to the old one for broad version compat.
         try:
@@ -324,8 +352,8 @@ class LangSetModel(nn.Module):
 
     def __init__(
         self,
-        backbone: Any,
-        tokenizer: Any,
+        backbone: _Backbone,
+        tokenizer: PreTrainedTokenizerBase,
         latent_dim: int,
         n_latents: int,
         llm_model: str,
@@ -547,7 +575,7 @@ class LangSetModel(nn.Module):
         attention_mask: torch.Tensor,
         real_ids: Optional[torch.Tensor] = None,
         real_start: int = 0,
-    ) -> Any:
+    ) -> _HiddenOutput:
         """Backbone forward that stays correct on Per-Layer-Embedding models (Gemma E-series). For PLE models we
         build `per_layer_inputs` ourselves: the real-token span [real_start : real_start+len] gets its true
         token-ID lookup; synthetic positions (emit query / fed-back latents / recon soft tokens) get zeros, so
@@ -569,7 +597,7 @@ class LangSetModel(nn.Module):
         )
 
     @staticmethod
-    def _last_hidden(out: Any) -> torch.Tensor:
+    def _last_hidden(out: _HiddenOutput) -> torch.Tensor:
         h = getattr(
             out, "last_hidden_state", None
         )  # text tower returns this; a ForCausalLM does not
@@ -656,7 +684,7 @@ class LangSetModel(nn.Module):
         emb = emb[0] if single else emb
         return emb.numpy() if convert_to_numpy else emb
 
-    def emit(self, sentences: Union[str, list[str]], **kw: Any) -> torch.Tensor:
+    def emit(self, sentences: Union[str, list[str]], **kw: object) -> torch.Tensor:
         return self.encode(sentences, convert_to_numpy=False, **kw)  # type: ignore[return-value]
 
     @torch.no_grad()
@@ -963,7 +991,7 @@ class LangSetModel(nn.Module):
     def get_sentence_embedding_dimension(self) -> int:
         return self.latent_dim
 
-    def as_sentence_transformer(self) -> Any:
+    def as_sentence_transformer(self) -> SentenceTransformer:
         """Wrap as a `sentence_transformers.SentenceTransformer` so it drops into SetFit as `model_body`."""
         from langset.st_module import to_sentence_transformer
 

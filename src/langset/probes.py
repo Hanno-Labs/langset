@@ -22,12 +22,13 @@ never requires them — `pip install "langset[probes]"` (or bring your own sklea
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Optional, Sequence
+from types import ModuleType
+from typing import Iterable, Optional, Sequence
 
 import numpy as np
 
 
-def _require(mod: str, pkg: str) -> Any:
+def _require(mod: str, pkg: str) -> ModuleType:
     try:
         return __import__(mod, fromlist=["_"])
     except ImportError as e:  # pragma: no cover - trivial guard
