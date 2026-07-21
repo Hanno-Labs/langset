@@ -1918,7 +1918,9 @@ class Trainer:
                         pred = h.module(recon[valid].float())
                         flat = h._flat_recon_targets(bidx, lens_l)
                     else:  # "hidden": pooled per-sequence seed hidden — a separate backbone forward whose grad shapes it
-                        pred = h.module(m.seed_hidden(se["input_ids"], se["attention_mask"]).float())
+                        pred = h.module(
+                            m.seed_hidden(se["input_ids"], se["attention_mask"]).float()
+                        )
                         flat = [h.values[k] for k in bidx]
                     raw = h.loss_on(pred, flat, dev)
                     if raw is not None:

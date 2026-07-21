@@ -258,7 +258,9 @@ def test_bf16_hidden_and_recon_heads_train() -> None:
         TINY_MODEL, bf16=True, device="cpu", multi_latent=True, fsq_dim=32, fsq_levels=8
     )
     with tempfile.TemporaryDirectory() as td:
-        Trainer(model, _args(td, epochs=2, heads=heads), _dataset()).train()  # must not raise a dtype RuntimeError
+        Trainer(
+            model, _args(td, epochs=2, heads=heads), _dataset()
+        ).train()  # must not raise a dtype RuntimeError
         loaded = LangSetModel.load(td, device="cpu")
     assert "v" in loaded.aux_heads and "d" in loaded.aux_heads
 
