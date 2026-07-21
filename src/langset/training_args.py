@@ -24,6 +24,18 @@ class TrainingArguments:
     tau: float = 0.07  # contrastive temperature
     max_len: int = 512
 
+    # GRADCACHE (single-latent path): decouple the contrastive batch size from activation memory so we can use a LARGE
+    # in-batch-negative batch that would never fit as one graph. Phase 1 encodes the full batch in no_grad sub-chunks
+    # (only [B,d] embeddings kept); the contrastive loss runs on the full [B,d] and backprops to the embeddings (cached
+    # representation grads); Phase 2 re-forwards each sub-chunk WITH grad and backprops the cached grad -> EXACT
+    # full-batch param grad, but peak activation = ONE sub-chunk (gc_chunk). REQUIRES dropout==0 (phase-1/2 forwards of
+    # a chunk must match) and lam_recon==0 (recon needs the per-token backbone graph, incompatible with embedding-only
+    # caching). 0 = OFF (byte-identical to before). See Gao et al. 2021, "Scaling Deep Contrastive Learning Batch Size".
+    grad_cache: bool = (
+        False  # ON: batch_size is the LARGE effective batch; gc_chunk is the memory unit
+    )
+    gc_chunk: int = 0  # sub-batch size for the two-phase encode/backprop (e.g. 16/32); 0 with grad_cache -> batch_size
+
     # loss weights. The self-contrastive term (emit(input) <-> emit(target_text)) is the primary at weight 1.0;
     # these are light aux terms: recon grounds the latent in the target text, uniform keeps the space spread.
     lam_recon: float = 0.3  # aux: the latent must also DECODE target_text

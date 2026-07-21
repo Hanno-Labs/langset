@@ -929,6 +929,131 @@ class Trainer:
                 flush=True,
             )
 
+        def _sl_loss(
+            pred: torch.Tensor,
+            target: torch.Tensor,
+            hn: Optional[torch.Tensor],
+            idx: torch.Tensor,
+        ) -> torch.Tensor:
+            """Single-latent contrastive loss as a PURE FUNCTION OF THE EMBEDDINGS (pred/target/hn) — the
+            GradCache-compatible factoring of the inline step below. Contains every term that reads only the
+            pooled embeddings (in-batch-negative InfoNCE + false-neg / hard-neg masking + emb_slots facets +
+            uniformity); the recon aux is NOT here (it needs the per-token backbone graph, so it stays on the
+            direct path and grad_cache asserts lam_recon==0). Byte-identical math to the inline step, so
+            grad_cache=False is unchanged."""
+            tmat = target if hn is None else torch.cat([target, hn], dim=0)
+            logits = (pred @ tmat.t()) / a.tau  # in-batch negatives force separation (no collapse)
+            B = len(idx)
+            neg_mask = torch.zeros(B, logits.size(1), dtype=torch.bool, device=dev)
+            if self.mask_keys is not None:  # in-batch block: drop same-issue false negatives
+                bkeys = [self.mask_keys[j] for j in idx.tolist()]
+                for r in range(B):
+                    kr = bkeys[r]
+                    if not kr:
+                        continue
+                    for c in range(B):
+                        if r != c and (kr & bkeys[c]):
+                            neg_mask[r, c] = True
+            if (
+                hn_ids is not None
+            ):  # PER-ANCHOR-ONLY hard neg: anchor i sees ONLY its own mined hard neg (col B+i)
+                hnt = self.hard_neg_text
+                assert hnt is not None
+                valid = [bool(hnt[j]) for j in idx.tolist()]
+                for r in range(B):
+                    for c in range(B):
+                        if not (r == c and valid[c]):
+                            neg_mask[r, B + c] = True
+            if bool(neg_mask.any()):
+                logits = logits.masked_fill(
+                    neg_mask, float("-inf")
+                )  # diagonal (positive) always kept
+            loss = F.cross_entropy(logits, torch.arange(B, device=dev))  # primary
+            for (
+                field,
+                lo,
+                hi,
+                kind,
+                head,
+                cls2id,
+            ) in slot_plan:  # aux: CONTINUOUS EMB SLOTS (pure fn of pred)
+                sl = self.slot_labels
+                assert sl is not None
+                labs = sl[field]
+                sub = pred[:, lo:hi]
+                rows_i = idx.tolist()
+                if kind == "classify":
+                    yi = torch.tensor([cls2id.get(labs[j], -100) for j in rows_i], device=dev)
+                    if bool((yi >= 0).any()):
+                        loss = loss + a.lam_emb_slots * F.cross_entropy(
+                            head(sub), yi, ignore_index=-100
+                        )
+                else:  # regress: MSE on known rows
+                    keep = [
+                        k
+                        for k, j in enumerate(rows_i)
+                        if labs[j].lower() not in ("", "unknown", "none", "nan", "na")
+                    ]
+                    if keep:
+                        ki = torch.tensor(keep, device=dev)
+                        yt = torch.tensor(
+                            [float(labs[rows_i[k]]) for k in keep], device=dev
+                        ).unsqueeze(1)
+                        loss = loss + a.lam_emb_slots * F.mse_loss(head(sub[ki]), yt)
+            if a.lam_uniform > 0 and B > 1:  # aux: uniformity
+                sq = torch.pdist(F.normalize(pred, p=2, dim=-1), p=2).pow(2)
+                loss = loss + a.lam_uniform * sq.mul(-2.0).exp().mean().log()
+            return loss
+
+        def _grad_cache_step(idx: torch.Tensor) -> float:
+            """GradCache: EXACT full-batch contrastive gradient with peak activation = one gc_chunk (Gao et al.
+            2021). Lets `batch_size` (in-batch negatives) grow far past what one graph fits. Phase 1 encodes the
+            whole batch in no_grad chunks (only [B,d] embeddings survive), builds the loss on the full batch and
+            caches d(loss)/d(embedding); Phase 2 re-forwards each chunk WITH grad and injects the cached grads via
+            autograd.backward -> exact param grad. emb_slot heads get their grad in phase 1 (they read only the
+            cached embeddings); the backbone gets its grad in phase 2. Requires dropout==0."""
+            ch = a.gc_chunk or a.batch_size
+            chunks = [idx[j : j + ch] for j in range(0, len(idx), ch)]
+            preds: list[torch.Tensor] = []
+            targets: list[torch.Tensor] = []
+            hns: list[torch.Tensor] = []
+            with torch.no_grad():  # PHASE 1: embeddings only; each chunk's activations freed
+                for c in chunks:
+                    p, t, h = engine.featurize(c)
+                    preds.append(p)
+                    targets.append(t)
+                    if h is not None:
+                        hns.append(h)
+            pf = torch.cat(preds).detach().requires_grad_(True)
+            tf = torch.cat(targets).detach().requires_grad_(True)
+            hf = torch.cat(hns) if hns else None  # hard negs stay no_grad (as in featurize)
+            loss = _sl_loss(
+                pf, tf, hf, idx
+            )  # full-batch loss -> cached rep grads (+ emb_slot head grads)
+            opt.zero_grad()
+            loss.backward()  # fills pf.grad/tf.grad (and slot-head param grads); backbone params NOT in this graph
+            gp, gt = pf.grad, tf.grad
+            assert gp is not None and gt is not None  # loss.backward just populated them
+            off = 0
+            for c in chunks:  # PHASE 2: re-forward WITH grad, inject cached grads -> backbone param grads accumulate
+                cn = len(c)
+                p, t, _ = engine.featurize(c)
+                torch.autograd.backward([p, t], [gp[off : off + cn], gt[off : off + cn]])
+                off += cn
+            opt.step()
+            return float(loss.detach())
+
+        if a.grad_cache:
+            assert a.lam_recon == 0, (
+                "grad_cache requires lam_recon==0 (recon needs the per-token backbone graph, not just the "
+                "pooled embedding); set TrainingArguments(lam_recon=0)"
+            )
+            print(
+                f"[langset] GRADCACHE ON: effective batch={a.batch_size}, gc_chunk={a.gc_chunk or a.batch_size} "
+                "(peak activation = one chunk; big in-batch-negative batch decoupled from memory)",
+                flush=True,
+            )
+
         for ep in range(start_ep, a.epochs):
             m.train()
             # JEPA: RE-MASK the raw text fresh this epoch (new random holes every epoch -> the model never sees
@@ -961,83 +1086,33 @@ class Trainer:
                     lloss.backward()
                     opt.step()
                 idx = torch.tensor(order[i : i + a.batch_size], device=dev)
-                pred, target, hn = engine.featurize(
-                    idx
-                )  # engine owns WHERE features come from (backbone vs cached)
-                # HARD NEGATIVES (if any): mined near-miss targets as extra negative columns [B:2B] (in-batch targets
-                # stay cols [0:B]); the engine computed them under no_grad so gradient still flows only to `pred`.
-                tmat = target if hn is None else torch.cat([target, hn], dim=0)
-                logits = (
-                    pred @ tmat.t()
-                ) / a.tau  # in-batch negatives force separation (no collapse)
-                B = len(idx)
-                neg_mask = torch.zeros(
-                    B, logits.size(1), dtype=torch.bool, device=dev
-                )  # NB: not `mask` (that's the attn mask)
-                if self.mask_keys is not None:  # in-batch block: drop same-issue false negatives
-                    bkeys = [self.mask_keys[j] for j in idx.tolist()]
-                    for r in range(B):
-                        kr = bkeys[r]
-                        if not kr:
-                            continue
-                        for c in range(B):
-                            if r != c and (kr & bkeys[c]):
-                                neg_mask[r, c] = True
-                if hn_ids is not None:
-                    # PER-ANCHOR-ONLY hard neg: anchor i sees ONLY its own mined hard neg (col B+i), never the other
-                    # anchors' (a batch-SHARED negative cluster herds every emit off one region -> geometry collapse,
-                    # observed: collapse 0.03 -> 0.28/0.57). Keep the valid diagonal of the hard-neg block; mask rest.
-                    hnt = self.hard_neg_text
-                    assert hnt is not None  # populated whenever hn_ids is
-                    valid = [bool(hnt[j]) for j in idx.tolist()]
-                    for r in range(B):
-                        for c in range(B):
-                            if not (r == c and valid[c]):
-                                neg_mask[r, B + c] = True
-                if bool(neg_mask.any()):
-                    logits = logits.masked_fill(
-                        neg_mask, float("-inf")
-                    )  # diagonal (positive) always kept
-                loss = F.cross_entropy(logits, torch.arange(B, device=dev))  # primary
-                for field, lo, hi, kind, head, cls2id in slot_plan:  # aux: CONTINUOUS EMB SLOTS
-                    sl = self.slot_labels
-                    assert sl is not None  # slot_plan is non-empty only when slot_labels is set
-                    labs = sl[field]  # decode facet from pred[lo:hi]
-                    sub = pred[:, lo:hi]  # -> encoder routes it there
-                    rows_i = idx.tolist()
-                    if kind == "classify":
-                        yi = torch.tensor([cls2id.get(labs[j], -100) for j in rows_i], device=dev)
-                        if bool((yi >= 0).any()):
-                            loss = loss + a.lam_emb_slots * F.cross_entropy(
-                                head(sub), yi, ignore_index=-100
-                            )
-                    else:  # regress: MSE on known rows
-                        keep = [
-                            k
-                            for k, j in enumerate(rows_i)
-                            if labs[j].lower() not in ("", "unknown", "none", "nan", "na")
-                        ]
-                        if keep:
-                            ki = torch.tensor(keep, device=dev)
-                            yt = torch.tensor(
-                                [float(labs[rows_i[k]]) for k in keep], device=dev
-                            ).unsqueeze(1)
-                            loss = loss + a.lam_emb_slots * F.mse_loss(head(sub[ki]), yt)
-                if engine.supports_recon and a.lam_recon > 0:  # aux: grounding. At 0 the
-                    loss = loss + a.lam_recon * engine.recon(
-                        pred, idx
-                    )  # term is zero anyway; SKIP so
-                    #  recon's fp32 full-vocab ([B,S,vocab]) projection graph is NOT built every step (that graph, not
-                    #  the stripped lm_head, is what OOM'd a 0.6B at 84GB without grad_ckpt). Also lets frozen-pool run
-                    #  (recon needs the backbone that pool_mode deliberately freezes out). Default 0.3 -> unchanged.
-                if a.lam_uniform > 0 and len(idx) > 1:  # aux: uniformity
-                    sq = torch.pdist(F.normalize(pred, p=2, dim=-1), p=2).pow(2)
-                    loss = loss + a.lam_uniform * sq.mul(-2.0).exp().mean().log()
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
-                tot += float(loss.detach())
-                nb += 1
+                if (
+                    a.grad_cache
+                ):  # GradCache: big in-batch-negative batch, peak activation capped at gc_chunk
+                    tot += _grad_cache_step(idx)
+                    nb += 1
+                else:
+                    pred, target, hn = engine.featurize(
+                        idx
+                    )  # engine owns WHERE features come from (backbone vs cached)
+                    # HARD NEGATIVES flow through _sl_loss as extra negative columns; grad still reaches only `pred`.
+                    loss = _sl_loss(
+                        pred, target, hn, idx
+                    )  # InfoNCE + false-neg/hard-neg masking + emb_slots + uniformity (factored above)
+                    if (
+                        engine.supports_recon and a.lam_recon > 0
+                    ):  # aux: grounding. At 0 the term is zero anyway;
+                        loss = (
+                            loss + a.lam_recon * engine.recon(pred, idx)
+                        )  # SKIP so recon's fp32 full-vocab ([B,S,vocab]) projection graph is NOT built every step
+                        #  (that graph, not the stripped lm_head, OOM'd a 0.6B at 84GB without grad_ckpt). Also lets
+                        #  frozen-pool run. Direct path only: grad_cache asserts lam_recon==0 (embedding-only caching
+                        #  cannot hold the per-token backbone graph recon needs). Default 0.3 -> unchanged.
+                    opt.zero_grad()
+                    loss.backward()
+                    opt.step()
+                    tot += float(loss.detach())
+                    nb += 1
 
                 if (
                     _mem_n and _mem_step < _mem_n and torch.cuda.is_available()
@@ -1507,6 +1582,147 @@ class Trainer:
                 m, ln_doc_ids[pos], ln_doc_mask[pos], ln_tgt_ids[pos], ln_tgt_mask[pos], vsz
             )
 
+        if a.grad_cache:  # multi-latent GradCache: reject the configs it cannot keep exact for the cross-batch term
+            assert not target_source.wants_regularizer, (
+                "grad_cache is incompatible with a cross-batch regularizer (e.g. SIGRegTarget): it is computed "
+                "over the whole batch's latents and is not cached. Use the EMA twin, or grad_cache=False."
+            )
+            assert self.label_plan is None, (
+                "grad_cache is incompatible with the FSQ label subspace (LabelDimsTerm reads dim_lg, the rollout "
+                "logits, not the cached recon). Drop label_field or grad_cache."
+            )
+            assert not any(getattr(t, "isolated_backward", False) for t in loss_terms), (
+                "grad_cache does not support isolated-backward loss terms."
+            )
+            print(
+                f"[langset] GRADCACHE ON (multi): effective batch={a.batch_size}, gc_chunk={a.gc_chunk or a.batch_size} "
+                "(cross-batch InfoNCE cached EXACT; base loss accumulated per-chunk). ss_prob kept via a shared mask.",
+                flush=True,
+            )
+
+        def _multi_grad_cache_step(
+            se: dict[str, torch.Tensor],
+            target_lat: torch.Tensor,
+            valid: torch.Tensor,
+            lens_l: list[int],
+            bidx: list[int],
+            b: int,
+            lmax: int,
+            ep: int,
+            flat_texts: list[str],
+            agg: dict[str, float],
+        ) -> float:
+            """Multi-latent GradCache. Phase 1 rolls out the FULL batch under no_grad (a SHARED ss_mask makes the
+            scheduled-sampling rollout deterministic), runs the cross-batch recon-pure terms (InfoNCE, hard-neg,
+            supcon, phase, emb_slots) on the full-batch recon, and caches d(loss)/d(recon). Phase 2 re-rolls each
+            gc_chunk WITH grad, backprops the (row-weighted) base loss, and injects the cached recon-grads -> the
+            cross-batch term is EXACT full-batch; the per-row base loss is accumulated (pragmatic, see grad_cache
+            docs). Peak activation = one chunk."""
+            ss_prob = a.ss_prob
+            assert (
+                ss_prob is not None
+            )  # Trainer resolves the None sentinel to a float before any step
+            eff_ss = ss_prob if a.ss_warmup <= 0 else ss_prob * min(1.0, ep / a.ss_warmup)
+            H = lmax if a.train_hops is None else max(0, min(int(a.train_hops), lmax))
+            ss_mask = (torch.rand(b, H, device=dev) < eff_ss) if (eff_ss > 0 and H > 0) else None
+
+            # PHASE 1: full-batch rollout (no_grad) -> recon; cross-batch loss on cached recon -> recon.grad
+            with torch.no_grad():
+                em_full = objective.emit(
+                    se, target_lat, valid, lens_l, bidx, b, lmax, ep, ss_mask=ss_mask
+                )
+            recon_rg = em_full.recon.detach().requires_grad_(True)
+            c = MultiStepCtx(
+                trainer=self,
+                args=a,
+                model=m,
+                dev=dev,
+                bidx=bidx,
+                lens_l=lens_l,
+                flat_texts=flat_texts,
+                valid=valid,
+                target_lat=target_lat,
+                recon=recon_rg,
+                dim_lg=None,
+                lmax=lmax,
+                fsq_levels=fsq_levels,
+                lab_label=None,
+                target_source=target_source,
+                phase_head=phase_head,
+                phase_ids=phase_ids,
+            )
+            cross = recon_rg.new_zeros(())
+            for term in loss_terms:  # cross-batch recon-pure terms (InfoNCE etc.)
+                contrib = term.contribute(c)
+                if contrib is not None:
+                    _k, _raw, _w = contrib
+                    cross = cross + _w * _raw
+                    agg[_k] = agg.get(_k, 0.0) + float(_raw.detach())
+            if slot_plan:  # emb_slots facets: pure fn of the pooled recon
+                _vm = valid.unsqueeze(-1).to(recon_rg.dtype)
+                pooled = (recon_rg * _vm).sum(1) / _vm.sum(1).clamp(min=1.0)
+                for field, lo, hi, kind, slot_head, cls2id in slot_plan:
+                    sl = self.slot_labels
+                    assert sl is not None
+                    labs = sl[field]
+                    sub = pooled[:, lo:hi]
+                    if kind == "classify":
+                        yi = torch.tensor([cls2id.get(labs[j], -100) for j in bidx], device=dev)
+                        if bool((yi >= 0).any()):
+                            _sl = F.cross_entropy(slot_head(sub), yi, ignore_index=-100)
+                            cross = cross + a.lam_emb_slots * _sl
+                            agg["loss_slots"] = agg.get("loss_slots", 0.0) + float(_sl.detach())
+                    else:
+                        keep = [
+                            k
+                            for k, j in enumerate(bidx)
+                            if labs[j].lower() not in ("", "unknown", "none", "nan", "na")
+                        ]
+                        if keep:
+                            ki = torch.tensor(keep, device=dev)
+                            yt = torch.tensor(
+                                [float(labs[bidx[k]]) for k in keep], device=dev
+                            ).unsqueeze(1)
+                            _sl = F.mse_loss(slot_head(sub[ki]), yt)
+                            cross = cross + a.lam_emb_slots * _sl
+                            agg["loss_slots"] = agg.get("loss_slots", 0.0) + float(_sl.detach())
+            opt.zero_grad()
+            if cross.requires_grad:
+                cross.backward()  # fills recon_rg.grad (+ any head params: phase_head, slot heads)
+            gcache = (
+                recon_rg.grad
+            )  # [b, lmax, d] cached full-batch cross-batch grad (None if no cross term fired)
+
+            # PHASE 2: re-roll each chunk WITH grad; base loss (row-weighted) + inject cached recon-grads
+            ch = a.gc_chunk or a.batch_size
+            base_tot = 0.0
+            for j0 in range(0, b, ch):
+                rows = list(range(j0, min(j0 + ch, b)))
+                ri = torch.tensor(rows, device=dev)
+                se_c = {k: v[ri] for k, v in se.items()}
+                tgt_c, val_c = target_lat[ri], valid[ri]
+                lens_c = [lens_l[r] for r in rows]
+                bidx_c = [bidx[r] for r in rows]
+                mask_c = ss_mask[ri] if ss_mask is not None else None
+                em_c = objective.emit(
+                    se_c, tgt_c, val_c, lens_c, bidx_c, len(rows), lmax, ep, ss_mask=mask_c
+                )
+                w = (
+                    len(rows) / b
+                )  # row-weight so the per-chunk base means sum ~ the batch mean (pragmatic)
+                (em_c.base_loss * w).backward(retain_graph=gcache is not None)
+                if (
+                    gcache is not None
+                ):  # inject the cached cross-batch grad through THIS chunk's recon
+                    torch.autograd.backward(em_c.recon, gcache[ri])
+                base_tot += float(em_c.base_loss.detach()) * w
+                agg["loss_stop"] += float(em_c.logs["loss_stop"].detach()) * w
+                agg["loss_dims"] += float(em_c.logs["loss_dims"].detach()) * w
+                agg["recon_loss"] += float(em_c.logs["recon_loss"].detach()) * w
+            opt.step()
+            target_source.update()
+            return base_tot + float(cross.detach())
+
         for ep in range(start_ep, a.epochs):
             m.train()
             order = a.epoch_order(tr_idx, rng_t, a, seeds)  # epoch ordering strategy (INJECTED)
@@ -1556,6 +1772,14 @@ class Trainer:
                     target_lat[r, :nl] = flat_tgt[k : k + nl]
                     valid[r, :nl] = True
                     k += nl
+                if (
+                    a.grad_cache
+                ):  # two-phase: cross-batch InfoNCE cached exact, base loss accumulated per chunk
+                    tot += _multi_grad_cache_step(
+                        se, target_lat, valid, lens_l, bidx, b, lmax, ep, flat_texts, agg
+                    )
+                    nb += 1
+                    continue
                 with _rf("rollout"):
                     em = objective.emit(se, target_lat, valid, lens_l, bidx, b, lmax, ep)
                 recon, dim_lg, lab_label = em.recon, em.dim_lg, em.lab_label

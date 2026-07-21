@@ -939,6 +939,7 @@ class LangSetModel(nn.Module):
         train_hops: Optional[int] = None,
         ss_prob: float = 0.0,
         ss_sample: bool = False,
+        ss_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Token-native AR pass (multi-latent, FSQ). Quantizes the TRUE target latents to per-dim digits and predicts
         the digits at each of L+1 positions (targets 0..L-1 then a STOP at position L). Returns (dim_logits
@@ -952,7 +953,12 @@ class LangSetModel(nn.Module):
         predictions. This is the exposure-bias fix that makes MULTI-HOP rollout trained rather than emergent. Self-
         fed latents are DETACHED (standard scheduled sampling; no BPTT through FSQ argmax). Cost = train_hops+1
         backbone passes (positions past train_hops are teacher-forced in one pass). `ss_sample` samples the self-fed
-        digits instead of argmax."""
+        digits instead of argmax.
+
+        `ss_mask` (optional [B, H] bool): the PRECOMPUTED per-(row, hop) self-feed decisions. When given, the loop
+        uses `ss_mask[:, h]` in place of a fresh `torch.rand < ss_prob` draw. This makes the rollout DETERMINISTIC
+        given the mask, so GradCache's phase-1 (no_grad, full batch) and phase-2 (grad, per chunk) forwards produce
+        identical `recon` and the cached gradients line up exactly. None = sample as usual (byte-identical)."""
         assert self.head.multi_latent
         bsz, s_len = input_ids.size(0), input_ids.size(1)
         n = target_latents.size(1)
@@ -992,7 +998,12 @@ class LangSetModel(nn.Module):
             else:
                 pred_dig = dl.argmax(-1)  # [B, fsq_dim] (own emission, never STOP)
             recon_pred = self.head.reconstruct(pred_dig).detach()  # own emitted latent (detached)
-            use_own = (torch.rand(bsz, device=dev) < ss_prob).unsqueeze(1)
+            if (
+                ss_mask is not None
+            ):  # GradCache: replay the SHARED per-(row,hop) decisions (deterministic rollout)
+                use_own = ss_mask[:, h].unsqueeze(1)
+            else:
+                use_own = (torch.rand(bsz, device=dev) < ss_prob).unsqueeze(1)
             feed_h = torch.where(use_own, recon_pred, recon[:, h].detach())
             seq = torch.cat([seq, self.head.feedback(feed_h.to(seq.dtype)).unsqueeze(1)], 1)
             am = torch.cat([am, am.new_ones(bsz, 1)], 1)

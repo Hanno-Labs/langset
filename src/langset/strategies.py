@@ -374,6 +374,7 @@ class _EmissionObjective:
         b: int,
         lmax: int,
         ep: int,
+        ss_mask: Optional[torch.Tensor] = None,
     ) -> EmissionOut:
         """Run the emission forward and its base loss for one step.
 
@@ -422,6 +423,7 @@ class FSQObjective(_EmissionObjective):
         b: int,
         lmax: int,
         ep: int,
+        ss_mask: Optional[torch.Tensor] = None,
     ) -> EmissionOut:
         m, a, dev, self_ = self.m, self.a, self.dev, self.trainer
         fsq_dim, fsq_levels = self.fsq_dim, self.fsq_levels
@@ -436,6 +438,7 @@ class FSQObjective(_EmissionObjective):
             train_hops=a.train_hops,
             ss_prob=eff_ss,
             ss_sample=a.ss_sample,
+            ss_mask=ss_mask,  # GradCache: shared per-(row,hop) self-feed decisions (deterministic replay)
         )
         dim0 = torch.cat([dim_lg[:, :, 0, :], stop_lg], -1)  # [b, lmax+1, L+1] — digit-0 + STOP
         lab0 = torch.full((b, lmax + 1), -100, dtype=torch.long, device=dev)
