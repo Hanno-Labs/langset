@@ -25,7 +25,7 @@ _ROWS = [
 ]
 
 
-def _one_step(grad_cache: bool, gc_chunk: int) -> dict:
+def _one_step(grad_cache: bool, gc_chunk: int, stop_grad_target: bool = False) -> dict:
     torch.manual_seed(0)  # identical LoRA init + data order across the two builds
     m = LangSetModel.from_pretrained(ARCH, device="cpu", dropout=0.0)
     args = TrainingArguments(
@@ -40,6 +40,7 @@ def _one_step(grad_cache: bool, gc_chunk: int) -> dict:
         eval_every=999,
         grad_cache=grad_cache,
         gc_chunk=gc_chunk,
+        stop_grad_target=stop_grad_target,
         seed=0,
         verbose=False,
     )
@@ -54,4 +55,16 @@ def test_gradcache_matches_direct_update() -> None:
     max_abs = max((direct[n] - gc[n]).abs().max().item() for n in direct)
     assert max_abs < 1e-4, (
         f"GradCache update diverged from direct by {max_abs:.3e} (should be fp noise)"
+    )
+
+
+def test_gradcache_matches_direct_update_stop_grad_target() -> None:
+    """stop_grad_target: the target is a frozen key (gradient reaches only `pred`). GradCache must cache/inject
+    only the pred grad and skip the no-grad target — otherwise autograd.backward errors on a graph-less target."""
+    direct = _one_step(grad_cache=False, gc_chunk=0, stop_grad_target=True)
+    gc = _one_step(grad_cache=True, gc_chunk=2, stop_grad_target=True)
+    assert set(direct) == set(gc)
+    max_abs = max((direct[n] - gc[n]).abs().max().item() for n in direct)
+    assert max_abs < 1e-4, (
+        f"GradCache (stop_grad_target) diverged from direct by {max_abs:.3e} (should be fp noise)"
     )

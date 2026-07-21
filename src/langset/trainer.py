@@ -1025,20 +1025,31 @@ class Trainer:
                     if h is not None:
                         hns.append(h)
             pf = torch.cat(preds).detach().requires_grad_(True)
-            tf = torch.cat(targets).detach().requires_grad_(True)
+            # the target participates in autograd UNLESS it's a stop-grad target (BYOL/MoCo-style): then it is a
+            # frozen key, gradient reaches only `pred` — mirror the direct path, which featurizes it under no_grad.
+            tf = torch.cat(targets).detach()
+            if not a.stop_grad_target:
+                tf.requires_grad_(True)
             hf = torch.cat(hns) if hns else None  # hard negs stay no_grad (as in featurize)
             loss = _sl_loss(
                 pf, tf, hf, idx
             )  # full-batch loss -> cached rep grads (+ emb_slot head grads)
             opt.zero_grad()
-            loss.backward()  # fills pf.grad/tf.grad (and slot-head param grads); backbone params NOT in this graph
-            gp, gt = pf.grad, tf.grad
-            assert gp is not None and gt is not None  # loss.backward just populated them
+            loss.backward()  # fills pf.grad (+ tf.grad unless stop-grad, + slot-head params); backbone NOT in this graph
+            gp = pf.grad
+            gt = tf.grad if tf.requires_grad else None
+            assert gp is not None  # loss.backward just populated it
             off = 0
             for c in chunks:  # PHASE 2: re-forward WITH grad, inject cached grads -> backbone param grads accumulate
                 cn = len(c)
                 p, t, _ = engine.featurize(c)
-                torch.autograd.backward([p, t], [gp[off : off + cn], gt[off : off + cn]])
+                tensors, grads = [p], [gp[off : off + cn]]
+                if (
+                    gt is not None and t.requires_grad
+                ):  # skip the target when it's a stop-grad (no-grad) key
+                    tensors.append(t)
+                    grads.append(gt[off : off + cn])
+                torch.autograd.backward(tensors, grads)
                 off += cn
             opt.step()
             return float(loss.detach())
@@ -1047,6 +1058,11 @@ class Trainer:
             assert a.lam_recon == 0, (
                 "grad_cache requires lam_recon==0 (recon needs the per-token backbone graph, not just the "
                 "pooled embedding); set TrainingArguments(lam_recon=0)"
+            )
+            assert float(m.head.drop.p) == 0.0, (
+                "grad_cache requires dropout==0: phase-1 and phase-2 forwards of a chunk must be identical, but "
+                "dropout randomizes them so the cached embedding grads no longer match the re-forward. Rebuild "
+                "the model with dropout=0 (this also zeros lora_dropout, which is driven by the same arg)."
             )
             print(
                 f"[langset] GRADCACHE ON: effective batch={a.batch_size}, gc_chunk={a.gc_chunk or a.batch_size} "
@@ -1583,6 +1599,11 @@ class Trainer:
             )
 
         if a.grad_cache:  # multi-latent GradCache: reject the configs it cannot keep exact for the cross-batch term
+            assert float(m.head.drop.p) == 0.0, (
+                "grad_cache requires dropout==0: the phase-1 (no_grad, full batch) and phase-2 (grad, per chunk) "
+                "rollouts must be identical, but dropout randomizes them so the cached recon grads no longer match. "
+                "Rebuild the model with dropout=0."
+            )
             assert not target_source.wants_regularizer, (
                 "grad_cache is incompatible with a cross-batch regularizer (e.g. SIGRegTarget): it is computed "
                 "over the whole batch's latents and is not cached. Use the EMA twin, or grad_cache=False."

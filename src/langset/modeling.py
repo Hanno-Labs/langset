@@ -1001,7 +1001,9 @@ class LangSetModel(nn.Module):
             if (
                 ss_mask is not None
             ):  # GradCache: replay the SHARED per-(row,hop) decisions (deterministic rollout)
-                use_own = ss_mask[:, h].unsqueeze(1)
+                use_own = (
+                    ss_mask[:, h].to(device=dev, dtype=torch.bool).unsqueeze(1)
+                )  # normalize: caller may pass a CPU/int mask
             else:
                 use_own = (torch.rand(bsz, device=dev) < ss_prob).unsqueeze(1)
             feed_h = torch.where(use_own, recon_pred, recon[:, h].detach())
