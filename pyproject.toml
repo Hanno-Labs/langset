@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "langset"
-version = "0.13.0"
+version = "0.13.1"
 description = "A short path to a world model in your LLM: few-shot fine-tune it to predict in latent space (a JEPA world model) — or emit a single latent as a bespoke embedding model, SetFit-ready."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -1744,7 +1744,7 @@ class Trainer:
             ):  # PLUGGABLE AUX HEADS (recon read site only; "hidden" is rejected under grad_cache).
                 # A recon head is a pure fn of the cached recon, so it belongs in the phase-1 cross accumulation.
                 raw_h = h.loss_on(
-                    h.module(recon_rg[valid]), h._flat_recon_targets(bidx, lens_l), dev
+                    h.module(recon_rg[valid].float()), h._flat_recon_targets(bidx, lens_l), dev
                 )
                 if raw_h is not None:
                     cross = cross + h.spec.eff_weight(ep) * raw_h
@@ -1915,10 +1915,10 @@ class Trainer:
                     if (
                         h.spec.reads == "recon"
                     ):  # per emitted latent (grad shapes the FSQ geometry, like the phase head)
-                        pred = h.module(recon[valid])
+                        pred = h.module(recon[valid].float())
                         flat = h._flat_recon_targets(bidx, lens_l)
                     else:  # "hidden": pooled per-sequence seed hidden — a separate backbone forward whose grad shapes it
-                        pred = h.module(m.seed_hidden(se["input_ids"], se["attention_mask"]))
+                        pred = h.module(m.seed_hidden(se["input_ids"], se["attention_mask"]).float())
                         flat = [h.values[k] for k in bidx]
                     raw = h.loss_on(pred, flat, dev)
                     if raw is not None:

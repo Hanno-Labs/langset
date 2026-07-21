@@ -36,4 +36,4 @@ __all__ = [
     "TokenMasker",
     "FieldMasker",
 ]
-__version__ = "0.13.0"  # keep in sync with pyproject [project].version
+__version__ = "0.13.1"  # keep in sync with pyproject [project].version

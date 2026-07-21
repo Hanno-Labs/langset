@@ -244,6 +244,25 @@ def test_custom_loss_vector_target_recon() -> None:
     assert all(t.dim() == 2 and t.size(1) == 1 for t in dense)  # [Li, 1] per row
 
 
+# --- bf16 dtype regression (0.13.1) -------------------------------------------------------------------------
+def test_bf16_hidden_and_recon_heads_train() -> None:
+    """REGRESSION: under bf16 the backbone hidden/recon is BFloat16 but the aux-head Linear is Float, so applying
+    the head must cast the input (like head_output does) — otherwise the training forward raises
+    `mat1 and mat2 must have the same dtype, but got BFloat16 and Float`. The fp32 CPU tests never exercised this;
+    a bf16 model with a hidden AND a recon head must train without a dtype error."""
+    heads = [
+        Head(name="v", reads="hidden", target="value", loss="mse", dim=1, transient=False),
+        Head(name="d", reads="recon", target="dense", loss="mse", dim=1, transient=False),
+    ]
+    model = LangSetModel.from_pretrained(
+        TINY_MODEL, bf16=True, device="cpu", multi_latent=True, fsq_dim=32, fsq_levels=8
+    )
+    with tempfile.TemporaryDirectory() as td:
+        Trainer(model, _args(td, epochs=2, heads=heads), _dataset()).train()  # must not raise a dtype RuntimeError
+        loaded = LangSetModel.load(td, device="cpu")
+    assert "v" in loaded.aux_heads and "d" in loaded.aux_heads
+
+
 # --- fail-fast validation (Copilot review) ------------------------------------------------------------------
 def test_duplicate_head_names_raise() -> None:
     """Head.name keys the log entry, the checkpoint, and the head_output lookup — two heads with the same name
