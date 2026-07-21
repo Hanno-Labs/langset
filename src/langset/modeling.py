@@ -432,6 +432,12 @@ class LangSetModel(nn.Module):
         self._arch_overrides: Optional[dict] = (
             None  # config shrink applied to the from-scratch backbone
         )
+        # PERSISTED AUXILIARY HEADS (langset.heads): a name->nn.Linear map of PERSISTED heads (transient heads are
+        # never registered here — they live and die in the trainer). Each carries a metadata spec (read site, loss,
+        # in/out dims, CE classes) so save_pretrained can serialize it and `head_output(name, ...)` can read it back
+        # at inference. Empty by default => byte-identical: no extra params, nothing written to disk.
+        self.aux_heads: nn.ModuleDict = nn.ModuleDict()
+        self.aux_head_specs: dict[str, dict[str, Any]] = {}
 
     # ---- construction ----
     @classmethod
@@ -701,6 +707,83 @@ class LangSetModel(nn.Module):
         # kw is a genuine passthrough to encode() -> Unknown (gradual) so it forwards into encode's typed
         # params without ANN401 tripping on Any. cast the union return (encode -> ndarray | Tensor).
         return cast("torch.Tensor", self.encode(sentences, convert_to_numpy=False, **kw))
+
+    # --- auxiliary supervised heads (langset.heads) --------------------------------------------------------------
+    def seed_hidden(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Per-sequence backbone hidden for a LEFT-padded batch -> [B, h]. Left padding puts every row's last real
+        token at the final column, so the pooled/final hidden is simply `hid[:, -1]` (this is the "hidden" read
+        site a value/time head reads; distinct from `_pool_hidden`, which assumes RIGHT padding). Grad flows into
+        the backbone/LoRA when they are trainable, so the head can SHAPE the representation."""
+        hid = self._last_hidden(
+            self._run_backbone(self.embed(input_ids), attention_mask, input_ids, 0)
+        )
+        return hid[:, -1]
+
+    def add_aux_head(self, module: nn.Linear, spec: dict[str, Any]) -> None:
+        """Register a PERSISTED auxiliary head so `save_pretrained` serializes it and `head_output` can read it back.
+        `spec` is the head's metadata (name / reads / loss / in_dim / out_dim / classes). Called by the trainer for
+        each persisted Head; the module object is SHARED with the trainer so in-place training keeps it current."""
+        name = str(spec["name"])
+        self.aux_heads[name] = module
+        self.aux_head_specs[name] = dict(spec)
+
+    @torch.no_grad()
+    def head_output(
+        self,
+        name: str,
+        sentences: Union[str, list[str]],
+        batch_size: int = 32,
+        reduce: str = "mean",
+        device: Optional[str] = None,
+    ) -> Union[torch.Tensor, list[torch.Tensor]]:
+        """Query a PERSISTED auxiliary head at inference — the readout that makes a value/time head useful.
+        `reads="hidden"` heads read the pooled seed hidden -> one [out_dim] vector per sentence ([N, out_dim]).
+        `reads="recon"` heads read every emitted latent of the rollout: reduce="mean" -> [N, out_dim] (mean over a
+        row's emitted latents); reduce="none" -> a per-row list of [Li, out_dim] (the dense per-tick readout).
+        For a `loss="mse"` value head out_dim=1 (a scalar per state); for a `loss="ce"` head the columns are class
+        logits (argmax -> `aux_head_specs[name]['classes']`)."""
+        if name not in self.aux_heads:
+            raise KeyError(f"no persisted head {name!r}; have {sorted(self.aux_heads)}")
+        module = cast(nn.Linear, self.aux_heads[name])
+        reads = self.aux_head_specs[name]["reads"]
+        single = isinstance(sentences, str)
+        texts = [sentences] if single else list(sentences)
+        was_training = self.training
+        self.eval()
+        if reads == "hidden":
+            rows: list[torch.Tensor] = []
+            for i in range(0, len(texts), batch_size):
+                enc = self.tokenizer(
+                    texts[i : i + batch_size],
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_len,
+                    padding_side="left",  # matches training: last real token at the final column
+                    return_tensors="pt",
+                ).to(self.device)
+                pooled = self.seed_hidden(enc["input_ids"], enc["attention_mask"])
+                rows.append(module(pooled.float()).cpu())
+            if was_training:
+                self.train()
+            out = torch.cat(rows)
+            return out[0] if single else out
+        # reads == "recon": roll out, apply the head to each emitted latent, reduce over the row's latents.
+        lat, lengths = cast(
+            "tuple[torch.Tensor, torch.Tensor]",
+            self.rollout(texts, return_lengths=True),
+        )
+        per_row = module(lat.float())  # [B, L, out_dim]
+        if was_training:
+            self.train()
+        if reduce == "none":
+            seq = [per_row[r, : int(lengths[r])].cpu() for r in range(len(texts))]
+            return seq[0] if single else seq
+        means: list[torch.Tensor] = []
+        for r in range(len(texts)):
+            n = max(int(lengths[r]), 1)
+            means.append(per_row[r, :n].mean(0).cpu())
+        pooled_out = torch.stack(means)
+        return pooled_out[0] if single else pooled_out
 
     @torch.no_grad()
     def generate_text(self, prompt: str, max_new: int = 200) -> str:
@@ -1049,6 +1132,13 @@ class LangSetModel(nn.Module):
                 "head": self.head.state_dict(),
                 "backbone": {k: v.cpu() for k, v in self.backbone.state_dict().items()},
             }
+        if (
+            self.aux_heads
+        ):  # PERSISTED auxiliary heads (langset.heads): weights here, metadata in config.json
+            weights["aux_heads"] = {
+                name: {k: v.cpu() for k, v in mod.state_dict().items()}
+                for name, mod in self.aux_heads.items()
+            }
         torch.save(weights, p / "langset.pt")
         (p / "config.json").write_text(
             json.dumps(
@@ -1067,6 +1157,7 @@ class LangSetModel(nn.Module):
                     "full_ft": self._full_ft,
                     "tokenizer_id": self._tokenizer_id,
                     "arch_overrides": self._arch_overrides,
+                    "aux_heads": self.aux_head_specs,  # {} unless persisted heads were registered (back-compat)
                 }
             )
         )
@@ -1122,5 +1213,11 @@ class LangSetModel(nn.Module):
         # select by the ACTUAL payload (not the flag): a full-FT pretrained model persists "backbone", not "lora".
         m.backbone.load_state_dict(sd["backbone"] if "backbone" in sd else sd["lora"], strict=False)
         m.head.load_state_dict(sd["head"])
+        for name, spec in cfg.get(
+            "aux_heads", {}
+        ).items():  # rebuild + reload PERSISTED auxiliary heads
+            mod = nn.Linear(int(spec["in_dim"]), int(spec["out_dim"])).to(m.device)
+            mod.load_state_dict({k: v.to(m.device) for k, v in sd["aux_heads"][name].items()})
+            m.add_aux_head(mod, spec)
         m.eval()
         return m

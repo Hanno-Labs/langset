@@ -258,15 +258,17 @@ class LabelDimsTerm(_LossTerm):
 
 
 def build_loss_terms(args: TrainingArguments) -> list[_LossTerm]:
-    """DEFAULT loss-term set, built once from the args. Fixed order (label -> multi_nce -> hard_neg -> sup ->
-    phase) so the float summation is byte-identical; each term self-skips when its weight/column is absent. Inject
-    `TrainingArguments(loss_terms=...)` with your own builder (or add terms like CoTGenTerm) to change the set."""
+    """DEFAULT loss-term set, built once from the args. Fixed order (label -> multi_nce -> hard_neg -> sup) so the
+    float summation is byte-identical; each term self-skips when its weight/column is absent. Inject
+    `TrainingArguments(loss_terms=...)` with your own builder (or add terms like CoTGenTerm) to change the set.
+    NOTE: the phase head is no longer a term here — it is the `phase` instance of the generic AUXILIARY-HEAD plug
+    (langset.heads), applied inline in `_train_multi` right after this loop (the same summation position the old
+    `PhaseTerm` held, so lam_phase>0 stays byte-identical). `PhaseTerm` is kept for back-compat injection."""
     return [
         LabelDimsTerm(),
         MultiNCETerm(maskers=[identical_text_mask]),
         HardNegTerm(),
         SupConTerm(),
-        PhaseTerm(),
     ]
 
 
