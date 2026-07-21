@@ -57,6 +57,10 @@ def _dataset() -> list[dict]:
                 "stage": list(_STAGES),
                 "value": _TOPIC_VALUE[t],  # per-row scalar (hidden read site)
                 "dense": [_STAGE_VALUE[s] for s in _STAGES],  # per-item scalar (recon read site)
+                # per-ROW VECTOR target (Δt, event-observed) — the survival/time-head seam (hidden read site).
+                "dt_pair": [_TOPIC_VALUE[t] + 0.05, float(i % 2)],
+                # per-ITEM VECTOR target: one (Δt, event) pair PER emitted stage (recon read site).
+                "dt_seq": [[_STAGE_VALUE[s] + 0.05, float(j % 2)] for j, s in enumerate(_STAGES)],
             }
         )
     return rows
@@ -192,3 +196,48 @@ def test_custom_callable_loss_runs() -> None:
         loaded = LangSetModel.load(td, device="cpu")
     out = loaded.head_output("surv", [r["input_text"] for r in _dataset()])
     assert tuple(out.shape) == (9, 1)
+
+
+# --- custom loss with a MULTI-COLUMN per-item vector target: the Hanno TIME-head / survival seam --------------
+def _censored(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Toy censored exponential-hazard NLL. REQUIRES a 2-column target — indexing target[:, 1] IndexErrors unless
+    the trainer actually feeds the per-item VECTOR target through. dt=target[:,0], obs=target[:,1] (0=censored)."""
+    assert target.dim() == 2 and target.size(1) == 2, (
+        f"expected [N, 2] target, got {tuple(target.shape)}"
+    )
+    dt, obs = target[:, 0], target[:, 1]
+    haz = torch.nn.functional.softplus(pred[:, 0]) + 1e-4  # positive hazard rate
+    return (
+        haz * dt - obs * torch.log(haz)
+    ).mean()  # -log-likelihood of an exponential w/ right-censoring
+
+
+def test_custom_loss_vector_target_hidden() -> None:
+    """A custom loss with a MULTI-COLUMN per-item target (the survival/hazard TIME head) trains end to end at the
+    HIDDEN read site — proving the trainer feeds the (Δt, event) VECTOR through, not just a scalar — and the
+    persisted head reads back at the right shape."""
+    dt_head = Head(
+        name="dt", reads="hidden", target="dt_pair", loss=_censored, dim=1, transient=False
+    )
+    model = _build_model()
+    with tempfile.TemporaryDirectory() as td:
+        Trainer(model, _args(td, epochs=3, heads=[dt_head]), _dataset()).train()
+        loaded = LangSetModel.load(td, device="cpu")
+    assert loaded.aux_head_specs["dt"]["loss"] == "custom"
+    out = loaded.head_output("dt", [r["input_text"] for r in _dataset()])
+    assert tuple(out.shape) == (9, 1)
+
+
+def test_custom_loss_vector_target_recon() -> None:
+    """Same survival seam at the RECON read site: a per-ITEM (Δt, event) pair per emitted latent flows through to
+    the custom loss as an [N, 2] target, and reduce='none' gives the dense per-tick hazard readout."""
+    dt_head = Head(
+        name="dt", reads="recon", target="dt_seq", loss=_censored, dim=1, transient=False
+    )
+    model = _build_model()
+    with tempfile.TemporaryDirectory() as td:
+        Trainer(model, _args(td, epochs=3, heads=[dt_head]), _dataset()).train()
+        loaded = LangSetModel.load(td, device="cpu")
+    dense = loaded.head_output("dt", [r["input_text"] for r in _dataset()], reduce="none")
+    assert isinstance(dense, list) and len(dense) == 9
+    assert all(t.dim() == 2 and t.size(1) == 1 for t in dense)  # [Li, 1] per row
