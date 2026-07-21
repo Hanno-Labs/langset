@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as F
 
 from langset import selection
+from langset.heads import Head, RtHead, resolve_head
 from langset.modeling import LangSetModel
 from langset.strategies import (
     MultiStepCtx,
@@ -141,6 +142,13 @@ def _snapshot_best(m: LangSetModel) -> dict[str, Any]:
         }
     else:
         snap["backbone"] = {k: v.detach().cpu().clone() for k, v in m.backbone.state_dict().items()}
+    if len(
+        m.aux_heads
+    ):  # PERSISTED auxiliary heads (langset.heads): restore the best epoch's readouts too
+        snap["aux_heads"] = {
+            name: {k: v.detach().cpu().clone() for k, v in mod.state_dict().items()}
+            for name, mod in m.aux_heads.items()
+        }
     return snap
 
 
@@ -151,6 +159,8 @@ def _restore_best(m: LangSetModel, best_state: dict[str, Any]) -> None:
         m.backbone.load_state_dict(best_state["backbone"], strict=False)
     else:  # pretrained (or legacy checkpoint): LoRA only
         m.backbone.load_state_dict(best_state["lora"], strict=False)
+    for name, sd in best_state.get("aux_heads", {}).items():  # PERSISTED auxiliary heads
+        m.aux_heads[name].load_state_dict(sd)
 
 
 def _replay_ce(
@@ -436,6 +446,12 @@ class Trainer:
                         f"emb_slots[{field!r}] slice must satisfy 0 <= lo < hi <= latent_dim ({d}); "
                         f"got [{lo}:{hi}]"
                     )
+        # PLUGGABLE AUXILIARY HEADS are multi-latent only (they generalize the phase head, which lives only there).
+        if getattr(args, "heads", None) and not self.multi_latent:
+            raise ValueError(
+                "TrainingArguments(heads=...) is supported on the MULTI-LATENT path only (build the model with "
+                "multi_latent=True). The heads generalize the phase head, which is multi-latent-only."
+            )
         cols = _columns(train_dataset)
         inv = {v: k for k, v in (column_mapping or {}).items()}  # user-col -> canonical
         get = lambda canon: cols[inv.get(canon, canon)]  # type: ignore[index]  # noqa: E731
@@ -589,6 +605,14 @@ class Trainer:
                 for field in slot_specs:
                     raw = cols[inv.get(field, field)]
                     self.slot_labels[field] = [("" if v is None else str(v)) for v in raw]
+            # optional PLUGGABLE AUXILIARY HEADS (langset.heads): each user Head names a `target` dataset column. Read
+            # the RAW per-row values here (a list per row for reads="recon", a scalar for reads="hidden"); resolution
+            # to class maps / float tensors happens per-loss-kind in _train_multi. The phase shim reuses sup_labels,
+            # so it is NOT read here. [] = off (byte-identical). Reject on the single-latent path (heads are
+            # multi-latent only — the phase-head lineage they generalize lives only here).
+            self.head_cols: dict[str, list[object]] = {}
+            for h in getattr(args, "heads", []):
+                self.head_cols[h.name] = list(cols[inv.get(h.target, h.target)])
             # TEXT REPLAY tag (multi-latent): rows marked "learn" rehearse the backbone's plain next-token ability
             # (interleaved at `learn_ratio` in _train_multi). Must be set HERE — this branch returns before the
             # single-latent is_learn setup below. learn_field unset / learn_ratio=0 -> all-False (feature off).
@@ -1291,24 +1315,51 @@ class Trainer:
             m, a, tok, dev
         )  # target strategy (INJECTED), built ONCE
 
-        # PHASE HEAD (the non-collapsing alternative to SupCon): a transient linear classifier hidden->phase trained
-        # with CE on the emitted reconstruction. CE only needs a separating hyperplane, so it makes phase LINEARLY
-        # decodable WITHOUT pulling same-phase events together (SupCon's identity collapse). Grad flows into up/down_proj
-        # + LoRA, shaping the FSQ geometry to be phase-separable while retr_mrr (event identity) survives. Not persisted
-        # (its job is to inject phase gradient; eval re-fits its own probe on the now phase-informative emissions).
+        # PLUGGABLE AUXILIARY HEADS (langset.heads) — the generalization of the phase head. Each Head hangs a small
+        # supervised head off the model at a chosen READ SITE ("recon" = per emitted latent, like the phase head |
+        # "hidden" = pooled per-sequence backbone hidden) with a chosen LOSS ("ce"/"mse"/custom callable) and
+        # LIFECYCLE (transient shaping-gradient, or PERSISTED + queryable at inference). `lam_phase` is folded in as
+        # the `phase` SHIM (a transient recon+CE head over sup_labels), built FIRST so its nn.Linear draws RNG at the
+        # exact point the old inline phase head did -> lam_phase>0 is byte-identical (guarded by the multi-latent
+        # golden). User heads follow. Each RtHead owns its nn.Linear (trainer-owned, added to the optimizer below);
+        # a PERSISTED head is ALSO registered on the model (shared module) so save_pretrained serializes it and
+        # `head_output()` can query it at inference. phase_head/phase_ids stay None/{} for MultiStepCtx back-compat
+        # (PhaseTerm was dropped from the default loss terms; phase is applied inline like the other heads).
         phase_head: Optional[torch.nn.Module] = None
         phase_ids: dict[str, int] = {}
-        if self.sup_labels is not None and a.lam_phase > 0:
-            labs = sorted(
-                {
-                    lb
-                    for row2 in self.sup_labels
-                    for lb in row2
-                    if lb and lb.lower() not in ("unknown", "none", "nan", "")
-                }
+        _spec_values: list[tuple[Head, list[object]]] = []
+        if a.lam_phase > 0 and self.sup_labels is not None:
+            _spec_values.append(
+                (
+                    Head.phase_shim(cast(str, a.sup_field), a.lam_phase),
+                    cast("list[object]", self.sup_labels),
+                )
             )
-            phase_ids = {lb: i for i, lb in enumerate(labs)}
-            phase_head = torch.nn.Linear(d, len(phase_ids)).to(dev)
+        _spec_values.extend((h, self.head_cols[h.name]) for h in a.heads)
+        _names = [
+            spec.name for spec, _ in _spec_values
+        ]  # Head.name keys the log/agg entry, the checkpoint, and
+        _dups = sorted(
+            {n for n in _names if _names.count(n) > 1}
+        )  # the head_output lookup -> must be unique
+        if _dups:
+            raise ValueError(
+                f"duplicate Head name(s) {_dups}: each head name must be unique (it keys logging, the persisted "
+                f"checkpoint, and head_output). Note lam_phase reserves the name 'phase'."
+            )
+        rt_heads: list[RtHead] = [
+            resolve_head(spec, vals, d, int(m.h), dev) for spec, vals in _spec_values
+        ]
+        if a.grad_cache and any(h.spec.reads == "hidden" for h in rt_heads):
+            raise ValueError(
+                "grad_cache is incompatible with a reads='hidden' auxiliary head: it reads the seed's pooled "
+                "backbone hidden (a separate forward), not the cached recon. Use grad_cache=False."
+            )
+        for h in (
+            rt_heads
+        ):  # persisted heads: register on the model so they serialize + are queryable at inference
+            if not h.spec.transient:
+                m.add_aux_head(h.module, h.spec_dict())
         # CONTINUOUS EMB SLOTS (multi-latent port): one TRANSIENT decoder head per facet, each reading ONLY its reserved
         # dim slice of the row's emit. In the single-latent path the emit is one vector; here the model emits a
         # VARIABLE-LENGTH latent SET (em.recon [B, L, d] + valid [B, L]). DESIGN DECISION: to decode a PER-ROW facet
@@ -1345,10 +1396,16 @@ class Trainer:
                     flush=True,
                 )
         slot_params = [p for (_, _, _, _, h, _) in slot_plan for p in h.parameters()]
-        params = [p for p in m.parameters() if p.requires_grad]
-        if phase_head is not None:
-            params = params + list(phase_head.parameters())
-        opt = torch.optim.AdamW(params + slot_params, lr=a.lr)
+        params = [
+            p for p in m.parameters() if p.requires_grad
+        ]  # includes PERSISTED aux heads (registered above)
+        # TRANSIENT aux-head params are trainer-owned (not on the model), so add them explicitly — exactly as the old
+        # phase head did. Ordering (base+head, then transient heads, then slots) preserves the byte-identical default
+        # (phase-only: base+head, phase, slots) since param order doesn't affect AdamW's per-parameter update.
+        transient_head_params = [
+            p for h in rt_heads if h.spec.transient for p in h.module.parameters()
+        ]
+        opt = torch.optim.AdamW(params + transient_head_params + slot_params, lr=a.lr)
         run = None
         if a.report_to == "wandb":
             import wandb  # type: ignore[import-untyped]  # ty: ignore[unresolved-import]  # optional dep, not installed
@@ -1455,8 +1512,10 @@ class Trainer:
             for nm, t in ck["trainable"].items():
                 if nm in _params:
                     _params[nm].data.copy_(t.to(_params[nm].device, _params[nm].dtype))
-            if phase_head is not None and ck.get("phase_head") is not None:
-                phase_head.load_state_dict({k: v.to(dev) for k, v in ck["phase_head"].items()})
+            for h in rt_heads:  # PLUGGABLE AUX HEADS (langset.heads): restore phase shim + user heads for exact resume
+                hsd = ck.get("aux_heads", {}).get(h.spec.name)
+                if hsd is not None:
+                    h.module.load_state_dict({k: v.to(dev) for k, v in hsd.items()})
             for (
                 field,
                 _,
@@ -1510,9 +1569,10 @@ class Trainer:
                 "gen_rng": rng_t.get_state(),
                 "run_sig": a.run_sig,
             }
-            if phase_head is not None:
-                payload["phase_head"] = {
-                    k: v.detach().cpu() for k, v in phase_head.state_dict().items()
+            if rt_heads:  # PLUGGABLE AUX HEADS (langset.heads): phase shim + user heads (transient AND persisted)
+                payload["aux_heads"] = {
+                    h.spec.name: {k: v.detach().cpu() for k, v in h.module.state_dict().items()}
+                    for h in rt_heads
                 }
             if slot_plan:  # transient slot heads (only when emb_slots on)
                 payload["slot_heads"] = {
@@ -1679,6 +1739,16 @@ class Trainer:
                     _k, _raw, _w = contrib
                     cross = cross + _w * _raw
                     agg[_k] = agg.get(_k, 0.0) + float(_raw.detach())
+            for h in (
+                rt_heads
+            ):  # PLUGGABLE AUX HEADS (recon read site only; "hidden" is rejected under grad_cache).
+                # A recon head is a pure fn of the cached recon, so it belongs in the phase-1 cross accumulation.
+                raw_h = h.loss_on(
+                    h.module(recon_rg[valid]), h._flat_recon_targets(bidx, lens_l), dev
+                )
+                if raw_h is not None:
+                    cross = cross + h.spec.eff_weight(ep) * raw_h
+                    agg[h.spec.loss_key] = agg.get(h.spec.loss_key, 0.0) + float(raw_h.detach())
             if slot_plan:  # emb_slots facets: pure fn of the pooled recon
                 _vm = valid.unsqueeze(-1).to(recon_rg.dtype)
                 pooled = (recon_rg * _vm).sum(1) / _vm.sum(1).clamp(min=1.0)
@@ -1839,6 +1909,21 @@ class Trainer:
                         _k, _raw, _w = contrib
                         loss = loss + _w * _raw
                         agg[_k] = agg.get(_k, 0.0) + float(_raw.detach())
+                for h in rt_heads:  # PLUGGABLE AUX HEADS (langset.heads): phase shim + user heads. Applied HERE (right
+                    # after the loss terms, before sigreg) — the exact summation slot the old PhaseTerm held, so a
+                    # phase-only run is byte-identical. Each self-skips (loss_on -> None) when nothing supervises it.
+                    if (
+                        h.spec.reads == "recon"
+                    ):  # per emitted latent (grad shapes the FSQ geometry, like the phase head)
+                        pred = h.module(recon[valid])
+                        flat = h._flat_recon_targets(bidx, lens_l)
+                    else:  # "hidden": pooled per-sequence seed hidden — a separate backbone forward whose grad shapes it
+                        pred = h.module(m.seed_hidden(se["input_ids"], se["attention_mask"]))
+                        flat = [h.values[k] for k in bidx]
+                    raw = h.loss_on(pred, flat, dev)
+                    if raw is not None:
+                        loss = loss + h.spec.eff_weight(ep) * raw
+                        agg[h.spec.loss_key] = agg.get(h.spec.loss_key, 0.0) + float(raw.detach())
                 if (
                     target_source.wants_regularizer and int(valid.sum()) > 1
                 ):  # e.g. SIGReg anti-collapse penalty

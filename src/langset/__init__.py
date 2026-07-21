@@ -5,6 +5,7 @@ that holds a calibrated superposition of next states — or a single latent as a
 Sentence-Transformer-shaped and drops into SetFit as a `model_body`.
 """
 
+from langset.heads import Head
 from langset.masking import (
     FieldMasker,
     SpanMasker,
@@ -22,6 +23,7 @@ from langset.training_args import TrainingArguments
 __all__ = [
     "LangSetModel",
     "EmitHead",
+    "Head",
     "Trainer",
     "TrainingArguments",
     "calibration_corr",

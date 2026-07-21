@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from langset.heads import Head
 from langset.strategies import (
     EMATwinTarget,
     FSQObjective,
@@ -97,7 +98,21 @@ class TrainingArguments:
     # transient linear CE classifier (emitted recon -> phase) at weight `lam_phase`, instead of the contrastive pull.
     # CE only carves a separating hyperplane, so phase becomes linearly decodable WITHOUT collapsing within-phase
     # event identity (retr_mrr survives). lam_phase=0 = off. Use INSTEAD of lam_sup (set lam_sup=0).
+    # NOTE: `lam_phase` is now a SHIM over the generic `heads` plug below — it is reconstructed as
+    # `Head.phase_shim(sup_field, lam_phase)` (a transient recon+CE head). Kept as a first-class arg for
+    # backward compatibility; the training path with lam_phase>0 is byte-identical to before.
     lam_phase: float = 0.0
+
+    # PLUGGABLE AUXILIARY HEADS — the generalization of the phase head (see langset.heads.Head). Each Head hangs a
+    # small supervised head off the model that (a) injects a shaping gradient into the backbone/geometry and/or (b)
+    # is a queryable readout. It declares FOUR axes: read site ("recon" = per emitted latent, like the phase head |
+    # "hidden" = pooled per-sequence backbone hidden, for a value/time readout); target (a per-item dataset column);
+    # loss ("ce" | "mse" | a CUSTOM callable, e.g. a censored survival loss); and lifecycle (transient = not saved,
+    # shaping-gradient only like the phase head | PERSISTED = saved with the checkpoint AND queryable at inference
+    # via `LangSetModel.head_output(name, ...)`). Plus per-head `weight` (the lam) and `warmup` (ramp 0->weight over
+    # the first N epochs). MULTI-LATENT path only. [] = off (byte-identical). `lam_phase` is prepended as a phase
+    # shim when set. e.g. heads=[Head("value", reads="hidden", target="winprob", loss="mse", dim=1, transient=False)].
+    heads: list[Head] = field(default_factory=list)
 
     # FSQ LABEL SUBSPACE — a FORMAL label space inside the emitted code, with NO head per label. Map each facet to
     # reserved FSQ digit indices (each >=1; dim 0 is STOP-coupled). Those dims' reconstruction targets are REPLACED
