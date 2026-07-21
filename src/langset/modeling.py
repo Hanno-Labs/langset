@@ -734,7 +734,6 @@ class LangSetModel(nn.Module):
         sentences: Union[str, list[str]],
         batch_size: int = 32,
         reduce: str = "mean",
-        device: Optional[str] = None,
     ) -> Union[torch.Tensor, list[torch.Tensor]]:
         """Query a PERSISTED auxiliary head at inference — the readout that makes a value/time head useful.
         `reads="hidden"` heads read the pooled seed hidden -> one [out_dim] vector per sentence ([N, out_dim]).
@@ -744,8 +743,18 @@ class LangSetModel(nn.Module):
         logits (argmax -> `aux_head_specs[name]['classes']`)."""
         if name not in self.aux_heads:
             raise KeyError(f"no persisted head {name!r}; have {sorted(self.aux_heads)}")
+        if reduce not in (
+            "mean",
+            "none",
+        ):  # fail loud: a typo'd reduce must not silently pick the mean path
+            raise ValueError(f"head_output reduce must be 'mean' or 'none'; got {reduce!r}")
         module = cast(nn.Linear, self.aux_heads[name])
         reads = self.aux_head_specs[name]["reads"]
+        if reads not in (
+            "hidden",
+            "recon",
+        ):  # guard the read site rather than fall through to recon
+            raise ValueError(f"head {name!r} has an unexpected read site {reads!r}")
         single = isinstance(sentences, str)
         texts = [sentences] if single else list(sentences)
         was_training = self.training

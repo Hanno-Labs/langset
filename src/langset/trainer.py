@@ -1336,6 +1336,17 @@ class Trainer:
                 )
             )
         _spec_values.extend((h, self.head_cols[h.name]) for h in a.heads)
+        _names = [
+            spec.name for spec, _ in _spec_values
+        ]  # Head.name keys the log/agg entry, the checkpoint, and
+        _dups = sorted(
+            {n for n in _names if _names.count(n) > 1}
+        )  # the head_output lookup -> must be unique
+        if _dups:
+            raise ValueError(
+                f"duplicate Head name(s) {_dups}: each head name must be unique (it keys logging, the persisted "
+                f"checkpoint, and head_output). Note lam_phase reserves the name 'phase'."
+            )
         rt_heads: list[RtHead] = [
             resolve_head(spec, vals, d, int(m.h), dev) for spec, vals in _spec_values
         ]

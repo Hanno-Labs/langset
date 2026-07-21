@@ -15,6 +15,7 @@ import os
 import tempfile
 
 import numpy as np
+import pytest
 import torch
 
 from langset import Head, LangSetModel, Trainer, TrainingArguments
@@ -129,7 +130,7 @@ def test_phase_head_is_not_persisted() -> None:
 
 # --- (b) PERSISTED regression head (mse, reads=hidden): trains, saves, reloads, queryable --------------------
 def test_persisted_hidden_regression_head_roundtrips_and_reads() -> None:
-    """A persisted `Head(reads="hidden", loss="mse")` (the chess/hanno VALUE head shape) trains, serializes with
+    """A persisted `Head(reads="hidden", loss="mse")` (the value head shape) trains, serializes with
     the checkpoint, reloads, and `head_output` returns a per-sequence scalar that TRACKS the target."""
     value = Head(name="value", reads="hidden", target="value", loss="mse", dim=1, transient=False)
     model = _build_model()
@@ -198,7 +199,7 @@ def test_custom_callable_loss_runs() -> None:
     assert tuple(out.shape) == (9, 1)
 
 
-# --- custom loss with a MULTI-COLUMN per-item vector target: the Hanno TIME-head / survival seam --------------
+# --- custom loss with a MULTI-COLUMN per-item vector target: the time-to-event / survival seam ---------------
 def _censored(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Toy censored exponential-hazard NLL. REQUIRES a 2-column target — indexing target[:, 1] IndexErrors unless
     the trainer actually feeds the per-item VECTOR target through. dt=target[:,0], obs=target[:,1] (0=censored)."""
@@ -241,3 +242,52 @@ def test_custom_loss_vector_target_recon() -> None:
     dense = loaded.head_output("dt", [r["input_text"] for r in _dataset()], reduce="none")
     assert isinstance(dense, list) and len(dense) == 9
     assert all(t.dim() == 2 and t.size(1) == 1 for t in dense)  # [Li, 1] per row
+
+
+# --- fail-fast validation (Copilot review) ------------------------------------------------------------------
+def test_duplicate_head_names_raise() -> None:
+    """Head.name keys the log entry, the checkpoint, and the head_output lookup — two heads with the same name
+    would silently overwrite, so resolution must reject them."""
+    dup = [
+        Head(name="v", reads="hidden", target="value", loss="mse", dim=1, transient=False),
+        Head(name="v", reads="recon", target="dense", loss="mse", dim=1, transient=False),
+    ]
+    model = _build_model()
+    with (
+        tempfile.TemporaryDirectory() as td,
+        pytest.raises(ValueError, match="duplicate Head name"),
+    ):
+        Trainer(model, _args(td, heads=dup), _dataset()).train()
+
+
+def test_ce_head_empty_classes_raises() -> None:
+    """A CE head whose `target` labels are ALL missing yields a [N, 0] logit -> F.cross_entropy fails opaquely;
+    resolution must raise a clear error instead."""
+    rows = [
+        {"input_text": f"row {i}", "target_texts": ["a", "b"], "empty": ["", "unknown"]}
+        for i in range(6)
+    ]
+    head = Head(name="e", reads="recon", target="empty", loss="ce")
+    model = _build_model()
+    with tempfile.TemporaryDirectory() as td, pytest.raises(ValueError, match="no classes"):
+        Trainer(model, _args(td, sup_field=None, heads=[head]), rows).train()
+
+
+def test_ce_head_dim_mismatch_raises() -> None:
+    """A CE head's width IS its class count — a user-set `dim` that disagrees must be rejected up front, not crash
+    at loss time."""
+    head = Head(name="p", reads="recon", target="stage", loss="ce", dim=99)
+    model = _build_model()
+    with tempfile.TemporaryDirectory() as td, pytest.raises(ValueError, match="conflicts with"):
+        Trainer(model, _args(td, heads=[head]), _dataset()).train()
+
+
+def test_head_output_bad_reduce_raises() -> None:
+    """A typo'd `reduce` must fail loud, not silently take the mean path."""
+    head = Head(name="value", reads="recon", target="dense", loss="mse", dim=1, transient=False)
+    model = _build_model()
+    with tempfile.TemporaryDirectory() as td:
+        Trainer(model, _args(td, epochs=2, heads=[head]), _dataset()).train()
+        loaded = LangSetModel.load(td, device="cpu")
+    with pytest.raises(ValueError, match="reduce must be"):
+        loaded.head_output("value", [r["input_text"] for r in _dataset()], reduce="meann")

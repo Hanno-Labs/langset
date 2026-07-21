@@ -251,8 +251,20 @@ def resolve_head(
     if spec.is_ce:
         rows = [[str(e) for e in v] if isinstance(v, (list, tuple)) else [str(v)] for v in values]
         classes, class_map = build_ce_classes(rows)
-        if out_dim is None:
-            out_dim = len(classes)
+        n_cls = len(classes)
+        if n_cls == 0:  # else F.cross_entropy fails opaquely on a [N, 0] logit
+            raise ValueError(
+                f"CE head {spec.name!r} has no classes — all `target` labels are missing "
+                f"(empty/unknown/none/nan). Supply real class labels, or use a non-CE loss."
+            )
+        if (
+            spec.dim is not None and spec.dim != n_cls
+        ):  # a CE head's width IS the class count — don't let it drift
+            raise ValueError(
+                f"CE head {spec.name!r}: dim={spec.dim} conflicts with the {n_cls} inferred classes "
+                f"({classes}). Leave dim=None for a CE head — its width is inferred from the labels."
+            )
+        out_dim = n_cls  # CE width is always the inferred class count (phase shim keeps dim=None -> byte-identical)
     assert out_dim is not None  # __post_init__ guarantees dim is set for non-CE losses
     module = torch.nn.Linear(in_dim, out_dim).to(dev)
     return RtHead(spec, module, values, classes, class_map)
