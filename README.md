@@ -309,3 +309,39 @@ lat = F.normalize(m.rollout("Barack Obama visited Berlin to meet Angela Merkel."
 for v in lat:                                                        # one latent per entity, count set by a learned STOP
     print(bank[int((v @ zb.T).argmax())])                           # PER: Barack Obama / LOC: Berlin / PER: Angela Merkel
 ```
+
+## Big batches without the memory — GradCache
+
+The contrastive loss wants a **large batch** — every other row is an in-batch negative, and more negatives means
+a sharper geometry. But holding the whole batch's activation graph at once OOMs. **GradCache** ([Gao et al.
+2021](https://arxiv.org/abs/2101.06983)) gives you the *exact* large-batch gradient while peak activation stays
+at one small chunk: forward the full batch in `no_grad` sub-chunks (only the `[B, d]` embeddings survive), run
+the loss on the full set and cache each embedding's gradient, then re-forward each chunk *with* grad and inject
+the cached gradients. `batch_size` becomes the big effective batch; `gc_chunk` is the memory unit you tune to the
+card.
+
+```python
+# single-latent (embedding model): the whole contrastive loss is cached -> BIT-EXACT vs the direct big-batch step
+Trainer(model, TrainingArguments(
+    grad_cache=True, batch_size=1024, gc_chunk=32,   # 1024 in-batch negatives, activation = 32 rows
+    lam_recon=0,                                     # required: recon needs the per-token backbone graph, not the pooled embedding
+)).train()
+
+# multi-latent (world model): the cross-batch InfoNCE is cached exact; scheduled sampling is preserved
+Trainer(model, TrainingArguments(
+    grad_cache=True, batch_size=512, gc_chunk=16,
+    ss_prob=0.25,                                    # kept — a SHARED self-feed mask makes the rollout replay identically across phases
+)).train()
+```
+
+Requirements and what stays exact:
+
+| | single-latent | multi-latent |
+|---|---|---|
+| requires | `dropout=0`, `lam_recon=0` | `dropout=0`, EMA twin (not `SIGRegTarget`) |
+| scheduled sampling (`ss_prob>0`) | n/a | **supported** — the coin flips are sampled once and shared across both phases |
+| exactness | **bit-exact** (the whole loss is cached) | cross-batch **InfoNCE exact**; the per-row base loss (stop/dims/recon) is accumulated per chunk (a small `gc_chunk`-dependent reweighting, negligible in practice) |
+
+`gc_chunk=0` (default) or `grad_cache=False` leaves training byte-identical. GradCache is only defined for the
+contrastive path, so `SIGRegTarget` (a cross-batch regularizer) and the FSQ label subspace (which reads the
+rollout logits, not the cached latent) are rejected with a clear error when `grad_cache=True`.
