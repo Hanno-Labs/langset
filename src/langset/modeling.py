@@ -18,7 +18,7 @@ from torch import nn
 
 if TYPE_CHECKING:  # type-only: no runtime import cost, and the optional-dep types stay import-safe
     from sentence_transformers import SentenceTransformer
-    from transformers import PretrainedConfig, PreTrainedTokenizerBase
+    from transformers import Cache, PretrainedConfig, PreTrainedTokenizerBase
     from ty_extensions import (
         Unknown,
     )  # ty's gradual type — for genuine passthrough boundaries (not typing.Any)
@@ -590,12 +590,21 @@ class LangSetModel(nn.Module):
         attention_mask: torch.Tensor,
         real_ids: Optional[torch.Tensor] = None,
         real_start: int = 0,
+        past_key_values: Optional["Cache"] = None,
+        use_cache: bool = False,
     ) -> _HiddenOutput:
         """Backbone forward that stays correct on Per-Layer-Embedding models (Gemma E-series). For PLE models we
         build `per_layer_inputs` ourselves: the real-token span [real_start : real_start+len] gets its true
         token-ID lookup; synthetic positions (emit query / fed-back latents / recon soft tokens) get zeros, so
         their per-layer contribution is projection-only and the crashing embed->ID reverse lookup never runs.
-        A no-op for non-PLE backbones (identical to a plain inputs_embeds forward)."""
+        A no-op for non-PLE backbones (identical to a plain inputs_embeds forward).
+
+        `use_cache`/`past_key_values` drive the TRAINING-TIME KV cache used by the multi-latent rollout: the
+        prompt is forwarded once, then each latent token is forwarded alone against the cached prefix K/V. The
+        cache tensors are NOT detached, so gradients flow back through them to the backbone params exactly as in
+        a full-sequence forward (verified: single-token cached hiddens match the full forward to ~1e-5). The
+        `attention_mask` passed here covers the FULL length (prefix history + current token) so RoPE positions
+        stay correct under left-padding; HF derives cache_position from the past length."""
         kw: dict[str, Any] = {}
         if self._ple_dim:
             b, s = inputs_embeds.shape[:2]
@@ -608,6 +617,10 @@ class LangSetModel(nn.Module):
                 real = cast("Unknown", bb).get_per_layer_inputs(real_ids, None).to(ple.dtype)
                 ple[:, real_start : real_start + real_ids.size(1)] = real
             kw["per_layer_inputs"] = ple
+        if use_cache:  # per-call override of the config's use_cache=False (KV-cache rollout only)
+            kw["use_cache"] = True
+            if past_key_values is not None:
+                kw["past_key_values"] = past_key_values
         return self.backbone(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -1032,6 +1045,7 @@ class LangSetModel(nn.Module):
         ss_prob: float = 0.0,
         ss_sample: bool = False,
         ss_mask: Optional[torch.Tensor] = None,
+        kv_cache: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Token-native AR pass (multi-latent, FSQ). Quantizes the TRUE target latents to per-dim digits and predicts
         the digits at each of L+1 positions (targets 0..L-1 then a STOP at position L). Returns (dim_logits
@@ -1074,6 +1088,63 @@ class LangSetModel(nn.Module):
         H = n if train_hops is None else max(0, min(int(train_hops), n))
         dev = recon.device
         Lv = self.head.fsq_levels
+        if (
+            kv_cache
+        ):  # KV-CACHE rollout: forward the prompt ONCE, then each latent token ALONE against the
+            # cached prefix K/V. Numerically identical to the recompute loop below given the same ss decisions
+            # (cached single-token hiddens match a full forward to ~1e-5), but activation memory is ~1 prompt
+            # forward + n single tokens instead of n full-prefix forwards — it kills the O(ticks) blowup that
+            # forces grad_ckpt, so this path trains WITHOUT checkpointing. PLE (Gemma-E) unsupported: its
+            # per_layer_inputs would need the cached span; the maze/SmolLM backbones are non-PLE.
+            assert not self._ple_dim, "kv_cache rollout does not support PLE (Gemma-E) backbones"
+            # HF force-disables use_cache under gradient checkpointing, which would silently null the cache and
+            # feed each latent token with NO history. kv_cache REPLACES grad_ckpt (it removes the O(ticks) blowup
+            # that grad_ckpt was paying for), so the two are mutually exclusive — fail loudly, don't degrade.
+            assert not getattr(self.backbone, "is_gradient_checkpointing", False), (
+                "kv_cache rollout is incompatible with gradient checkpointing (HF disables the cache under it); "
+                "kv_cache replaces grad_ckpt — turn grad_ckpt OFF"
+            )
+
+            def _feed(
+                dl_h: torch.Tensor, t: int
+            ) -> torch.Tensor:  # the latent to advance tick t -> t+1
+                if ss_sample:
+                    pred_dig = torch.multinomial(
+                        torch.softmax(dl_h.float(), -1).reshape(-1, Lv), 1
+                    ).reshape(bsz, -1)
+                else:
+                    pred_dig = dl_h.argmax(-1)  # [B, fsq_dim] (own emission, never STOP)
+                recon_pred = self.head.reconstruct(pred_dig).detach()
+                if t < H:  # self-feed region: own emission or ground truth by the ss decision
+                    if (
+                        ss_mask is not None
+                    ):  # shared per-(row,hop) replay (deterministic; matches non-cached)
+                        use_own = ss_mask[:, t].to(device=dev, dtype=torch.bool).unsqueeze(1)
+                    else:
+                        use_own = (torch.rand(bsz, device=dev) < ss_prob).unsqueeze(1)
+                    return torch.where(use_own, recon_pred, recon[:, t].detach())
+                return recon[:, t].detach()  # teacher-forced region: always the true latent
+
+            seq0 = self.embed(input_ids)
+            out = self._run_backbone(seq0, attention_mask, input_ids, 0, use_cache=True)
+            pkv = getattr(out, "past_key_values", None)
+            hid = self._last_hidden(out)[:, -1]  # last real prompt token -> emits tick 0
+            cur_am = attention_mask
+            dim_parts = []
+            stop_parts = []
+            for t in range(n):  # emit tick t, then feed one latent to advance to tick t+1
+                dl, sl = self.head.emit_logits(hid)
+                dim_parts.append(dl.unsqueeze(1))
+                stop_parts.append(sl.unsqueeze(1))
+                fb = self.head.feedback(_feed(dl, t).to(seq0.dtype)).unsqueeze(1)  # [B, 1, h]
+                cur_am = torch.cat([cur_am, cur_am.new_ones(bsz, 1)], 1)
+                out = self._run_backbone(fb, cur_am, None, 0, past_key_values=pkv, use_cache=True)
+                pkv = getattr(out, "past_key_values", None)
+                hid = self._last_hidden(out)[:, -1]
+            dl, sl = self.head.emit_logits(hid)  # tick n = the STOP position
+            dim_parts.append(dl.unsqueeze(1))
+            stop_parts.append(sl.unsqueeze(1))
+            return torch.cat(dim_parts, 1), torch.cat(stop_parts, 1), digits, recon
         seq = self.embed(input_ids)
         am = attention_mask
         dim_parts: list[torch.Tensor] = []

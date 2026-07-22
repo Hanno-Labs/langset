@@ -151,6 +151,12 @@ class TrainingArguments:
     train_hops: Optional[int] = None
     ss_prob: Optional[float] = None
     ss_sample: bool = False
+    # KV-CACHE rollout (multi-latent): forward the prompt ONCE, then each latent token alone against the cached
+    # prefix K/V, instead of re-running the whole growing sequence every tick. Numerically identical (verified to
+    # ~1e-7 in test_kv_cache), but activation memory is ~1 prompt forward + n single tokens rather than n
+    # full-prefix forwards — it removes the O(ticks) blowup that forces grad_ckpt. Use it INSTEAD of grad_ckpt
+    # (mutually exclusive: HF disables the cache under gradient checkpointing). Non-PLE backbones only.
+    kv_cache: bool = False
     # scheduled-sampling WARMUP: linearly ramp the effective ss_prob 0 -> ss_prob over the first `ss_warmup` epochs.
     # 0 = constant ss_prob (no warmup). REQUIRED for deep train_hops (feeding own predictions for many hops from
     # epoch 0, when they're garbage, destabilizes training — the phase head sticks at chance). Ramp lets the model

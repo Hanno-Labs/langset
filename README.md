@@ -345,3 +345,30 @@ Requirements and what stays exact:
 `gc_chunk=0` (default) or `grad_cache=False` leaves training byte-identical. GradCache is only defined for the
 contrastive path, so `SIGRegTarget` (a cross-batch regularizer) and the FSQ label subspace (which reads the
 rollout logits, not the cached latent) are rejected with a clear error when `grad_cache=True`.
+
+## Long rollouts without the memory — KV cache
+
+The multi-latent world model rolls out **autoregressively at train time**: it emits one latent per tick and feeds
+each back to condition the next, so a rollout of `T` ticks runs the backbone `T` times over the *growing*
+sequence. With no cache that re-encodes the shared prompt every tick, and because every tick carries its own
+emission loss, autograd keeps **all `T` full-sequence forwards alive at once** — activation memory scales with
+`ticks`, which forces gradient checkpointing (and its recompute tax) on any long-rollout corpus.
+
+`kv_cache=True` forwards the prompt **once**, then feeds each latent token alone against the cached prefix K/V
+(one new position per tick). Peak activation becomes ~one prompt forward plus `T` single tokens instead of `T`
+full-prefix forwards, so long rollouts train **without checkpointing**.
+
+```python
+# world model on a long-rollout corpus: no grad_ckpt needed
+Trainer(model, TrainingArguments(
+    kv_cache=True,        # prompt forwarded once, single-token hops vs full-prefix recompute
+    ss_prob=0.25,         # scheduled sampling preserved (same self-feed decisions as the recompute path)
+)).train()
+```
+
+The cache is **not** detached, so gradients flow through it to the backbone exactly as in a full-sequence
+forward — the emitted logits are numerically identical to the recompute rollout (verified to ~1e-7,
+`tests/test_kv_cache.py`), under both teacher forcing and self-feed. `kv_cache=False` (default) leaves training
+byte-identical. Two constraints: it is **mutually exclusive with gradient checkpointing** (HF disables the cache
+under checkpointing — use one or the other), and it targets standard (non-PLE) backbones. Both are checked with a
+clear error.

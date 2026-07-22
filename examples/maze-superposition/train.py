@@ -54,6 +54,12 @@ def main() -> None:
     p.add_argument("--max-fut", type=int, default=32, help="cap on emitted latents (ticks) per maze")
     p.add_argument("--fsq-dim", type=int, default=256)
     p.add_argument("--fsq-levels", type=int, default=8)
+    p.add_argument("--kv-cache", action="store_true",
+                   help="KV-CACHE the multi-latent rollout: forward the prompt ONCE, then feed each latent token "
+                        "alone against the cached prefix K/V instead of re-running the whole growing sequence every "
+                        "tick. Numerically identical (~1e-7), but activation memory is ~1 prompt forward + n single "
+                        "tokens instead of n full-prefix forwards, removing the O(ticks) blowup. Trains long-rollout "
+                        "corpora without gradient checkpointing.")
     p.add_argument("--sigreg", action="store_true", help="EMA-free anti-collapse (LeJEPA) instead of the EMA twin")
     p.add_argument("--sigreg-lambda", type=float, default=0.3)
     p.add_argument("--random-init", action="store_true",
@@ -99,7 +105,7 @@ def main() -> None:
         epochs=a.epochs, batch_size=a.bs, lr=a.lr, max_len=a.max_len,
         max_target_items=a.max_fut, val_frac=0.1,
         selector=last_epoch_selector,        # superposition: keep the last epoch (retr_mrr is meant to fall)
-        output_dir=a.out,
+        output_dir=a.out, kv_cache=a.kv_cache,
         report_to="wandb" if a.wandb else None, wandb_project=a.wandb_project)
     if a.sigreg:                             # optional: EMA-free isotropic-Gaussian anti-collapse (see langset/sigreg.py)
         opts.update(target_source=SIGRegTarget, sigreg_lambda=a.sigreg_lambda)
