@@ -441,6 +441,7 @@ class FSQObjective(_EmissionObjective):
             ss_prob=eff_ss,
             ss_sample=a.ss_sample,
             ss_mask=ss_mask,  # GradCache: shared per-(row,hop) self-feed decisions (deterministic replay)
+            kv_cache=a.kv_cache,  # forward prompt once + single-token hops vs full-prefix recompute (no grad_ckpt)
         )
         dim0 = torch.cat([dim_lg[:, :, 0, :], stop_lg], -1)  # [b, lmax+1, L+1] — digit-0 + STOP
         lab0 = torch.full((b, lmax + 1), -100, dtype=torch.long, device=dev)
