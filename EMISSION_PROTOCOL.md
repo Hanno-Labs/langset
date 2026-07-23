@@ -4,9 +4,12 @@ Goal: widen langset's seams so a **non-autoregressive, continuous, parallel-quer
 Perceiver-style "query-bridge" over a frozen encoder) can be plugged in as a strategy — and *instantly* inherit
 GradCache, kv_cache, the trainer, checkpoint selection, and the `_TargetSource` / `_LossTerm` seams.
 
-**This doc defines the protocol and the port plan. It does NOT port the bridge.** The bridge stays a separate
-proof (`~/dev/ii3/packages/fin-exp01-mteb/privcap/train/bridge_lightning.py`, validated: retrieval-preserving
-multi-latent, beats single-vector on entity×time). This is the abstraction that would let it live in langset.
+**This doc defines the protocol and the longer-term port plan.** The concrete first cut ships alongside it in this
+PR: `src/langset/bridge_emission.py` (`QueryBridgeEmission` + `FrozenEncoderTarget`) is the bridge, ported against
+the *existing* `_EmissionObjective` seam. It originated as a separate proof
+(`~/dev/ii3/packages/fin-exp01-mteb/privcap/train/bridge_lightning.py`, validated: retrieval-preserving
+multi-latent, beats single-vector on entity×time). This document describes the cleaner interface the seam should
+grow into next (below), so future families need even less glue than this first port did.
 
 ## Current emission architecture (as of 0.13.1 — `origin/main` `ca28ec2`)
 

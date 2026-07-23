@@ -1,9 +1,11 @@
 """The generalized emission-strategy protocol — the abstraction target for EMISSION_PROTOCOL.md.
 
-This file is a SPEC, not a wiring change. It defines the interface a non-autoregressive, continuous,
-parallel-query emission family (a DETR/Perceiver "query-bridge" over a frozen encoder) would implement so it
-slots into the multi-latent trainer and inherits GradCache / kv_cache / `_TargetSource` / `_LossTerm` /
-checkpoint selection for free — WITHOUT porting the bridge and WITHOUT rewiring the trainer yet.
+This file is a SPEC (the fuller, typed interface we are converging toward), separate from the concrete wiring in
+this PR. It describes the interface a non-autoregressive, continuous, parallel-query emission family (a
+DETR/Perceiver "query-bridge" over a frozen encoder) implements so it slots into the multi-latent trainer and
+inherits GradCache / kv_cache / `_TargetSource` / `_LossTerm` / checkpoint selection for free. The first such
+family, `QueryBridgeEmission` (bridge_emission.py), already ships in this PR against the EXISTING
+`_EmissionObjective` seam (strategies.py); this spec captures the cleaner interface the seam should grow into next.
 
 It generalizes today's `_EmissionObjective` (strategies.py:355) by moving three AR-FSQ assumptions out of the
 interface:

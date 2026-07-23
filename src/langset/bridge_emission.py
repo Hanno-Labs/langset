@@ -105,9 +105,13 @@ class QueryBridgeEmission(_EmissionObjective):
         trainer: "Trainer",
     ) -> None:
         super().__init__(model, args, dev, trainer)
-        from scipy.optimize import (
-            linear_sum_assignment,  # local: optional dep, only this family needs it
-        )
+        try:  # SciPy is an optional dep — only this emission family needs it (Hungarian matching)
+            from scipy.optimize import linear_sum_assignment
+        except ModuleNotFoundError as e:  # pragma: no cover - trivial guard
+            raise ModuleNotFoundError(
+                "QueryBridgeEmission needs SciPy for DETR Hungarian matching. Install it with "
+                "`pip install scipy` (or `pip install langset[bridge]`)."
+            ) from e
 
         self._match = linear_sum_assignment
         d = int(model.h)
@@ -172,14 +176,18 @@ class QueryBridgeEmission(_EmissionObjective):
         vlab = torch.zeros_like(vlog)
         matched_pred: list[torch.Tensor] = []
         pos: list[int] = []
+        nq = vecs.size(1)  # number of query slots = MAX matchable emissions per row
+        # ONE device sync for the whole batch: query×target cosine, then Hungarian per row on CPU (SciPy is CPU-only).
+        sims = torch.bmm(vecs, tgt.transpose(1, 2)).detach().float().cpu().numpy()  # [B, nq, lmax]
         off = 0
         for r in range(b):
             mi = lens_l[r]
             if mi == 0:
                 continue
-            t_i = tgt[r, :mi]  # [mi, d]
-            cost = -(vecs[r] @ t_i.T).detach().float().cpu().numpy()  # [nq, mi]
-            pr, tc = self._match(cost)  # mi matches (nq >= mi)
+            mi_eff = min(
+                mi, nq
+            )  # guard: SciPy returns min(nq, mi) pairs — extra targets stay in the bank as negs
+            pr, tc = self._match(-sims[r, :, :mi_eff])  # cost = -cos over [nq, mi_eff]
             for p, c in zip(pr, tc):
                 recon[r, c] = vecs[
                     r, p
@@ -220,7 +228,7 @@ class QueryBridgeEmission(_EmissionObjective):
             texts,
             padding=True,
             truncation=True,
-            max_length=m.max_len,
+            max_length=self.a.max_len,  # honor the run's TrainingArguments.max_len (== training truncation)
             padding_side="left",
             return_tensors="pt",
         ).to(dev)
