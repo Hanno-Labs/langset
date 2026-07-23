@@ -11,6 +11,11 @@ Inject with `TrainingArguments(emission=QueryBridgeEmission, freeze_backbone=Tru
 `_TargetSource` and set `lam_multi_nce=0` (its base loss already does the contrastive term). `n_queries` (default
 16) is read off args via getattr — no TrainingArguments change required.
 
+HARD NEGATIVES: set `hard_neg_field="<col>"` (a per-row list of confusable texts, e.g. adjacent-quarter queries) and
+the family folds them into its OWN InfoNCE denominator — one softmax over [in-batch targets ++ hard-negs], the exact
+mechanism that lets the emitted vector separate same-entity/wrong-time near-misses. Keep `lam_hard_neg=0` so langset's
+separate HardNegTerm does not double-count. Absent `hard_neg_field`, the bank is plain in-batch (byte-identical).
+
 Retrieval is preserved BY CONSTRUCTION: the backbone is frozen, so the base embedder's geometry is untouched;
 the bridge is a pure add-on. `emit_infer`/eval delegation (so `model.rollout()` uses one pass instead of the AR
 rollout) is the remaining follow-up — see EMISSION_PROTOCOL.md.
@@ -67,7 +72,7 @@ def _heads_for(d: int) -> int:
 class QueryBridge(nn.Module):
     """N learned queries cross-attend the frozen substrate -> N L2-normalized vectors + per-query validity logit."""
 
-    def __init__(self, d: int, n_queries: int, n_layers: int = 2):
+    def __init__(self, d: int, n_queries: int, n_layers: int = 2) -> None:
         super().__init__()
         self.queries = nn.Parameter(torch.randn(n_queries, d) * 0.02)
         layer = nn.TransformerDecoderLayer(d, _heads_for(d), 4 * d, batch_first=True, dropout=0.0)
@@ -90,7 +95,9 @@ class QueryBridgeEmission(_EmissionObjective):
         self, model: "LangSetModel", args: "TrainingArguments", dev: torch.device, trainer: "Trainer"
     ) -> None:
         super().__init__(model, args, dev, trainer)
-        from scipy.optimize import linear_sum_assignment  # local: optional dep, only this family needs it
+        from scipy.optimize import (
+            linear_sum_assignment,  # local: optional dep, only this family needs it
+        )
 
         self._match = linear_sum_assignment
         d = int(model.h)
@@ -109,6 +116,14 @@ class QueryBridgeEmission(_EmissionObjective):
 
     def parameters(self) -> Iterable[nn.Parameter]:
         return self.bridge.parameters()
+
+    def _hard_negs(self, bidx: list[int]) -> list[str]:
+        """Flatten this batch's per-row hard-negative texts (from the trainer's `hard_neg_field` column) into one
+        pooled list. Empty when no `hard_neg_field` is configured (or a serve-time attach without a trainer)."""
+        hn = getattr(self.trainer, "hard_neg_texts", None)
+        if not hn:
+            return []
+        return [t for k in bidx for t in hn[k] if t and t.strip()]
 
     def emit(
         self,
@@ -130,7 +145,15 @@ class QueryBridgeEmission(_EmissionObjective):
         vecs, vlog = self.bridge(substrate, mask.bool())  # [B, nq, d], [B, nq]
 
         tgt = F.normalize(target_lat.float(), dim=-1)  # [B, lmax, d]
-        bank = tgt[valid]  # [Ntot, d] — cross-row InfoNCE negatives
+        bank = tgt[valid]  # [Ntot, d] — cross-row (in-batch) InfoNCE negatives; positives index into THIS prefix
+        # HARD-NEG bank: adjacent-quarter (same-entity / wrong-time) confusables from `hard_neg_field`, encoded in the
+        # SAME (query) space as the targets and folded into the SAME InfoNCE denominator — the mechanism the standalone
+        # used to beat entity×time. Absent hard_neg_field -> no-op, byte-identical to the plain in-batch bank.
+        hn_texts = self._hard_negs(bidx)
+        if hn_texts:
+            with torch.no_grad():
+                hn = self.m.encode(hn_texts, convert_to_numpy=False, normalize_embeddings=True)
+            bank = torch.cat([bank, hn.to(dev).float()], dim=0)  # [Ntot + Nhn, d]
         recon = torch.zeros(b, lmax, d, device=dev)
         vlab = torch.zeros_like(vlog)
         matched_pred: list[torch.Tensor] = []

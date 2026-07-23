@@ -65,6 +65,40 @@ def test_query_bridge_emission_trains_with_frozen_backbone() -> None:
     assert not any(pp.requires_grad for pp in trained.backbone.parameters()), "backbone should be frozen"
 
 
+def _rows_with_hard_negs() -> list[dict]:
+    """Same rows, plus a per-row `hard_neg` column of same-topic/wrong-stage confusables."""
+    topics = ["late payment", "theft", "property tax"]
+    wrong = ["appeal", "dismissal", "settlement"]
+    rows = _rows()
+    for i, r in enumerate(rows):
+        r["hard_neg"] = [f"{w}: the {topics[i % 3]} matter at the {w} stage" for w in wrong]
+    return rows
+
+
+def test_query_bridge_emission_folds_hard_negatives_into_the_bank() -> None:
+    """With `hard_neg_field` set, the family trains end-to-end (its InfoNCE bank now includes the pooled hard-negs).
+    Without the column the path is a no-op — this asserts the wired-up case runs and produces finite params."""
+    torch.manual_seed(0)
+    model = LangSetModel.from_pretrained(
+        TINY_MODEL, bf16=False, device="cpu", multi_latent=True, freeze_backbone=True
+    )
+    with tempfile.TemporaryDirectory() as out:
+        args = TrainingArguments(
+            epochs=3, batch_size=4, lr=1e-2, max_len=64, report_to=None, verbose=False,
+            eval_every=1, patience=99, val_frac=0.25, select="retr_mrr", seed=0,
+            emission=QueryBridgeEmission, target_source=FrozenEncoderTarget,
+            lam_multi_nce=0.0, lam_hard_neg=0.0,   # bridge consumes hard_neg_field IN-BANK; separate term stays off
+            hard_neg_field="hard_neg",             # <-- pooled adjacent-confusables folded into the bridge's InfoNCE
+            output_dir=out,
+        )
+        trained = Trainer(model, args, _rows_with_hard_negs()).train()
+
+    qb = trained.emission_bridge
+    p = next(qb.parameters())
+    assert torch.isfinite(p).all()
+    assert any(pp.requires_grad for pp in qb.parameters())
+
+
 def test_query_bridge_emission_persists_and_reattaches() -> None:
     """save_pretrained serializes the bridge; load stashes it; re-attaching the strategy restores the weights."""
     torch.manual_seed(0)
