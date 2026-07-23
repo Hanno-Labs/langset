@@ -310,6 +310,58 @@ for v in lat:                                                        # one laten
     print(bank[int((v @ zb.T).argmax())])                           # PER: Barack Obama / LOC: Berlin / PER: Angela Merkel
 ```
 
+### Retrieval-preserving multi-vector — `emission=QueryBridgeEmission`
+
+The default emission is **FSQ**: discrete digits, emitted **autoregressively** (each latent conditioned on the
+last), an **ordered** sequence. When the output is instead an **unordered set of items in a real vector space** —
+a document's facts, a passage's claims, the entities in a sentence — inject `emission=QueryBridgeEmission` for the
+**parallel-query** family: `N` learned query tokens cross-attend the backbone's per-token states in **one forward
+pass** and emit an unordered set of **L2-normalized vectors**, each with a **validity gate** that decides how many
+are real (`≤ N`). No autoregression, no digit softmax — continuous vectors, one shot.
+
+Pair it with a **frozen backbone** and the frozen `FrozenEncoderTarget`, and it becomes a pure add-on to an
+existing embedding model — the emitted vectors are trained to match the *encoder's own* embedding of each target
+text (DETR-style set-matching), so they live in the same space the base model already retrieves in:
+
+```python
+from langset import LangSetModel, Trainer, TrainingArguments
+from langset.bridge_emission import QueryBridgeEmission, FrozenEncoderTarget
+
+# each row: a passage -> the SET of facts it states (as text). target_texts defines the set; the bridge learns
+# to emit one vector per fact, each matched to the frozen encoder's embedding of that fact.
+rows = [{"input_text": "The X200 ships in slate and sand, weighs 1.2 kg, and runs 14 hours on a charge.",
+         "target_texts": ["available in slate and sand", "weighs 1.2 kg", "14-hour battery life"]},
+        # ...one row per passage; target_texts = the facts to surface
+       ]
+model = LangSetModel.from_pretrained("Qwen/Qwen3-Embedding-0.6B", multi_latent=True, freeze_backbone=True)
+Trainer(model, TrainingArguments(
+    emission=QueryBridgeEmission,        # one-pass parallel-query set-emitter (vs the default FSQ rollout)
+    target_source=FrozenEncoderTarget,   # targets = the frozen encoder's own embedding of each fact
+    lam_multi_nce=0.0,                   # the bridge's base loss already runs the per-fact contrastive term
+    n_queries=16,                        # max facts per input; the validity gate picks the actual count
+), rows).train()
+# at inference the model emits a validity-gated set in one pass — one unit vector per fact, count decided by the gate.
+```
+
+**Why reach for it:**
+
+* 🔒 **Retrieval preserved by construction.** With `freeze_backbone=True` the base embedder's single-vector
+  geometry is *untouched* — the bridge is a pure add-on, so `model.encode()` and its cosine behavior stay exactly
+  the base model's. You bolt a multi-vector head onto an existing retriever without disturbing it.
+* 🧷 **A set, in the same space, cosine-ready.** Every emitted vector is a normal unit vector in the encoder's
+  space, so a query can retrieve the **specific** fact instead of a blurred whole-document average — and the set
+  drops straight into any cosine ANN / multi-vector index (ColBERT-style late interaction), no new primitive.
+* ⚡ **One pass, unordered.** Unlike the autoregressive FSQ rollout, all items emit together — cheaper at
+  inference and the natural shape when order is meaningless.
+* 🎯 **Hard negatives fold in.** Set `hard_neg_field="..."` (a per-row list of confusable near-misses — e.g. a
+  fact that differs from the real one in a single attribute) and they join the emitter's **own** contrastive
+  denominator, so each vector learns to separate the look-alikes a single averaged vector blurs together.
+
+Reach for FSQ (the default) when the emission is an **ordered rollout** whose steps condition each other — a world
+model. Reach for `QueryBridgeEmission` when it's an **unordered set of vectors in an existing embedding space** —
+multi-vector retrieval or multi-item extraction where the base retriever's geometry must stay intact. Injected via
+`emission=` / `target_source=`; with no `emission` set the default FSQ path is byte-identical.
+
 ## Big batches without the memory — GradCache
 
 The contrastive loss wants a **large batch** — every other row is an in-batch negative, and more negatives means

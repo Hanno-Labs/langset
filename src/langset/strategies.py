@@ -391,6 +391,41 @@ class _EmissionObjective:
         """
         raise NotImplementedError
 
+    def build_targets(
+        self,
+        ent_lists: list[list[str]],
+        flat_tgt: torch.Tensor,
+        d: int,
+        dev: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int], int]:
+        """Shape the per-row target item lists + their encoded latents into the emission's teacher-forcing tensors
+        `(target_lat [B,L,d], valid [B,L], lens_l, lmax)`. EXTRACTED verbatim from the trainer's inline block so the
+        STRATEGY owns target↔slot shaping: the AR/FSQ default is positional teacher forcing (item i -> slot i); a
+        future matching family (DETR/parallel-query) overrides this (e.g. all-valid, assignment deferred to its own
+        Hungarian match inside emit()). Pure tensor assembly — no model forward."""
+        lmax = max(len(x) for x in ent_lists)
+        b = len(ent_lists)
+        target_lat = torch.zeros(b, lmax, d, device=dev)
+        valid = torch.zeros(b, lmax, dtype=torch.bool, device=dev)
+        lens_l: list[int] = []
+        k = 0
+        for r, lst in enumerate(ent_lists):
+            nl = len(lst)
+            lens_l.append(nl)
+            target_lat[r, :nl] = flat_tgt[k : k + nl]
+            valid[r, :nl] = True
+            k += nl
+        return target_lat, valid, lens_l, lmax
+
+    def emit_infer(self, texts: list[str], max_steps: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Inference emission: texts -> (lat [B, Lmax, d], lens [B]), zero-padding halted rows. The eval and
+        `model.rollout` route through here so a non-AR family (parallel-query) can emit in one pass. Default
+        delegates to the model's autoregressive rollout (FSQ)."""
+        lat, lens = self.m.rollout(  # ty: ignore[invalid-assignment]  # return_lengths=True -> (lat, lens)
+            texts, max_steps=max_steps, return_lengths=True
+        )
+        return lat, lens
+
     def z_for_reg(
         self, em: EmissionOut, target_lat: torch.Tensor, valid: torch.Tensor, lmax: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
