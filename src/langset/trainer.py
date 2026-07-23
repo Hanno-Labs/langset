@@ -1398,7 +1398,9 @@ class Trainer:
         # Build the emission strategy BEFORE the optimizer: a strategy may register its OWN trainable module on the
         # model (e.g. a parallel-query bridge over a frozen backbone), and `params` below must then capture it via
         # `m.parameters()`. FSQ registers nothing extra, so this is byte-identical for the default path.
-        objective: _EmissionObjective = a.emission(m, a, dev, self)  # emission strategy (INJECTED), built ONCE
+        objective: _EmissionObjective = a.emission(
+            m, a, dev, self
+        )  # emission strategy (INJECTED), built ONCE
         slot_params = [p for (_, _, _, _, h, _) in slot_plan for p in h.parameters()]
         params = [
             p for p in m.parameters() if p.requires_grad
@@ -1851,7 +1853,9 @@ class Trainer:
                     flat_tgt = target_source.encode(flat_texts)  # [ΣL, d] stop-grad EMA targets
                 b = len(bidx)
                 # target↔slot shaping now owned by the emission strategy (was inline here) — see EMISSION_PROTOCOL.md
-                target_lat, valid, lens_l, lmax = objective.build_targets(ent_lists, flat_tgt, d, dev)
+                target_lat, valid, lens_l, lmax = objective.build_targets(
+                    ent_lists, flat_tgt, d, dev
+                )
                 if (
                     a.grad_cache
                 ):  # two-phase: cross-batch InfoNCE cached exact, base loss accumulated per chunk

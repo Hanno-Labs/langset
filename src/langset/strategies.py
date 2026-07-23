@@ -417,13 +417,13 @@ class _EmissionObjective:
             k += nl
         return target_lat, valid, lens_l, lmax
 
-    def emit_infer(
-        self, texts: list[str], max_steps: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def emit_infer(self, texts: list[str], max_steps: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Inference emission: texts -> (lat [B, Lmax, d], lens [B]), zero-padding halted rows. The eval and
         `model.rollout` route through here so a non-AR family (parallel-query) can emit in one pass. Default
         delegates to the model's autoregressive rollout (FSQ)."""
-        lat, lens = self.m.rollout(texts, max_steps=max_steps, return_lengths=True)  # type: ignore[misc]
+        lat, lens = self.m.rollout(  # ty: ignore[invalid-assignment]  # return_lengths=True -> (lat, lens)
+            texts, max_steps=max_steps, return_lengths=True
+        )
         return lat, lens
 
     def z_for_reg(

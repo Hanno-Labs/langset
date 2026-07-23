@@ -48,7 +48,11 @@ class FrozenEncoderTarget(_TargetSource):
     suppresses_nce = False
 
     def __init__(
-        self, model: "LangSetModel", args: "TrainingArguments", tok: "PreTrainedTokenizerBase", dev: torch.device
+        self,
+        model: "LangSetModel",
+        args: "TrainingArguments",
+        tok: "PreTrainedTokenizerBase",
+        dev: torch.device,
     ) -> None:
         self.m, self.a, self.tok, self.dev = model, args, tok, dev
         self.twin = model  # eval encodes its retrieval bank with the frozen model itself
@@ -56,7 +60,7 @@ class FrozenEncoderTarget(_TargetSource):
     def encode(self, texts: list[str]) -> torch.Tensor:
         with torch.no_grad():
             z = self.m.encode(texts, convert_to_numpy=False, normalize_embeddings=True)
-        return z.to(self.dev).float()  # [n, d] L2-normalized frozen-encoder embeddings
+        return z.to(self.dev).float()  # ty: ignore[unresolved-attribute]  # encode(convert_to_numpy=False) -> Tensor
 
     def update(self) -> None:  # nothing to track — the target model is frozen
         pass
@@ -80,7 +84,9 @@ class QueryBridge(nn.Module):
         self.out = nn.Linear(d, d)
         self.valid = nn.Linear(d, 1)
 
-    def forward(self, substrate: torch.Tensor, smask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, substrate: torch.Tensor, smask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         q = self.queries.unsqueeze(0).expand(substrate.size(0), -1, -1)
         q = self.dec(q, substrate, memory_key_padding_mask=~smask)
         return F.normalize(self.out(q), dim=-1), self.valid(q).squeeze(-1)
@@ -92,7 +98,11 @@ class QueryBridgeEmission(_EmissionObjective):
     codebook = False
 
     def __init__(
-        self, model: "LangSetModel", args: "TrainingArguments", dev: torch.device, trainer: "Trainer"
+        self,
+        model: "LangSetModel",
+        args: "TrainingArguments",
+        dev: torch.device,
+        trainer: "Trainer",
     ) -> None:
         super().__init__(model, args, dev, trainer)
         from scipy.optimize import (
@@ -110,7 +120,9 @@ class QueryBridgeEmission(_EmissionObjective):
         # aux-head plug is a follow-up; for now this makes the module optimizer-visible.
         model.add_module("emission_bridge", bridge)
         pending = getattr(model, "_emission_bridge_state", None)
-        if pending is not None:  # restore weights persisted by save_pretrained (serve-time / resumed run)
+        if (
+            pending is not None
+        ):  # restore weights persisted by save_pretrained (serve-time / resumed run)
             bridge.load_state_dict(pending)
         self.bridge = bridge
 
@@ -145,7 +157,9 @@ class QueryBridgeEmission(_EmissionObjective):
         vecs, vlog = self.bridge(substrate, mask.bool())  # [B, nq, d], [B, nq]
 
         tgt = F.normalize(target_lat.float(), dim=-1)  # [B, lmax, d]
-        bank = tgt[valid]  # [Ntot, d] — cross-row (in-batch) InfoNCE negatives; positives index into THIS prefix
+        bank = tgt[
+            valid
+        ]  # [Ntot, d] — cross-row (in-batch) InfoNCE negatives; positives index into THIS prefix
         # HARD-NEG bank: adjacent-quarter (same-entity / wrong-time) confusables from `hard_neg_field`, encoded in the
         # SAME (query) space as the targets and folded into the SAME InfoNCE denominator — the mechanism the standalone
         # used to beat entity×time. Absent hard_neg_field -> no-op, byte-identical to the plain in-batch bank.
@@ -153,7 +167,7 @@ class QueryBridgeEmission(_EmissionObjective):
         if hn_texts:
             with torch.no_grad():
                 hn = self.m.encode(hn_texts, convert_to_numpy=False, normalize_embeddings=True)
-            bank = torch.cat([bank, hn.to(dev).float()], dim=0)  # [Ntot + Nhn, d]
+            bank = torch.cat([bank, hn.to(dev).float()], dim=0)  # ty: ignore[unresolved-attribute]  # -> Tensor
         recon = torch.zeros(b, lmax, d, device=dev)
         vlab = torch.zeros_like(vlog)
         matched_pred: list[torch.Tensor] = []
@@ -167,7 +181,9 @@ class QueryBridgeEmission(_EmissionObjective):
             cost = -(vecs[r] @ t_i.T).detach().float().cpu().numpy()  # [nq, mi]
             pr, tc = self._match(cost)  # mi matches (nq >= mi)
             for p, c in zip(pr, tc):
-                recon[r, c] = vecs[r, p]  # matched emission -> its target's slot (aligns recon with `valid`)
+                recon[r, c] = vecs[
+                    r, p
+                ]  # matched emission -> its target's slot (aligns recon with `valid`)
                 matched_pred.append(vecs[r, p])
                 pos.append(off + int(c))
                 vlab[r, p] = 1.0
@@ -176,7 +192,9 @@ class QueryBridgeEmission(_EmissionObjective):
         if matched_pred:
             mp = torch.stack(matched_pred)  # [K, d]
             pos_t = torch.tensor(pos, device=dev)
-            nce = F.cross_entropy(mp @ bank.T / self.temp, pos_t)  # each emission retrieves its own target
+            nce = F.cross_entropy(
+                mp @ bank.T / self.temp, pos_t
+            )  # each emission retrieves its own target
         else:
             nce = target_lat.new_zeros(())
         vloss = F.binary_cross_entropy_with_logits(
@@ -199,7 +217,12 @@ class QueryBridgeEmission(_EmissionObjective):
         (lat [B, Lmax, d], lens [B]) padded — the same shape the AR rollout yields, so eval/retrieval is unchanged."""
         m, dev = self.m, self.dev
         e = m.tokenizer(
-            texts, padding=True, truncation=True, max_length=m.max_len, padding_side="left", return_tensors="pt"
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=m.max_len,
+            padding_side="left",
+            return_tensors="pt",
         ).to(dev)
         ids, mask = e["input_ids"], e["attention_mask"]
         substrate = m._last_hidden(m._run_backbone(m.embed(ids), mask, ids, 0)).float()

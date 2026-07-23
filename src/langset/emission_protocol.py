@@ -26,7 +26,7 @@ if TYPE_CHECKING:  # keep this file import-light (no cycle with strategies/train
     import torch
     from torch import nn
 
-    from langset.strategies import EmissionOut, _TargetSource
+    from langset.strategies import EmissionOut
 
 
 class SeedBatch(Protocol):
@@ -43,9 +43,9 @@ class TargetSet(Protocol):
     """The per-row targets the `_TargetSource` produced for this batch: the target texts (row-major) and their
     encoded latents. The strategy decides how emissions bind to these (positional vs matched)."""
 
-    texts: list[list[str]]          # per row: the row's target item texts
-    latents: "torch.Tensor"         # [B, L, d] encoded targets (L = max items across the batch's rows)
-    lens: list[int]                 # per row: item count
+    texts: list[list[str]]  # per row: the row's target item texts
+    latents: "torch.Tensor"  # [B, L, d] encoded targets (L = max items across the batch's rows)
+    lens: list[int]  # per row: item count
 
 
 @runtime_checkable

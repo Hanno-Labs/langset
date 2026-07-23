@@ -167,8 +167,10 @@ class TrainingArguments:
     # n_queries = number of query slots = MAX emitted items per doc (the validity head gates the actual count ≤ this).
     # Unused by the default FSQ/AR emission, so byte-identical there.
     n_queries: int = 16
-    bridge_lam_valid: float = 1.0   # weight on the validity/count BCE in the bridge's base loss
-    bridge_pos_weight: float = 2.0  # pos_weight for the validity BCE (few valid slots among n_queries per row)
+    bridge_lam_valid: float = 1.0  # weight on the validity/count BCE in the bridge's base loss
+    bridge_pos_weight: float = (
+        2.0  # pos_weight for the validity BCE (few valid slots among n_queries per row)
+    )
 
     # EMIT SEED as step-0 (phase-0 as a generated node). Off (default) = byte-identical: the model only emits latents
     # for the FUTURE events (the first emission is the first future). On: each seed's OWN text is prepended as target

@@ -15,7 +15,9 @@ import torch
 from langset import LangSetModel, Trainer, TrainingArguments
 from langset.bridge_emission import FrozenEncoderTarget, QueryBridgeEmission
 
-TINY_MODEL = os.environ.get("LANGSET_TEST_MODEL", "hf-internal-testing/tiny-random-LlamaForCausalLM")
+TINY_MODEL = os.environ.get(
+    "LANGSET_TEST_MODEL", "hf-internal-testing/tiny-random-LlamaForCausalLM"
+)
 
 
 def _rows() -> list[dict]:
@@ -43,26 +45,30 @@ def test_query_bridge_emission_trains_with_frozen_backbone() -> None:
             max_len=64,
             report_to=None,
             verbose=False,
-            eval_every=1,      # run eval so the bridge's emit_infer path is exercised
+            eval_every=1,  # run eval so the bridge's emit_infer path is exercised
             patience=99,
             val_frac=0.25,
             select="retr_mrr",
             seed=0,
-            emission=QueryBridgeEmission,       # <-- the ported family, injected
+            emission=QueryBridgeEmission,  # <-- the ported family, injected
             target_source=FrozenEncoderTarget,  # <-- query-target: match the frozen encoder's E(text)
-            lam_multi_nce=0.0,                  # its base loss already does the contrastive term
+            lam_multi_nce=0.0,  # its base loss already does the contrastive term
             output_dir=out,
         )
         trained = Trainer(model, args, _rows()).train()
 
     # (a) the bridge module was registered on the model
-    assert hasattr(trained, "emission_bridge"), "QueryBridgeEmission did not register its module on the model"
+    assert hasattr(trained, "emission_bridge"), (
+        "QueryBridgeEmission did not register its module on the model"
+    )
     qb = trained.emission_bridge
     # (b) its params are finite and it is trainable (the backbone is frozen)
     p = next(qb.parameters())
     assert torch.isfinite(p).all()
     assert any(pp.requires_grad for pp in qb.parameters())
-    assert not any(pp.requires_grad for pp in trained.backbone.parameters()), "backbone should be frozen"
+    assert not any(pp.requires_grad for pp in trained.backbone.parameters()), (
+        "backbone should be frozen"
+    )
 
 
 def _rows_with_hard_negs() -> list[dict]:
@@ -84,11 +90,22 @@ def test_query_bridge_emission_folds_hard_negatives_into_the_bank() -> None:
     )
     with tempfile.TemporaryDirectory() as out:
         args = TrainingArguments(
-            epochs=3, batch_size=4, lr=1e-2, max_len=64, report_to=None, verbose=False,
-            eval_every=1, patience=99, val_frac=0.25, select="retr_mrr", seed=0,
-            emission=QueryBridgeEmission, target_source=FrozenEncoderTarget,
-            lam_multi_nce=0.0, lam_hard_neg=0.0,   # bridge consumes hard_neg_field IN-BANK; separate term stays off
-            hard_neg_field="hard_neg",             # <-- pooled adjacent-confusables folded into the bridge's InfoNCE
+            epochs=3,
+            batch_size=4,
+            lr=1e-2,
+            max_len=64,
+            report_to=None,
+            verbose=False,
+            eval_every=1,
+            patience=99,
+            val_frac=0.25,
+            select="retr_mrr",
+            seed=0,
+            emission=QueryBridgeEmission,
+            target_source=FrozenEncoderTarget,
+            lam_multi_nce=0.0,
+            lam_hard_neg=0.0,  # bridge consumes hard_neg_field IN-BANK; separate term stays off
+            hard_neg_field="hard_neg",  # <-- pooled adjacent-confusables folded into the bridge's InfoNCE
             output_dir=out,
         )
         trained = Trainer(model, args, _rows_with_hard_negs()).train()
@@ -107,9 +124,19 @@ def test_query_bridge_emission_persists_and_reattaches() -> None:
     )
     with tempfile.TemporaryDirectory() as out:
         args = TrainingArguments(
-            epochs=2, batch_size=4, lr=1e-2, max_len=64, report_to=None, verbose=False,
-            eval_every=99, patience=99, val_frac=0.25, seed=0,
-            emission=QueryBridgeEmission, lam_multi_nce=0.0, output_dir=out,
+            epochs=2,
+            batch_size=4,
+            lr=1e-2,
+            max_len=64,
+            report_to=None,
+            verbose=False,
+            eval_every=99,
+            patience=99,
+            val_frac=0.25,
+            seed=0,
+            emission=QueryBridgeEmission,
+            lam_multi_nce=0.0,
+            output_dir=out,
         )
         trained = Trainer(model, args, _rows()).train()
         want = {k: v.clone() for k, v in trained.emission_bridge.state_dict().items()}
@@ -117,7 +144,9 @@ def test_query_bridge_emission_persists_and_reattaches() -> None:
         trained.save_pretrained(ckpt)
 
         loaded = LangSetModel.load(ckpt)
-        assert hasattr(loaded, "_emission_bridge_state"), "bridge state not persisted/stashed on load"
+        assert hasattr(loaded, "_emission_bridge_state"), (
+            "bridge state not persisted/stashed on load"
+        )
 
         class _NoTrainer:  # serve-time attach: the strategy only needs the model/args/dev
             pass
