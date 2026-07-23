@@ -1852,7 +1852,7 @@ class Trainer:
                 with _rf("ema_encode"):
                     flat_tgt = target_source.encode(flat_texts)  # [ΣL, d] stop-grad EMA targets
                 b = len(bidx)
-                # target↔slot shaping now owned by the emission strategy (was inline here) — see EMISSION_PROTOCOL.md
+                # target↔slot shaping now owned by the emission strategy (was inline here; default = positional TF)
                 target_lat, valid, lens_l, lmax = objective.build_targets(
                     ent_lists, flat_tgt, d, dev
                 )

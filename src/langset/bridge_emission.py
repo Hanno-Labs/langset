@@ -17,8 +17,8 @@ mechanism that lets the emitted vector separate same-entity/wrong-time near-miss
 separate HardNegTerm does not double-count. Absent `hard_neg_field`, the bank is plain in-batch (byte-identical).
 
 Retrieval is preserved BY CONSTRUCTION: the backbone is frozen, so the base embedder's geometry is untouched;
-the bridge is a pure add-on. `emit_infer`/eval delegation (so `model.rollout()` uses one pass instead of the AR
-rollout) is the remaining follow-up — see EMISSION_PROTOCOL.md.
+the bridge is a pure add-on. Eval routes through `emit_infer` (one pass, validity-gated) instead of the AR
+rollout.
 """
 
 from __future__ import annotations
