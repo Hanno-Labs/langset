@@ -1395,10 +1395,14 @@ class Trainer:
                     ),
                     flush=True,
                 )
+        # Build the emission strategy BEFORE the optimizer: a strategy may register its OWN trainable module on the
+        # model (e.g. a parallel-query bridge over a frozen backbone), and `params` below must then capture it via
+        # `m.parameters()`. FSQ registers nothing extra, so this is byte-identical for the default path.
+        objective: _EmissionObjective = a.emission(m, a, dev, self)  # emission strategy (INJECTED), built ONCE
         slot_params = [p for (_, _, _, _, h, _) in slot_plan for p in h.parameters()]
         params = [
             p for p in m.parameters() if p.requires_grad
-        ]  # includes PERSISTED aux heads (registered above)
+        ]  # includes PERSISTED aux heads + any strategy module registered above
         # TRANSIENT aux-head params are trainer-owned (not on the model), so add them explicitly — exactly as the old
         # phase head did. Ordering (base+head, then transient heads, then slots) preserves the byte-identical default
         # (phase-only: base+head, phase, slots) since param order doesn't affect AdamW's per-parameter update.
@@ -1446,12 +1450,9 @@ class Trainer:
             emit_labs: list[str] = []  # position-aligned sup label of each emission
             for i in range(0, len(veval), a.batch_size):
                 chunk = veval[i : i + a.batch_size]
-                out = m.rollout(
-                    [seeds[c] for c in chunk], max_steps=a.max_steps, return_lengths=True
-                )
-                lats, lens = cast(
-                    "tuple[torch.Tensor, torch.Tensor]", out
-                )  # list input => (lat [B,Lmax,d], len [B])
+                # emission-strategy owns inference: FSQ delegates to the AR rollout; a parallel-query family emits
+                # in ONE pass. Both return (lat [B,Lmax,d], len [B]).
+                lats, lens = objective.emit_infer([seeds[c] for c in chunk], a.max_steps)
                 for kk, ci in enumerate(chunk):
                     own = chain_t == ci
                     for j in range(int(lens[kk])):
@@ -1622,9 +1623,6 @@ class Trainer:
                 return _rfn(name)
             return _nullctx()
 
-        objective: _EmissionObjective = a.emission(
-            m, a, dev, self
-        )  # emission strategy (INJECTED), built ONCE
         loss_terms = a.loss_terms(a)  # aux separation/shaping terms (INJECTED), built ONCE
 
         # optional TEXT REPLAY (multi-latent). Rows tagged `learn` (via `learn_field`) rehearse the backbone's plain
@@ -1848,21 +1846,12 @@ class Trainer:
                     return_tensors="pt",
                 ).to(dev)  # left-pad: hid[s_len-1] = last real token
                 ent_lists = [list(futs[k]) for k in bidx]
-                lmax = max(len(x) for x in ent_lists)
                 flat_texts = [txt for lst in ent_lists for txt in lst]
                 with _rf("ema_encode"):
                     flat_tgt = target_source.encode(flat_texts)  # [ΣL, d] stop-grad EMA targets
                 b = len(bidx)
-                target_lat = torch.zeros(b, lmax, d, device=dev)
-                valid = torch.zeros(b, lmax, dtype=torch.bool, device=dev)
-                lens_l: list[int] = []
-                k = 0
-                for r, lst in enumerate(ent_lists):
-                    nl = len(lst)
-                    lens_l.append(nl)
-                    target_lat[r, :nl] = flat_tgt[k : k + nl]
-                    valid[r, :nl] = True
-                    k += nl
+                # target↔slot shaping now owned by the emission strategy (was inline here) — see EMISSION_PROTOCOL.md
+                target_lat, valid, lens_l, lmax = objective.build_targets(ent_lists, flat_tgt, d, dev)
                 if (
                     a.grad_cache
                 ):  # two-phase: cross-batch InfoNCE cached exact, base loss accumulated per chunk

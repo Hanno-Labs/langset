@@ -1219,6 +1219,10 @@ class LangSetModel(nn.Module):
                 name: {k: v.cpu() for k, v in mod.state_dict().items()}
                 for name, mod in self.aux_heads.items()
             }
+        if hasattr(self, "emission_bridge"):  # parallel-query emission family: persist its module's state_dict
+            weights["emission_bridge"] = {
+                k: v.cpu() for k, v in self.emission_bridge.state_dict().items()
+            }
         torch.save(weights, p / "langset.pt")
         (p / "config.json").write_text(
             json.dumps(
@@ -1299,5 +1303,7 @@ class LangSetModel(nn.Module):
             mod = nn.Linear(int(spec["in_dim"]), int(spec["out_dim"])).to(m.device)
             mod.load_state_dict({k: v.to(m.device) for k, v in sd["aux_heads"][name].items()})
             m.add_aux_head(mod, spec)
+        if "emission_bridge" in sd:  # stash raw state; a QueryBridgeEmission reloads it on re-attach (no import cycle)
+            m._emission_bridge_state = sd["emission_bridge"]
         m.eval()
         return m
