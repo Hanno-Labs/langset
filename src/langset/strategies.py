@@ -172,7 +172,14 @@ class MultiNCETerm(_LossTerm):
 
 
 class HardNegTerm(_LossTerm):
-    """Each emitted recon: own EMA target (positive) vs a shared bank of the batch's mined hard-negative texts."""
+    """Each PREDICTED emission: own EMA target (positive) vs a shared bank of the batch's mined hard-negative
+    texts. On the FSQ (multi_latent) path the query is the model's COMMITTED emission decoded from the predicted
+    digit logits (dim_lg) via a straight-through soft-argmax — so the negative steers the move-distribution
+    logits (level_proj / dim_lg), not the target reconstruction (up_proj / down_proj). Without this the term
+    trains the recon matrix only and 'don't emit this blunder' cannot change which move the model commits to at
+    any weight (tests/test_hardneg_reaches_move.py — the chess neg-on / neg-w10 blunder-mass was flat across
+    0.3/1.0 and matched in-train to held-out because the gradient never reached dim_lg). On the continuous
+    (non-FSQ) path the emission IS c.recon (out_proj), so the query stays c.recon (byte-identical to before)."""
 
     key = "loss_hard_neg"
 
@@ -184,7 +191,22 @@ class HardNegTerm(_LossTerm):
         if not hn_flat:
             return None
         hn_bank = c.target_source.encode(hn_flat)  # [Nhn, d] stop-grad normalized hard-neg latents
-        rv = F.normalize(c.recon[c.valid], dim=-1)  # [Nvalid, d] emitted reconstructions
+        if c.dim_lg is not None and c.recon is not None:
+            # FSQ path: query = the PREDICTED emitted latent decoded from dim_lg (soft-argmax + straight-through)
+            # so gradient reaches the move-digit logits (level_proj / dim_lg), not the frozen target recon.
+            # Mirrors the frontier-head decode (trainer.py): hard forward = committed code (matches inference),
+            # soft backward = grad through softmax(dim_lg).
+            head = c.model.head
+            lvls = torch.arange(c.fsq_levels, device=c.dev, dtype=torch.float32)
+            dl = c.dim_lg[:, : c.lmax]  # [B, lmax, fsq_dim, V] — the L emission positions (excl. STOP)
+            soft_lv = (torch.softmax(dl.float(), -1) * lvls).sum(-1)  # [B, lmax, fsq_dim] E[level]
+            hard_lv = dl.argmax(-1).float()
+            st_lv = hard_lv + (soft_lv - soft_lv.detach())  # STE: hard forward, soft backward
+            query = head.reconstruct(st_lv)  # [B, lmax, d] — the model's committed emission
+        else:
+            # continuous path: the emission IS c.recon (out_proj), so contrast that (unchanged behavior).
+            query = c.recon
+        rv = F.normalize(query[c.valid], dim=-1)  # [Nvalid, d]
         pos = (rv * c.target_lat[c.valid]).sum(-1, keepdim=True)  # [Nvalid, 1] cos to own target
         neg = rv @ hn_bank.t()  # [Nvalid, Nhn] cos to every hard neg
         logits_hn = torch.cat([pos, neg], dim=1) / a.tau
@@ -192,6 +214,116 @@ class HardNegTerm(_LossTerm):
             logits_hn, torch.zeros(logits_hn.size(0), dtype=torch.long, device=c.dev)
         )
         return (self.key, loss_hn, a.lam_hard_neg)
+
+
+class MoveNegTerm(_LossTerm):
+    """DISTRIBUTION-LEVEL hard negative (FSQ label_dims path): penalize the probability MASS the model's
+    PREDICTED move distribution puts on each row's blunder moves, operating DIRECTLY on the reserved-digit
+    softmax (dim_lg) — not the latent. For each blunder's codeword (precomputed by the trainer via
+    `label_codewords` — the same map the positive label uses), P(blunder) = Π over reserved digits of
+    softmax(dim_lg[digit])[code]; minimizing Σ P(blunder) pushes the blunder's digit probabilities DOWN and
+    (by softmax normalization) the non-blunder levels UP. Grad flows straight into dim_lg / level_proj.
+
+    The codeword->index tensor is PRECOMPUTED ONCE in Trainer.__init__ (padded `[N_rows, max_neg, n_reserved]`
+    long + a count mask) so the step loop does ONE batched gather+prod — no Python, no per-step recompute.
+    Applied to each VALID tick of the row (single-latent: 1 tick). Self-skips when `lam_move_neg<=0`, no codes,
+    no `label_plan`, or non-FSQ (`dim_lg` is None) — byte-identical to before when off.
+
+    EMPIRICAL NOTE: this term is a building block (shares the codeword->index precompute with LegalMoveNegTerm)
+    but is empirically weak on its own — the RAW codeword probability it penalizes is ~0.002 (mass spread across
+    8 levels x several digits), so the gradient is ~60x too small to move the legal-move mass the decode metric
+    reads (chess moveneg10 run: P-mass-on-blunders 34.3% ≈ control 34.5%, no effect). LegalMoveNegTerm
+    renormalizes over the legal-move support set and is the term that actually reshapes mass; prefer it."""
+
+    key = "loss_move_neg"
+
+    def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
+        a, self_ = c.args, c.trainer
+        if a.lam_move_neg <= 0 or c.dim_lg is None:
+            return None
+        plan = self_.label_plan
+        idx_t, n_t = getattr(self_, "move_neg_idx", None), getattr(self_, "move_neg_n", None)
+        if idx_t is None or n_t is None or plan is None:
+            return None
+        rcols = [cj for (cj, _, _) in plan]
+        if not rcols:
+            return None
+        # reserved-digit softmax at each valid tick. [B, lmax, n_reserved, V]
+        soft = torch.softmax(c.dim_lg[:, : c.lmax, 1:, :][:, :, rcols, :].float(), -1)
+        bidx = torch.as_tensor(c.bidx, device=c.dev, dtype=torch.long)
+        idx = idx_t[bidx].to(c.dev)              # [B, max_neg, n_reserved]
+        nn = n_t[bidx].to(c.dev)                 # [B] counts
+        # gather P(level=cw[d]) for every (row, neg, reserved-digit) in one op -> prod over digits = P(codeword).
+        # CLAMP padding sentinels (-1) to 0 BEFORE gather (gather with -1 is OOB on CUDA -> device-side assert);
+        # the mask below zeros those out, so the gathered value for padding is irrelevant.
+        idx = idx.clamp(min=0)
+        # soft [B, lmax, n_reserved, V]; idx[:, None, :, d] -> gather [B, lmax, max_neg] per-codeword probs
+        probs = [soft[:, :, d, :].gather(-1, idx[:, None, :, d].expand(-1, c.lmax, -1)) for d in range(len(rcols))]
+        p_cw = torch.stack(probs, -1).prod(-1)   # [B, lmax, max_neg]
+        mask = (torch.arange(idx.size(1), device=c.dev)[None, :] < nn[:, None]).to(p_cw.dtype)  # [B, max_neg]
+        p_cw = p_cw * mask[:, None, :]           # zero out padding codewords
+        n = int(mask.sum().item()) * c.lmax
+        if n == 0:
+            return None
+        return (self.key, p_cw.sum() / n, a.lam_move_neg)
+
+
+class LegalMoveNegTerm(_LossTerm):
+    """LEGAL-MOVE-RENORMALIZED negative (FSQ label_dims path): penalize the blunder's share of the LEGAL-move
+    probability mass, operating DIRECTLY on the reserved-digit softmax (dim_lg) — the same space the decode
+    metric reads. Where MoveNegTerm penalizes the RAW codeword probability (P ~ 0.002, grad ~ 0.002 — too weak
+    to move the legal mass; chess moveneg10: P-mass 34.3% ≈ control 34.5%), this term RENORMALIZES: loss =
+    Σ_neg P(codeword_neg) / Σ_support P(codeword_support). The renormalized blunder share is ~10-35% (the metric
+    range), so the gradient is ~50x larger and can actually reshape the legal-move mass.
+
+    GENERIC (no chess logic): both the neg-subset and legal-support codeword->index tensors are PRECOMPUTED ONCE
+    in Trainer.__init__ (padded `[N_rows, max_K, n_reserved]` long + count masks) so the step loop does ONE
+    batched gather+prod per set — no Python, no per-step recompute. The chess-ness (board -> legal moves ->
+    codewords via label_codewords) lives in the data builder. Self-skips when `lam_legal_neg<=0`, no codes, no
+    `label_plan`, or non-FSQ (dim_lg None) — byte-identical to before when off.
+
+    VALIDATED (chess A/B, held-out shard_1, n=400, SmolLM2-135M full-FT, 4ep): the blunder's legal-move MASS
+    drops monotonically with weight — neg-off 34.5% -> 0.3 31.3% -> 0.6 29.9% -> 1.0 28.7% — the first negative
+    form to move mass outside the noise floor (latent-cosine HardNegTerm and raw MoveNegTerm both left it flat).
+    0.6 is the operating point (best overall: lowest cp-regret 435 AND lowest argmax-blunder 24%; at 1.0 the
+    argmax regresses as the term over-regularizes the base digit CE). See tests/test_legalneg_reaches_legal_mass.py."""
+
+    key = "loss_legal_neg"
+
+    def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
+        a, self_ = c.args, c.trainer
+        if a.lam_legal_neg <= 0 or c.dim_lg is None:
+            return None
+        plan = self_.label_plan
+        neg_idx, neg_n = getattr(self_, "move_neg_idx", None), getattr(self_, "move_neg_n", None)
+        leg_idx, leg_n = getattr(self_, "legal_move_idx", None), getattr(self_, "legal_move_n", None)
+        if neg_idx is None or leg_idx is None or plan is None:
+            return None
+        rcols = [cj for (cj, _, _) in plan]
+        if not rcols:
+            return None
+        soft = torch.softmax(c.dim_lg[:, : c.lmax, 1:, :][:, :, rcols, :].float(), -1)  # [B, lmax, n_reserved, V]
+        bidx = torch.as_tensor(c.bidx, device=c.dev, dtype=torch.long)
+
+        def _codeword_probs(idx_t, n_t):
+            idx = idx_t[bidx].to(c.dev)           # [B, max_K, n_reserved]
+            nn = n_t[bidx].to(c.dev)              # [B]
+            idx = idx.clamp(min=0)                # padding sentinels (-1) -> 0 (OOB on CUDA gather; masked out below)
+            probs = [soft[:, :, d, :].gather(-1, idx[:, None, :, d].expand(-1, c.lmax, -1)) for d in range(len(rcols))]
+            p = torch.stack(probs, -1).prod(-1)    # [B, lmax, max_K]
+            mask = (torch.arange(idx.size(1), device=c.dev)[None, :] < nn[:, None]).to(p.dtype)
+            return p * mask[:, None, :], mask      # zero out padding codewords
+
+        p_neg, m_neg = _codeword_probs(neg_idx, neg_n)   # [B, lmax, max_neg]
+        p_leg, m_leg = _codeword_probs(leg_idx, leg_n)   # [B, lmax, max_legal]
+        sum_neg = p_neg.sum(-1)                          # [B, lmax]
+        sum_leg = p_leg.sum(-1).clamp(min=1e-8)          # [B, lmax] Σ_legal (renorm denominator)
+        # only count (row,tick) where the row HAS neg codes (else nothing to penalize)
+        has_neg = (m_neg.sum(-1) > 0).to(sum_neg.dtype)  # [B, max_neg]->[B]
+        n = float(has_neg[:, None].expand(-1, c.lmax).sum().item())
+        if n == 0:
+            return None
+        return (self.key, (sum_neg / sum_leg * has_neg[:, None]).sum() / n, a.lam_legal_neg)
 
 
 class SupConTerm(_LossTerm):
@@ -268,6 +400,8 @@ def build_loss_terms(args: TrainingArguments) -> list[_LossTerm]:
         LabelDimsTerm(),
         MultiNCETerm(maskers=[identical_text_mask]),
         HardNegTerm(),
+        MoveNegTerm(),
+        LegalMoveNegTerm(),
         SupConTerm(),
     ]
 
