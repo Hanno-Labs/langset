@@ -617,10 +617,14 @@ class Trainer:
                 # Each blunder dict's values are looked up per field and the digit indices concatenated in label_plan
                 # order (so the codeword aligns with the reserved-digit layout in dim_lg).
                 if getattr(self, "_raw_move_neg", None) is not None and self.label_plan is not None:
+                    _raw_move_neg = (
+                        self._raw_move_neg
+                    )  # narrows Optional -> list for the type checker
+                    assert _raw_move_neg is not None
                     cws_per_field = self.label_codewords  # {field: {class_str: [digit idxs]}}
                     self.move_neg_codes = []
                     skipped = 0
-                    for v in self._raw_move_neg:
+                    for v in _raw_move_neg:
                         blunders = (
                             v
                             if isinstance(v, (list, tuple))
@@ -662,9 +666,13 @@ class Trainer:
                     getattr(self, "_raw_legal_moves", None) is not None
                     and self.label_plan is not None
                 ):
+                    _raw_legal_moves = (
+                        self._raw_legal_moves
+                    )  # narrows Optional -> list for the type checker
+                    assert _raw_legal_moves is not None
                     cws_per_field = self.label_codewords
                     self.legal_move_codes = []
-                    for v in self._raw_legal_moves:
+                    for v in _raw_legal_moves:
                         moves = (
                             v
                             if isinstance(v, (list, tuple))
