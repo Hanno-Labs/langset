@@ -29,7 +29,6 @@ import sys
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).parent))
 import test_trainer_multi_characterization as M  # noqa: E402
