@@ -198,7 +198,9 @@ class HardNegTerm(_LossTerm):
             # soft backward = grad through softmax(dim_lg).
             head = c.model.head
             lvls = torch.arange(c.fsq_levels, device=c.dev, dtype=torch.float32)
-            dl = c.dim_lg[:, : c.lmax]  # [B, lmax, fsq_dim, V] — the L emission positions (excl. STOP)
+            dl = c.dim_lg[
+                :, : c.lmax
+            ]  # [B, lmax, fsq_dim, V] — the L emission positions (excl. STOP)
             soft_lv = (torch.softmax(dl.float(), -1) * lvls).sum(-1)  # [B, lmax, fsq_dim] E[level]
             hard_lv = dl.argmax(-1).float()
             st_lv = hard_lv + (soft_lv - soft_lv.detach())  # STE: hard forward, soft backward
@@ -251,17 +253,22 @@ class MoveNegTerm(_LossTerm):
         # reserved-digit softmax at each valid tick. [B, lmax, n_reserved, V]
         soft = torch.softmax(c.dim_lg[:, : c.lmax, 1:, :][:, :, rcols, :].float(), -1)
         bidx = torch.as_tensor(c.bidx, device=c.dev, dtype=torch.long)
-        idx = idx_t[bidx].to(c.dev)              # [B, max_neg, n_reserved]
-        nn = n_t[bidx].to(c.dev)                 # [B] counts
+        idx = idx_t[bidx].to(c.dev)  # [B, max_neg, n_reserved]
+        nn = n_t[bidx].to(c.dev)  # [B] counts
         # gather P(level=cw[d]) for every (row, neg, reserved-digit) in one op -> prod over digits = P(codeword).
         # CLAMP padding sentinels (-1) to 0 BEFORE gather (gather with -1 is OOB on CUDA -> device-side assert);
         # the mask below zeros those out, so the gathered value for padding is irrelevant.
         idx = idx.clamp(min=0)
         # soft [B, lmax, n_reserved, V]; idx[:, None, :, d] -> gather [B, lmax, max_neg] per-codeword probs
-        probs = [soft[:, :, d, :].gather(-1, idx[:, None, :, d].expand(-1, c.lmax, -1)) for d in range(len(rcols))]
-        p_cw = torch.stack(probs, -1).prod(-1)   # [B, lmax, max_neg]
-        mask = (torch.arange(idx.size(1), device=c.dev)[None, :] < nn[:, None]).to(p_cw.dtype)  # [B, max_neg]
-        p_cw = p_cw * mask[:, None, :]           # zero out padding codewords
+        probs = [
+            soft[:, :, d, :].gather(-1, idx[:, None, :, d].expand(-1, c.lmax, -1))
+            for d in range(len(rcols))
+        ]
+        p_cw = torch.stack(probs, -1).prod(-1)  # [B, lmax, max_neg]
+        mask = (torch.arange(idx.size(1), device=c.dev)[None, :] < nn[:, None]).to(
+            p_cw.dtype
+        )  # [B, max_neg]
+        p_cw = p_cw * mask[:, None, :]  # zero out padding codewords
         n = int(mask.sum().item()) * c.lmax
         if n == 0:
             return None
@@ -296,28 +303,38 @@ class LegalMoveNegTerm(_LossTerm):
             return None
         plan = self_.label_plan
         neg_idx, neg_n = getattr(self_, "move_neg_idx", None), getattr(self_, "move_neg_n", None)
-        leg_idx, leg_n = getattr(self_, "legal_move_idx", None), getattr(self_, "legal_move_n", None)
+        leg_idx, leg_n = (
+            getattr(self_, "legal_move_idx", None),
+            getattr(self_, "legal_move_n", None),
+        )
         if neg_idx is None or leg_idx is None or plan is None:
             return None
         rcols = [cj for (cj, _, _) in plan]
         if not rcols:
             return None
-        soft = torch.softmax(c.dim_lg[:, : c.lmax, 1:, :][:, :, rcols, :].float(), -1)  # [B, lmax, n_reserved, V]
+        soft = torch.softmax(
+            c.dim_lg[:, : c.lmax, 1:, :][:, :, rcols, :].float(), -1
+        )  # [B, lmax, n_reserved, V]
         bidx = torch.as_tensor(c.bidx, device=c.dev, dtype=torch.long)
 
         def _codeword_probs(idx_t, n_t):
-            idx = idx_t[bidx].to(c.dev)           # [B, max_K, n_reserved]
-            nn = n_t[bidx].to(c.dev)              # [B]
-            idx = idx.clamp(min=0)                # padding sentinels (-1) -> 0 (OOB on CUDA gather; masked out below)
-            probs = [soft[:, :, d, :].gather(-1, idx[:, None, :, d].expand(-1, c.lmax, -1)) for d in range(len(rcols))]
-            p = torch.stack(probs, -1).prod(-1)    # [B, lmax, max_K]
+            idx = idx_t[bidx].to(c.dev)  # [B, max_K, n_reserved]
+            nn = n_t[bidx].to(c.dev)  # [B]
+            idx = idx.clamp(
+                min=0
+            )  # padding sentinels (-1) -> 0 (OOB on CUDA gather; masked out below)
+            probs = [
+                soft[:, :, d, :].gather(-1, idx[:, None, :, d].expand(-1, c.lmax, -1))
+                for d in range(len(rcols))
+            ]
+            p = torch.stack(probs, -1).prod(-1)  # [B, lmax, max_K]
             mask = (torch.arange(idx.size(1), device=c.dev)[None, :] < nn[:, None]).to(p.dtype)
-            return p * mask[:, None, :], mask      # zero out padding codewords
+            return p * mask[:, None, :], mask  # zero out padding codewords
 
-        p_neg, m_neg = _codeword_probs(neg_idx, neg_n)   # [B, lmax, max_neg]
-        p_leg, m_leg = _codeword_probs(leg_idx, leg_n)   # [B, lmax, max_legal]
-        sum_neg = p_neg.sum(-1)                          # [B, lmax]
-        sum_leg = p_leg.sum(-1).clamp(min=1e-8)          # [B, lmax] Σ_legal (renorm denominator)
+        p_neg, m_neg = _codeword_probs(neg_idx, neg_n)  # [B, lmax, max_neg]
+        p_leg, m_leg = _codeword_probs(leg_idx, leg_n)  # [B, lmax, max_legal]
+        sum_neg = p_neg.sum(-1)  # [B, lmax]
+        sum_leg = p_leg.sum(-1).clamp(min=1e-8)  # [B, lmax] Σ_legal (renorm denominator)
         # only count (row,tick) where the row HAS neg codes (else nothing to penalize)
         has_neg = (m_neg.sum(-1) > 0).to(sum_neg.dtype)  # [B, max_neg]->[B]
         n = float(has_neg[:, None].expand(-1, c.lmax).sum().item())

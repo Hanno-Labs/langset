@@ -107,7 +107,9 @@ def test_move_neg_suppresses_blunder_mass() -> None:
     c, dim_lg = _build_ctx(model, dev, blunder)
 
     contrib = MoveNegTerm().contribute(c)
-    assert contrib is not None, "MoveNegTerm returned None (lam_move_neg<=0 / no codes / no label_plan / no dim_lg)"
+    assert contrib is not None, (
+        "MoveNegTerm returned None (lam_move_neg<=0 / no codes / no label_plan / no dim_lg)"
+    )
     _k, loss_mn, _w = contrib
     assert torch.isfinite(loss_mn), f"move-neg loss not finite: {loss_mn}"
 

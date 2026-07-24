@@ -79,7 +79,9 @@ def _build_ctx(model, dev) -> tuple[MultiStepCtx, torch.Tensor, torch.Tensor]:
     # stop-grad EMA target latents (the thing recon tries to reconstruct)
     torch.manual_seed(0)
     target_lat = torch.randn(B, L, d, device=dev).detach()
-    digits, recon = head.encode(target_lat)  # recon = up_proj(fsq(down_proj(target))) -> grad to down/up_proj
+    digits, recon = head.encode(
+        target_lat
+    )  # recon = up_proj(fsq(down_proj(target))) -> grad to down/up_proj
 
     # the model's predicted digit LOGITS (where the move lives). hid is the leaf so grad is well-defined.
     hid = torch.randn(B, L + 1, h, device=dev, requires_grad=True)
@@ -144,9 +146,17 @@ def test_positive_control_loss_dims_reaches_dim_lg() -> None:
     loss_dims.backward()
     assert dim_lg.grad is not None, "positive control: dim_lg retained no grad (apparatus broken)"
     dg = float(dim_lg.grad.abs().sum())
-    lg = float(model.head.level_proj.weight.grad.abs().sum()) if model.head.level_proj.weight.grad is not None else 0.0
-    assert dg > 1e-8, f"positive control: dim_lg got ~0 grad ({dg:.2e}) -> apparatus can't put grad on move logits"
-    assert lg > 1e-8, f"positive control: level_proj got ~0 grad ({lg:.2e}) -> the move-digit projection is frozen?"
+    lg = (
+        float(model.head.level_proj.weight.grad.abs().sum())
+        if model.head.level_proj.weight.grad is not None
+        else 0.0
+    )
+    assert dg > 1e-8, (
+        f"positive control: dim_lg got ~0 grad ({dg:.2e}) -> apparatus can't put grad on move logits"
+    )
+    assert lg > 1e-8, (
+        f"positive control: level_proj got ~0 grad ({lg:.2e}) -> the move-digit projection is frozen?"
+    )
     print(f"positive_control PASS  dim_lg.grad|sum|={dg:.3e}  level_proj.grad|sum|={lg:.3e}")
 
 
@@ -162,7 +172,9 @@ def test_hard_neg_reaches_move_logits() -> None:
     c, dim_lg, recon = _build_ctx(model, dev)
 
     contrib = HardNegTerm().contribute(c)
-    assert contrib is not None, "HardNegTerm returned None (lam_hard_neg<=0 or no hard_neg_texts) -> term inert"
+    assert contrib is not None, (
+        "HardNegTerm returned None (lam_hard_neg<=0 or no hard_neg_texts) -> term inert"
+    )
     _key, loss_hn, _w = contrib
     assert torch.isfinite(loss_hn), f"hard-neg loss not finite: {loss_hn}"
 

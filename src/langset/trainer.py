@@ -621,7 +621,11 @@ class Trainer:
                     self.move_neg_codes = []
                     skipped = 0
                     for v in self._raw_move_neg:
-                        blunders = v if isinstance(v, (list, tuple)) else ([v] if v not in (None, "") else [])
+                        blunders = (
+                            v
+                            if isinstance(v, (list, tuple))
+                            else ([v] if v not in (None, "") else [])
+                        )
                         row_codes: list[tuple[int, ...]] = []
                         for bd in blunders:
                             if not isinstance(bd, dict):
@@ -629,7 +633,7 @@ class Trainer:
                                 continue
                             code: list[int] = []
                             ok = True
-                            for (_rc, field, pos) in self.label_plan:
+                            for _rc, field, pos in self.label_plan:
                                 val = bd.get(field)
                                 if val is None:
                                     ok = False
@@ -650,20 +654,29 @@ class Trainer:
                             + (f" (skipped {skipped} non-dict)" if skipped else ""),
                             flush=True,
                         )
-                    self._raw_move_neg = None  # free the raw column; codes are the live structure now
+                    self._raw_move_neg = (
+                        None  # free the raw column; codes are the live structure now
+                    )
                 # map each row's legal-move label-dicts -> codeword tuples (the SUPPORT set for renormalization)
-                if getattr(self, "_raw_legal_moves", None) is not None and self.label_plan is not None:
+                if (
+                    getattr(self, "_raw_legal_moves", None) is not None
+                    and self.label_plan is not None
+                ):
                     cws_per_field = self.label_codewords
                     self.legal_move_codes = []
                     for v in self._raw_legal_moves:
-                        moves = v if isinstance(v, (list, tuple)) else ([v] if v not in (None, "") else [])
+                        moves = (
+                            v
+                            if isinstance(v, (list, tuple))
+                            else ([v] if v not in (None, "") else [])
+                        )
                         row_codes: list[tuple[int, ...]] = []
                         for md in moves:
                             if not isinstance(md, dict):
                                 continue
                             code: list[int] = []
                             ok = True
-                            for (_rc, field, pos) in self.label_plan:
+                            for _rc, field, pos in self.label_plan:
                                 val = md.get(field)
                                 if val is None:
                                     ok = False
@@ -689,7 +702,10 @@ class Trainer:
                 # loop, no per-step recompute. [N_rows, max_K, n_reserved] long (padded, -1 sentinel) + [N_rows] counts.
                 dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                 nr = len(self.label_plan)
-                for fld, codes_attr in (("move_neg_codes", "move_neg_idx"), ("legal_move_codes", "legal_move_idx")):
+                for fld, codes_attr in (
+                    ("move_neg_codes", "move_neg_idx"),
+                    ("legal_move_codes", "legal_move_idx"),
+                ):
                     codes_list = getattr(self, fld, None)
                     if codes_list is None:
                         continue

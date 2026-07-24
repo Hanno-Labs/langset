@@ -77,10 +77,22 @@ def _build_ctx(model, dev, legal_codes, neg_codes):
     args.lam_legal_neg = 1.0
     c = MultiStepCtx(
         trainer=_FakeTrainer([neg_codes], [legal_codes], label_plan),
-        args=args, model=model, dev=dev, bidx=[0], lens_l=[L], flat_texts=[],
-        valid=valid, target_lat=torch.zeros(B, L, model.latent_dim, device=dev),
-        recon=torch.zeros(B, L, model.latent_dim, device=dev), dim_lg=dim_lg, lmax=L,
-        fsq_levels=V, lab_label=None, target_source=None, phase_head=None, phase_ids={},
+        args=args,
+        model=model,
+        dev=dev,
+        bidx=[0],
+        lens_l=[L],
+        flat_texts=[],
+        valid=valid,
+        target_lat=torch.zeros(B, L, model.latent_dim, device=dev),
+        recon=torch.zeros(B, L, model.latent_dim, device=dev),
+        dim_lg=dim_lg,
+        lmax=L,
+        fsq_levels=V,
+        lab_label=None,
+        target_source=None,
+        phase_head=None,
+        phase_ids={},
     )
     return c, dim_lg
 
@@ -109,7 +121,9 @@ def test_legal_neg_reaches_legal_mass() -> None:
     c, dim_lg = _build_ctx(model, dev, legal, neg)
 
     contrib = LegalMoveNegTerm().contribute(c)
-    assert contrib is not None, "LegalMoveNegTerm returned None (lam_legal_neg<=0 / no codes / no dim_lg)"
+    assert contrib is not None, (
+        "LegalMoveNegTerm returned None (lam_legal_neg<=0 / no codes / no dim_lg)"
+    )
     _k, loss_ln, _w = contrib
     assert torch.isfinite(loss_ln), f"legal-neg loss not finite: {loss_ln}"
 
@@ -122,7 +136,9 @@ def test_legal_neg_reaches_legal_mass() -> None:
 
     for p in model.parameters():
         p.grad = None
-    loss_ln.backward(retain_graph=True)  # retain: the SGD step below backward()s the same graph again
+    loss_ln.backward(
+        retain_graph=True
+    )  # retain: the SGD step below backward()s the same graph again
     g = dim_lg.grad
     assert g is not None, "dim_lg retained no grad"
     # blunder occupies reserved rest-cols 0,1,2,3 -> full dims 1,2,3,4 at levels (5,6,7,0)
@@ -140,12 +156,16 @@ def test_legal_neg_reaches_legal_mass() -> None:
     )
     # (3) good-move (the other support member) digit grads NEGATIVE — mass redistributes off the blunder WITHIN
     # the legal support (not across the whole raw grid)
-    assert all(x < 0 for x in ggrad), f"good-move (support peer) digit grads not all negative: {ggrad}"
+    assert all(x < 0 for x in ggrad), (
+        f"good-move (support peer) digit grads not all negative: {ggrad}"
+    )
 
     # (4) one manual SGD step on THIS loss lowers the legal-renormalized P(blunder) — it actually reshapes mass
     opt = torch.optim.SGD([dim_lg], lr=5.0)
-    p_blunder_before = float(_renorm_p(model, dim_lg.detach(), blunder) /
-                             (_renorm_p(model, dim_lg.detach(), blunder) + _renorm_p(model, dim_lg.detach(), good)))
+    p_blunder_before = float(
+        _renorm_p(model, dim_lg.detach(), blunder)
+        / (_renorm_p(model, dim_lg.detach(), blunder) + _renorm_p(model, dim_lg.detach(), good))
+    )
     opt.zero_grad()
     LegalMoveNegTerm().contribute(c)[1].backward(retain_graph=False)
     opt.step()
