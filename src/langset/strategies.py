@@ -247,6 +247,9 @@ class MoveNegTerm(_LossTerm):
         idx_t, n_t = getattr(self_, "move_neg_idx", None), getattr(self_, "move_neg_n", None)
         if idx_t is None or n_t is None or plan is None:
             return None
+        assert (
+            idx_t is not None and n_t is not None
+        )  # narrows getattr's Any|None to Tensor for the type checker
         rcols = [cj for (cj, _, _) in plan]
         if not rcols:
             return None
@@ -307,8 +310,11 @@ class LegalMoveNegTerm(_LossTerm):
             getattr(self_, "legal_move_idx", None),
             getattr(self_, "legal_move_n", None),
         )
-        if neg_idx is None or leg_idx is None or plan is None:
+        if neg_idx is None or neg_n is None or leg_idx is None or leg_n is None or plan is None:
             return None
+        assert (
+            neg_idx is not None and neg_n is not None and leg_idx is not None and leg_n is not None
+        )  # narrows getattr's Any|None to Tensor for the type checker
         rcols = [cj for (cj, _, _) in plan]
         if not rcols:
             return None
