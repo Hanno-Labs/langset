@@ -317,7 +317,9 @@ class LegalMoveNegTerm(_LossTerm):
         )  # [B, lmax, n_reserved, V]
         bidx = torch.as_tensor(c.bidx, device=c.dev, dtype=torch.long)
 
-        def _codeword_probs(idx_t, n_t):
+        def _codeword_probs(
+            idx_t: torch.Tensor, n_t: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             idx = idx_t[bidx].to(c.dev)  # [B, max_K, n_reserved]
             nn = n_t[bidx].to(c.dev)  # [B]
             idx = idx.clamp(
