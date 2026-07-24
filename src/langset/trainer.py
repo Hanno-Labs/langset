@@ -527,6 +527,26 @@ class Trainer:
                     ]
                     for v in raw_hn
                 ]
+            # optional DISTRIBUTION-LEVEL hard negative (FSQ label_dims): per-row LIST of per-blunder label-dicts
+            # (e.g. [{"from_sq": g, "to_sq": f}, ...]) whose values map to codewords via label_codewords (built
+            # below from the positive label_cols). move_neg_codes[row] = list of codeword tuples, one per blunder,
+            # each tuple ordered by label_plan. MoveNegTerm / LegalMoveNegTerm penalize P(blunder) on the
+            # reserved-digit softmax.
+            self.move_neg_codes: Optional[list[list[tuple[int, ...]]]] = None
+            mn_field = getattr(args, "move_neg_field", None)
+            if mn_field is not None:
+                raw_mn = cols[inv.get(mn_field, mn_field)]
+                # label_codewords / label_plan are built below from `label_dims`; defer the codeword mapping to a
+                # second pass (after label_codewords exists) so we don't duplicate the build here.
+                self._raw_move_neg = list(raw_mn)
+                self._move_neg_field = mn_field
+            # LEGAL-MOVE support set (for LegalMoveNegTerm renormalization): per-row list of legal-move
+            # label-dicts (e.g. [{"from_sq":g,"to_sq":f}, ...]) -> mapped to codewords via label_codewords below.
+            self.legal_move_codes: Optional[list[list[tuple[int, ...]]]] = None
+            leg_field = getattr(args, "legal_move_field", None)
+            if leg_field is not None:
+                self._raw_legal_moves = list(cols[inv.get(leg_field, leg_field)])
+                self._legal_move_field = leg_field
             # optional MULTI-latent supervised-contrastive: a per-row LIST of group labels aligned 1:1 with
             # target_texts (each emitted item's stage/group). Shapes emissions into separate regions (weight lam_sup).
             self.sup_labels: Optional[list[list[str]]] = None
@@ -593,6 +613,122 @@ class Trainer:
                         ),
                         flush=True,
                     )
+                # second pass: map each row's move_neg blunder label-dicts -> codeword tuples via label_codewords.
+                # Each blunder dict's values are looked up per field and the digit indices concatenated in label_plan
+                # order (so the codeword aligns with the reserved-digit layout in dim_lg).
+                if getattr(self, "_raw_move_neg", None) is not None and self.label_plan is not None:
+                    _raw_move_neg = (
+                        self._raw_move_neg
+                    )  # narrows Optional -> list for the type checker
+                    assert _raw_move_neg is not None
+                    cws_per_field = self.label_codewords  # {field: {class_str: [digit idxs]}}
+                    self.move_neg_codes = []
+                    skipped = 0
+                    for v in _raw_move_neg:
+                        blunders = (
+                            v
+                            if isinstance(v, (list, tuple))
+                            else ([v] if v not in (None, "") else [])
+                        )
+                        row_codes: list[tuple[int, ...]] = []
+                        for bd in blunders:
+                            if not isinstance(bd, dict):
+                                skipped += 1
+                                continue
+                            code: list[int] = []
+                            ok = True
+                            for _rc, field, pos in self.label_plan:
+                                val = bd.get(field)
+                                if val is None:
+                                    ok = False
+                                    break
+                                cmap = cws_per_field.get(field, {})
+                                digs = cmap.get(str(val))
+                                if digs is None or pos >= len(digs):
+                                    ok = False
+                                    break
+                                code.append(int(digs[pos]))
+                            if ok:
+                                row_codes.append(tuple(code))
+                        self.move_neg_codes.append(row_codes)
+                    if args.verbose:
+                        n_b = sum(len(rc) for rc in self.move_neg_codes)
+                        print(
+                            f"[langset] move_neg: {n_b} blunder codewords across {len(self.move_neg_codes)} rows"
+                            + (f" (skipped {skipped} non-dict)" if skipped else ""),
+                            flush=True,
+                        )
+                    self._raw_move_neg = (
+                        None  # free the raw column; codes are the live structure now
+                    )
+                # map each row's legal-move label-dicts -> codeword tuples (the SUPPORT set for renormalization)
+                if (
+                    getattr(self, "_raw_legal_moves", None) is not None
+                    and self.label_plan is not None
+                ):
+                    _raw_legal_moves = (
+                        self._raw_legal_moves
+                    )  # narrows Optional -> list for the type checker
+                    assert _raw_legal_moves is not None
+                    cws_per_field = self.label_codewords
+                    self.legal_move_codes = []
+                    for v in _raw_legal_moves:
+                        moves = (
+                            v
+                            if isinstance(v, (list, tuple))
+                            else ([v] if v not in (None, "") else [])
+                        )
+                        row_codes: list[tuple[int, ...]] = []
+                        for md in moves:
+                            if not isinstance(md, dict):
+                                continue
+                            code: list[int] = []
+                            ok = True
+                            for _rc, field, pos in self.label_plan:
+                                val = md.get(field)
+                                if val is None:
+                                    ok = False
+                                    break
+                                cmap = cws_per_field.get(field, {})
+                                digs = cmap.get(str(val))
+                                if digs is None or pos >= len(digs):
+                                    ok = False
+                                    break
+                                code.append(int(digs[pos]))
+                            if ok:
+                                row_codes.append(tuple(code))
+                        self.legal_move_codes.append(row_codes)
+                    if args.verbose:
+                        n_l = sum(len(rc) for rc in self.legal_move_codes)
+                        print(
+                            f"[langset] legal_moves: {n_l} support codewords across {len(self.legal_move_codes)} rows",
+                            flush=True,
+                        )
+                    self._raw_legal_moves = None
+                # PRECOMPUTE padded codeword->index tensors ONCE (not per step). Both terms read these by indexing
+                # with the batch's row ids, so the step loop does ONE batched gather+prod per set — no Python row
+                # loop, no per-step recompute. [N_rows, max_K, n_reserved] long (padded, -1 sentinel) + [N_rows] counts.
+                dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                nr = len(self.label_plan)
+                for fld, codes_attr in (
+                    ("move_neg_codes", "move_neg_idx"),
+                    ("legal_move_codes", "legal_move_idx"),
+                ):
+                    codes_list = getattr(self, fld, None)
+                    if codes_list is None:
+                        continue
+                    maxk = max((len(rc) for rc in codes_list), default=0)
+                    n_rows = len(codes_list)
+                    if maxk == 0:
+                        continue
+                    pad = torch.full((n_rows, maxk, nr), -1, dtype=torch.long)
+                    counts = torch.zeros(n_rows, dtype=torch.long)
+                    for i, rc in enumerate(codes_list):
+                        for j, cw in enumerate(rc):
+                            pad[i, j] = torch.tensor(cw, dtype=torch.long)
+                        counts[i] = len(rc)
+                    setattr(self, codes_attr, pad.to(dev))
+                    setattr(self, fld.replace("_codes", "_n"), counts.to(dev))
             # optional CONTINUOUS EMB SLOTS (multi-latent): per-row facet label columns (named by the emb_slots dict
             # keys), stashed as raw strings — MIRRORS the single-latent reader below (392-399). The class<->id maps +
             # transient decoder heads are built in _train_multi(). Set HERE because this branch returns before the

@@ -84,6 +84,26 @@ class TrainingArguments:
     # Encoded under no_grad (memory-safe: no extra backward). None = no hard negs (byte-identical to before).
     hard_neg_field: Optional[str] = None
 
+    # DISTRIBUTION-LEVEL hard negative (FSQ label_dims path): where `hard_neg_field` is a LATENT-cosine contrastive
+    # that tightens the ARGMAX / committed move but leaves the MASS ~flat (chess A/B: P-mass-on-blunders 34.5% ->
+    # 33.3% across no-neg/0.3/1.0/fixed), `move_neg_field` operates DIRECTLY on the reserved-digit softmax (dim_lg).
+    # Each row's `move_neg` column is a LIST of per-blunder label-dicts (e.g. [{"from_sq": g, "to_sq": f}, ...])
+    # whose values are mapped to codewords via `label_codewords` (the SAME map the positive label uses) -> the term
+    # minimizes Σ P(blunder) = Π over reserved digits of softmax(dim_lg[digit])[code], pushing the blunder's digit
+    # probabilities DOWN and the non-blunder levels UP. Grad flows straight into dim_lg / level_proj (the move).
+    # 0 = off (byte-identical). Pairs ONLY with `label_dims` (reserved-digit subspace); ignored otherwise.
+    lam_move_neg: float = 0.0
+    move_neg_field: Optional[str] = None
+    # LEGAL-MOVE-RENORMALIZED negative (FSQ label_dims path): the renormalized analog of `move_neg`. Where
+    # `move_neg` penalizes the RAW codeword prob (~0.002, too weak to move the legal mass), `legal_neg` names a
+    # per-row column of ALL legal moves' label-dicts (e.g. [{"from_sq":g,"to_sq":f}, ...]); the term maps them
+    # to codewords via `label_codewords`, renormalizes P over the support set, and penalizes the `move_neg`
+    # subset's SHARE = Σ_neg P(neg) / Σ_legal P(legal). Same space as the decode metric (~10-35% blunder share),
+    # so the gradient is ~50x larger and can reshape the legal-move mass. GENERIC (chess-ness is in the builder).
+    # 0 = off (byte-identical). Pairs ONLY with `label_dims` + `move_neg_field`; ignored otherwise.
+    lam_legal_neg: float = 0.0
+    legal_move_field: Optional[str] = None
+
     # supervised-contrastive label shaping (Khosla et al.): name a dataset column of GROUP LABELS the emitted latents
     # should organize into SEPARATE REGIONS by. SINGLE-latent: one scalar label per row. MULTI-latent: a per-row LIST
     # of labels aligned 1:1 with `target_texts` (each emitted item's group, e.g. its lifecycle STAGE). Within a batch,
