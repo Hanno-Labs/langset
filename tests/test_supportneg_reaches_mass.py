@@ -1,26 +1,26 @@
-"""GOLDEN test (test-first): a LEGAL-MOVE-RENORMALIZED negative (LegalMoveNegTerm) must suppress the blunder's
+"""GOLDEN test (test-first): a LEGAL-MOVE-RENORMALIZED negative (SupportNegTerm) must suppress the blunder's
 share of the LEGAL-move probability mass — and the gradient must be ~50x larger than the raw-codeword
-MoveNegTerm's, which is the whole point of renormalizing. RED until the term exists, GREEN once it does.
+LabelNegTerm's, which is the whole point of renormalizing. RED until the term exists, GREEN once it does.
 
-Why this term: MoveNegTerm penalizes P(blunder) = Π softmax(dim_lg[digit])[code] on the RAW digit softmax — but a
-specific codeword's raw prob is ~0.002-0.02 (mass spread across 8 levels x 4 digits), so loss_move_neg ~ 0.0018
+Why this term: LabelNegTerm penalizes P(blunder) = Π softmax(dim_lg[digit])[code] on the RAW digit softmax — but a
+specific codeword's raw prob is ~0.002-0.02 (mass spread across 8 levels x 4 digits), so loss_label_neg ~ 0.0018
 at weight 1.0, ~60x too weak to move the legal-move mass (chess moveneg10 run: P-mass-on-blunders 34.3% ≈
 control 34.5%, no effect). The DECODE metric measures legal-RENORMALIZED P(blunder) = P(codeword_blunder) /
-Σ_legal P(codeword_legal), where a blunder's share is ~10-35%. LegalMoveNegTerm penalizes THAT: loss =
+Σ_legal P(codeword_legal), where a blunder's share is ~10-35%. SupportNegTerm penalizes THAT: loss =
 Σ_neg P(codeword_neg) / Σ_support P(codeword_support). The gradient is renormalized — order ~0.1 not ~0.002 —
 so it can actually move the legal-move mass that the metric reads.
 
-The term stays GENERIC (no chess logic): it reads `legal_move_codes` (per-row list of codeword tuples = the
-SUPPORT set) and `move_neg_codes` (per-row subset to penalize), renormalizes P over the support, penalizes the
+The term stays GENERIC (no chess logic): it reads `support_codes` (per-row list of codeword tuples = the
+SUPPORT set) and `label_neg_codes` (per-row subset to penalize), renormalizes P over the support, penalizes the
 neg subset's share. The chess-ness (board -> legal moves -> codewords) lives in the data builder, not here.
 
 This test asserts the precise mechanism:
   - loss is in the LEGAL-RENORM range (~0.1-0.5), NOT the raw range (~0.002) — the renormalization happened;
-  - the blunder's digit-level grad is POSITIVE (push-down) and LARGE (>> MoveNegTerm's ~0.02 at the same setup);
+  - the blunder's digit-level grad is POSITIVE (push-down) and LARGE (>> LabelNegTerm's ~0.02 at the same setup);
   - non-blunder SUPPORT levels of the same digit are NEGATIVE (mass redistributes off the blunder WITHIN the
     legal support, not across the whole raw grid);
   - a single manual SGD step on the loss DECREASES the legal-renormalized P(blunder) (it actually reshapes mass).
-Run:  .venv/bin/python tests/test_legalneg_reaches_legal_mass.py
+Run:  .venv/bin/python tests/test_supportneg_reaches_mass.py
 """
 
 from __future__ import annotations
@@ -33,14 +33,14 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 import test_trainer_multi_characterization as M  # noqa: E402
 
-from langset.strategies import LegalMoveNegTerm, MultiStepCtx  # noqa: E402
+from langset.strategies import MultiStepCtx, SupportNegTerm  # noqa: E402
 
 
 class _FakeTrainer:
-    """Fields LegalMoveNegTerm reads: the PRECOMPUTED padded index tensors + counts for BOTH the neg subset and
+    """Fields SupportNegTerm reads: the PRECOMPUTED padded index tensors + counts for BOTH the neg subset and
     the legal support set (mirrors Trainer.__init__) + label_plan."""
 
-    def __init__(self, move_neg_codes, legal_move_codes, label_plan) -> None:
+    def __init__(self, label_neg_codes, support_codes, label_plan) -> None:
         self.label_plan = label_plan
         self.hard_neg_texts = None
         nr = len(label_plan)
@@ -56,8 +56,8 @@ class _FakeTrainer:
                 counts[i] = len(rc)
             return pad, counts
 
-        self.move_neg_idx, self.move_neg_n = _pad(move_neg_codes)
-        self.legal_move_idx, self.legal_move_n = _pad(legal_move_codes)
+        self.label_neg_idx, self.label_neg_n = _pad(label_neg_codes)
+        self.support_idx, self.support_n = _pad(support_codes)
 
 
 def _build_ctx(model, dev, legal_codes, neg_codes):
@@ -73,7 +73,7 @@ def _build_ctx(model, dev, legal_codes, neg_codes):
     label_plan = [(0, "from_sq", 0), (1, "from_sq", 1), (2, "to_sq", 0), (3, "to_sq", 1)]
     valid = torch.ones(B, L, dtype=torch.bool, device=dev)
     args = M._args("/tmp/_ln")
-    args.lam_legal_neg = 1.0
+    args.lam_support_neg = 1.0
     c = MultiStepCtx(
         trainer=_FakeTrainer([neg_codes], [legal_codes], label_plan),
         args=args,
@@ -105,10 +105,10 @@ def _renorm_p(model, dim_lg, code):
     return p
 
 
-def test_legal_neg_reaches_legal_mass() -> None:
-    """RED until LegalMoveNegTerm exists and penalizes the blunder's LEGAL-RENORMALIZED share. Two legal moves
+def test_support_neg_reaches_legal_mass() -> None:
+    """RED until SupportNegTerm exists and penalizes the blunder's LEGAL-RENORMALIZED share. Two legal moves
     (support = {good, blunder}); neg = {blunder}. Asserts the renorm happened (loss ~0.5 not ~0.002), the blunder
-    grad is POSITIVE and LARGE (>> MoveNegTerm's), non-blunder support levels are NEGATIVE, and one SGD step
+    grad is POSITIVE and LARGE (>> LabelNegTerm's), non-blunder support levels are NEGATIVE, and one SGD step
     actually lowers the renormalized P(blunder)."""
     torch.manual_seed(0)
     model = M._build_model()
@@ -119,9 +119,9 @@ def test_legal_neg_reaches_legal_mass() -> None:
     neg = [blunder]
     c, dim_lg = _build_ctx(model, dev, legal, neg)
 
-    contrib = LegalMoveNegTerm().contribute(c)
+    contrib = SupportNegTerm().contribute(c)
     assert contrib is not None, (
-        "LegalMoveNegTerm returned None (lam_legal_neg<=0 / no codes / no dim_lg)"
+        "SupportNegTerm returned None (lam_support_neg<=0 / no codes / no dim_lg)"
     )
     _k, loss_ln, _w = contrib
     assert torch.isfinite(loss_ln), f"legal-neg loss not finite: {loss_ln}"
@@ -130,7 +130,7 @@ def test_legal_neg_reaches_legal_mass() -> None:
     loss_val = float(loss_ln)
     assert 0.05 < loss_val < 0.95, (
         f"loss {loss_val:.4f} not in the legal-renorm range [0.05, 0.95] — if it's ~0.002 the term is the "
-        f"raw-codeword MoveNegTerm (no renormalization); if it's >1 the renorm denominator is wrong"
+        f"raw-codeword LabelNegTerm (no renormalization); if it's >1 the renorm denominator is wrong"
     )
 
     for p in model.parameters():
@@ -147,11 +147,11 @@ def test_legal_neg_reaches_legal_mass() -> None:
         f"legal_neg: loss={loss_val:.4f}  blunder_digit_grads={[f'{x:+.3e}' for x in bgrad]}  "
         f"good_digit_grads={[f'{x:+.3e}' for x in ggrad]}"
     )
-    # (2) blunder digit grads POSITIVE (push-down) and LARGE (>> MoveNegTerm's ~0.02 — the renorm amplifies)
+    # (2) blunder digit grads POSITIVE (push-down) and LARGE (>> LabelNegTerm's ~0.02 — the renorm amplifies)
     assert all(x > 0 for x in bgrad), f"blunder digit grads not all positive: {bgrad}"
     assert max(bgrad) > 0.05, (
         f"blunder grad max {max(bgrad):.3e} too small — the legal renorm should amplify ~50x over the raw "
-        f"MoveNegTerm (~0.02); if it's ~0.002 the term is not renormalizing"
+        f"LabelNegTerm (~0.02); if it's ~0.002 the term is not renormalizing"
     )
     # (3) good-move (the other support member) digit grads NEGATIVE — mass redistributes off the blunder WITHIN
     # the legal support (not across the whole raw grid)
@@ -166,7 +166,7 @@ def test_legal_neg_reaches_legal_mass() -> None:
         / (_renorm_p(model, dim_lg.detach(), blunder) + _renorm_p(model, dim_lg.detach(), good))
     )
     opt.zero_grad()
-    LegalMoveNegTerm().contribute(c)[1].backward(retain_graph=False)
+    SupportNegTerm().contribute(c)[1].backward(retain_graph=False)
     opt.step()
     with torch.no_grad():
         pb = float(_renorm_p(model, dim_lg, blunder))
@@ -186,7 +186,7 @@ def test_legal_neg_reaches_legal_mass() -> None:
 
 if __name__ == "__main__":
     torch.use_deterministic_algorithms(True, warn_only=True)
-    for name in ("test_legal_neg_reaches_legal_mass",):
+    for name in ("test_support_neg_reaches_legal_mass",):
         try:
             globals()[name]()
             print(f"{name} PASS\n")

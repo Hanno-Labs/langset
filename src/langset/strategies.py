@@ -218,7 +218,7 @@ class HardNegTerm(_LossTerm):
         return (self.key, loss_hn, a.lam_hard_neg)
 
 
-class MoveNegTerm(_LossTerm):
+class LabelNegTerm(_LossTerm):
     """DISTRIBUTION-LEVEL hard negative (FSQ label_dims path): penalize the probability MASS the model's
     PREDICTED move distribution puts on each row's blunder moves, operating DIRECTLY on the reserved-digit
     softmax (dim_lg) — not the latent. For each blunder's codeword (precomputed by the trainer via
@@ -228,23 +228,23 @@ class MoveNegTerm(_LossTerm):
 
     The codeword->index tensor is PRECOMPUTED ONCE in Trainer.__init__ (padded `[N_rows, max_neg, n_reserved]`
     long + a count mask) so the step loop does ONE batched gather+prod — no Python, no per-step recompute.
-    Applied to each VALID tick of the row (single-latent: 1 tick). Self-skips when `lam_move_neg<=0`, no codes,
+    Applied to each VALID tick of the row (single-latent: 1 tick). Self-skips when `lam_label_neg<=0`, no codes,
     no `label_plan`, or non-FSQ (`dim_lg` is None) — byte-identical to before when off.
 
-    EMPIRICAL NOTE: this term is a building block (shares the codeword->index precompute with LegalMoveNegTerm)
+    EMPIRICAL NOTE: this term is a building block (shares the codeword->index precompute with SupportNegTerm)
     but is empirically weak on its own — the RAW codeword probability it penalizes is ~0.002 (mass spread across
     8 levels x several digits), so the gradient is ~60x too small to move the legal-move mass the decode metric
-    reads (chess moveneg10 run: P-mass-on-blunders 34.3% ≈ control 34.5%, no effect). LegalMoveNegTerm
+    reads (chess moveneg10 run: P-mass-on-blunders 34.3% ≈ control 34.5%, no effect). SupportNegTerm
     renormalizes over the legal-move support set and is the term that actually reshapes mass; prefer it."""
 
-    key = "loss_move_neg"
+    key = "loss_label_neg"
 
     def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
         a, self_ = c.args, c.trainer
-        if a.lam_move_neg <= 0 or c.dim_lg is None:
+        if a.lam_label_neg <= 0 or c.dim_lg is None:
             return None
         plan = self_.label_plan
-        idx_t, n_t = getattr(self_, "move_neg_idx", None), getattr(self_, "move_neg_n", None)
+        idx_t, n_t = getattr(self_, "label_neg_idx", None), getattr(self_, "label_neg_n", None)
         if idx_t is None or n_t is None or plan is None:
             return None
         assert (
@@ -275,13 +275,13 @@ class MoveNegTerm(_LossTerm):
         n = int(mask.sum().item()) * c.lmax
         if n == 0:
             return None
-        return (self.key, p_cw.sum() / n, a.lam_move_neg)
+        return (self.key, p_cw.sum() / n, a.lam_label_neg)
 
 
-class LegalMoveNegTerm(_LossTerm):
+class SupportNegTerm(_LossTerm):
     """LEGAL-MOVE-RENORMALIZED negative (FSQ label_dims path): penalize the blunder's share of the LEGAL-move
     probability mass, operating DIRECTLY on the reserved-digit softmax (dim_lg) — the same space the decode
-    metric reads. Where MoveNegTerm penalizes the RAW codeword probability (P ~ 0.002, grad ~ 0.002 — too weak
+    metric reads. Where LabelNegTerm penalizes the RAW codeword probability (P ~ 0.002, grad ~ 0.002 — too weak
     to move the legal mass; chess moveneg10: P-mass 34.3% ≈ control 34.5%), this term RENORMALIZES: loss =
     Σ_neg P(codeword_neg) / Σ_support P(codeword_support). The renormalized blunder share is ~10-35% (the metric
     range), so the gradient is ~50x larger and can actually reshape the legal-move mass.
@@ -289,26 +289,26 @@ class LegalMoveNegTerm(_LossTerm):
     GENERIC (no chess logic): both the neg-subset and legal-support codeword->index tensors are PRECOMPUTED ONCE
     in Trainer.__init__ (padded `[N_rows, max_K, n_reserved]` long + count masks) so the step loop does ONE
     batched gather+prod per set — no Python, no per-step recompute. The chess-ness (board -> legal moves ->
-    codewords via label_codewords) lives in the data builder. Self-skips when `lam_legal_neg<=0`, no codes, no
+    codewords via label_codewords) lives in the data builder. Self-skips when `lam_support_neg<=0`, no codes, no
     `label_plan`, or non-FSQ (dim_lg None) — byte-identical to before when off.
 
     VALIDATED (chess A/B, held-out shard_1, n=400, SmolLM2-135M full-FT, 4ep): the blunder's legal-move MASS
     drops monotonically with weight — neg-off 34.5% -> 0.3 31.3% -> 0.6 29.9% -> 1.0 28.7% — the first negative
-    form to move mass outside the noise floor (latent-cosine HardNegTerm and raw MoveNegTerm both left it flat).
+    form to move mass outside the noise floor (latent-cosine HardNegTerm and raw LabelNegTerm both left it flat).
     0.6 is the operating point (best overall: lowest cp-regret 435 AND lowest argmax-blunder 24%; at 1.0 the
     argmax regresses as the term over-regularizes the base digit CE). See tests/test_legalneg_reaches_legal_mass.py."""
 
-    key = "loss_legal_neg"
+    key = "loss_support_neg"
 
     def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
         a, self_ = c.args, c.trainer
-        if a.lam_legal_neg <= 0 or c.dim_lg is None:
+        if a.lam_support_neg <= 0 or c.dim_lg is None:
             return None
         plan = self_.label_plan
-        neg_idx, neg_n = getattr(self_, "move_neg_idx", None), getattr(self_, "move_neg_n", None)
+        neg_idx, neg_n = getattr(self_, "label_neg_idx", None), getattr(self_, "label_neg_n", None)
         leg_idx, leg_n = (
-            getattr(self_, "legal_move_idx", None),
-            getattr(self_, "legal_move_n", None),
+            getattr(self_, "support_idx", None),
+            getattr(self_, "support_n", None),
         )
         if neg_idx is None or neg_n is None or leg_idx is None or leg_n is None or plan is None:
             return None
@@ -348,7 +348,7 @@ class LegalMoveNegTerm(_LossTerm):
         n = float(has_neg[:, None].expand(-1, c.lmax).sum().item())
         if n == 0:
             return None
-        return (self.key, (sum_neg / sum_leg * has_neg[:, None]).sum() / n, a.lam_legal_neg)
+        return (self.key, (sum_neg / sum_leg * has_neg[:, None]).sum() / n, a.lam_support_neg)
 
 
 class SupConTerm(_LossTerm):
@@ -425,8 +425,8 @@ def build_loss_terms(args: TrainingArguments) -> list[_LossTerm]:
         LabelDimsTerm(),
         MultiNCETerm(maskers=[identical_text_mask]),
         HardNegTerm(),
-        MoveNegTerm(),
-        LegalMoveNegTerm(),
+        LabelNegTerm(),
+        SupportNegTerm(),
         SupConTerm(),
     ]
 

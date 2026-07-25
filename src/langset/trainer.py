@@ -529,24 +529,24 @@ class Trainer:
                 ]
             # optional DISTRIBUTION-LEVEL hard negative (FSQ label_dims): per-row LIST of per-blunder label-dicts
             # (e.g. [{"from_sq": g, "to_sq": f}, ...]) whose values map to codewords via label_codewords (built
-            # below from the positive label_cols). move_neg_codes[row] = list of codeword tuples, one per blunder,
-            # each tuple ordered by label_plan. MoveNegTerm / LegalMoveNegTerm penalize P(blunder) on the
+            # below from the positive label_cols). label_neg_codes[row] = list of codeword tuples, one per blunder,
+            # each tuple ordered by label_plan. LabelNegTerm / SupportNegTerm penalize P(blunder) on the
             # reserved-digit softmax.
-            self.move_neg_codes: Optional[list[list[tuple[int, ...]]]] = None
-            mn_field = getattr(args, "move_neg_field", None)
+            self.label_neg_codes: Optional[list[list[tuple[int, ...]]]] = None
+            mn_field = getattr(args, "label_neg_field", None)
             if mn_field is not None:
                 raw_mn = cols[inv.get(mn_field, mn_field)]
                 # label_codewords / label_plan are built below from `label_dims`; defer the codeword mapping to a
                 # second pass (after label_codewords exists) so we don't duplicate the build here.
-                self._raw_move_neg = list(raw_mn)
-                self._move_neg_field = mn_field
-            # LEGAL-MOVE support set (for LegalMoveNegTerm renormalization): per-row list of legal-move
+                self._raw_label_neg = list(raw_mn)
+                self._label_neg_field = mn_field
+            # LEGAL-MOVE support set (for SupportNegTerm renormalization): per-row list of legal-move
             # label-dicts (e.g. [{"from_sq":g,"to_sq":f}, ...]) -> mapped to codewords via label_codewords below.
-            self.legal_move_codes: Optional[list[list[tuple[int, ...]]]] = None
-            leg_field = getattr(args, "legal_move_field", None)
+            self.support_codes: Optional[list[list[tuple[int, ...]]]] = None
+            leg_field = getattr(args, "support_field", None)
             if leg_field is not None:
-                self._raw_legal_moves = list(cols[inv.get(leg_field, leg_field)])
-                self._legal_move_field = leg_field
+                self._raw_support = list(cols[inv.get(leg_field, leg_field)])
+                self._support_field = leg_field
             # optional MULTI-latent supervised-contrastive: a per-row LIST of group labels aligned 1:1 with
             # target_texts (each emitted item's stage/group). Shapes emissions into separate regions (weight lam_sup).
             self.sup_labels: Optional[list[list[str]]] = None
@@ -616,15 +616,18 @@ class Trainer:
                 # second pass: map each row's move_neg blunder label-dicts -> codeword tuples via label_codewords.
                 # Each blunder dict's values are looked up per field and the digit indices concatenated in label_plan
                 # order (so the codeword aligns with the reserved-digit layout in dim_lg).
-                if getattr(self, "_raw_move_neg", None) is not None and self.label_plan is not None:
-                    _raw_move_neg = (
-                        self._raw_move_neg
+                if (
+                    getattr(self, "_raw_label_neg", None) is not None
+                    and self.label_plan is not None
+                ):
+                    _raw_label_neg = (
+                        self._raw_label_neg
                     )  # narrows Optional -> list for the type checker
-                    assert _raw_move_neg is not None
+                    assert _raw_label_neg is not None
                     cws_per_field = self.label_codewords  # {field: {class_str: [digit idxs]}}
-                    self.move_neg_codes = []
+                    self.label_neg_codes = []
                     skipped = 0
-                    for v in _raw_move_neg:
+                    for v in _raw_label_neg:
                         blunders = (
                             v
                             if isinstance(v, (list, tuple))
@@ -650,29 +653,26 @@ class Trainer:
                                 code.append(int(digs[pos]))
                             if ok:
                                 row_codes.append(tuple(code))
-                        self.move_neg_codes.append(row_codes)
+                        self.label_neg_codes.append(row_codes)
                     if args.verbose:
-                        n_b = sum(len(rc) for rc in self.move_neg_codes)
+                        n_b = sum(len(rc) for rc in self.label_neg_codes)
                         print(
-                            f"[langset] move_neg: {n_b} blunder codewords across {len(self.move_neg_codes)} rows"
+                            f"[langset] move_neg: {n_b} blunder codewords across {len(self.label_neg_codes)} rows"
                             + (f" (skipped {skipped} non-dict)" if skipped else ""),
                             flush=True,
                         )
-                    self._raw_move_neg = (
+                    self._raw_label_neg = (
                         None  # free the raw column; codes are the live structure now
                     )
                 # map each row's legal-move label-dicts -> codeword tuples (the SUPPORT set for renormalization)
-                if (
-                    getattr(self, "_raw_legal_moves", None) is not None
-                    and self.label_plan is not None
-                ):
-                    _raw_legal_moves = (
-                        self._raw_legal_moves
+                if getattr(self, "_raw_support", None) is not None and self.label_plan is not None:
+                    _raw_support = (
+                        self._raw_support
                     )  # narrows Optional -> list for the type checker
-                    assert _raw_legal_moves is not None
+                    assert _raw_support is not None
                     cws_per_field = self.label_codewords
-                    self.legal_move_codes = []
-                    for v in _raw_legal_moves:
+                    self.support_codes = []
+                    for v in _raw_support:
                         moves = (
                             v
                             if isinstance(v, (list, tuple))
@@ -697,22 +697,22 @@ class Trainer:
                                 code.append(int(digs[pos]))
                             if ok:
                                 row_codes.append(tuple(code))
-                        self.legal_move_codes.append(row_codes)
+                        self.support_codes.append(row_codes)
                     if args.verbose:
-                        n_l = sum(len(rc) for rc in self.legal_move_codes)
+                        n_l = sum(len(rc) for rc in self.support_codes)
                         print(
-                            f"[langset] legal_moves: {n_l} support codewords across {len(self.legal_move_codes)} rows",
+                            f"[langset] legal_moves: {n_l} support codewords across {len(self.support_codes)} rows",
                             flush=True,
                         )
-                    self._raw_legal_moves = None
+                    self._raw_support = None
                 # PRECOMPUTE padded codeword->index tensors ONCE (not per step). Both terms read these by indexing
                 # with the batch's row ids, so the step loop does ONE batched gather+prod per set — no Python row
                 # loop, no per-step recompute. [N_rows, max_K, n_reserved] long (padded, -1 sentinel) + [N_rows] counts.
                 dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                 nr = len(self.label_plan)
                 for fld, codes_attr in (
-                    ("move_neg_codes", "move_neg_idx"),
-                    ("legal_move_codes", "legal_move_idx"),
+                    ("label_neg_codes", "label_neg_idx"),
+                    ("support_codes", "support_idx"),
                 ):
                     codes_list = getattr(self, fld, None)
                     if codes_list is None:
