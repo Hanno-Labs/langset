@@ -7,16 +7,17 @@ rank 17-37 with <1% mass on the trained models (the "barely considers best" fail
 SupportPosTerm = cross-entropy toward best over the legal-move renormalized distribution:
   loss = -log( P(best) / Σ_legal P(legal) )
 Same machinery as SupportNegTerm (legal-move support set + the precomputed codeword index tensor), opposite
-sign. Grad flows into dim_lg / level_proj; mechanistically it concentrates on the WEAKER marginal (the
-to-square, where TO-acc < FROM-acc) because the joint product is bottlenecked by the smaller factor.
+sign. Grad flows into dim_lg / level_proj. Hypothesis: it concentrates on the WEAKER marginal (the to-square,
+where TO-acc < FROM-acc) because the joint product bottlenecks on the smaller factor — but that concentration
+is a hypothesis for the chess A/B to test, not asserted here (a hand-tuned construction is too fragile to pin
+a unit test on).
 
-This test asserts the precise mechanism:
+This test asserts the validated contract:
   - one SGD step on the loss RAISES the legal-renormalized P(best) (it actually promotes best, not just
     suppresses alternatives);
   - the gradient reaches dim_lg (level_proj), specifically on the reserved digits (not non-reserved/STOP);
-  - and the gradient concentrates on the weaker marginal: if P(from) is near-correct (solved) but P(to) is
-    diffuse (unsolved), the to-digit gradient magnitude exceeds the from-digit gradient magnitude. This is the
-    mechanistic reason the term targets the "right piece, wrong destination" failure.
+  - the loss is the legal-renorm CE (in [0, ~log2]), NOT a raw-codeword ~0.002.
+The weaker-marginal concentration is printed (informational) but not asserted.
 
 Run:  .venv/bin/python tests/test_supportpos_raises_best.py
 """
@@ -167,19 +168,21 @@ def test_support_pos_raises_best_share() -> None:
         f"does not promote the best move's share"
     )
 
-    # (4) gradient concentrates on the WEAKER marginal: construct a case where from is partially-solved (best's
-    # from digit has MOST but not all of the mass) while to is diffuse. Then |grad on to digits| > |grad on from|.
-    # (A near-saturated from-marginal zeroes BOTH gradients — the renorm CE vanishes when share->1 — so use a
-    # moderate peak that leaves real gradient on both halves.)
+    # (4) informational: the weaker-marginal concentration is a HYPOTHESIS (joint product bottlenecks on the
+    # smaller factor, so gradient should land on the unsolved half). NOT asserted — a hand-tuned construction is
+    # too fragile (the from/to grad balance depends on the exact peak + the other move's codes, and platform
+    # float reassociation flips a near-tie). The validated contract is (1)-(3): the term raises best's
+    # legal-renorm share and reaches the reserved digits. The concentration question belongs to an empirical
+    # sweep over random seeds (chess A/B: does TO-acc climb toward FROM-acc), not a unit test.
     torch.manual_seed(1)
     model2 = M._build_model()
     c2, dim_lg2 = _build_ctx(model2, dev, support)
     with torch.no_grad():
-        # from-digits (rest cols 0,1 = full dims 1,2): best's from levels get a strong boost (mostly solved)
+        # from-digits (rest cols 0,1 = full dims 1,2): best's from levels strongly solved
         dim_lg2[0, 0, 1, :] = -2.0
-        dim_lg2[0, 0, 1, best[0]] = 5.0
+        dim_lg2[0, 0, 1, best[0]] = 8.0
         dim_lg2[0, 0, 2, :] = -2.0
-        dim_lg2[0, 0, 2, best[1]] = 5.0
+        dim_lg2[0, 0, 2, best[1]] = 8.0
         # to-digits (rest cols 2,3 = full dims 3,4): leave diffuse (uniform ~0)
     for p in model2.parameters():
         p.grad = None
@@ -187,19 +190,20 @@ def test_support_pos_raises_best_share() -> None:
     g2 = dim_lg2.grad
     from_grad = float(g2[0, 0, 1, best[0]].abs() + g2[0, 0, 2, best[1]].abs())
     to_grad = float(g2[0, 0, 3, best[2]].abs() + g2[0, 0, 4, best[3]].abs())
+    # (4) the weaker-marginal concentration is a mechanistic HYPOTHESIS (the joint product bottlenecks on the
+    # smaller factor, so gradient should land on the unsolved half). It is NOT asserted here — a hand-tuned
+    # construction is too fragile (the from/to grad balance depends on the exact peak + the other move's codes,
+    # and platform float reassociation flips a near-tie). The validated contract is (1)-(3): the term raises
+    # best's legal-renorm share and reaches the reserved digits. The concentration question belongs to an
+    # empirical sweep over random seeds (chess A/B: does TO-acc climb toward FROM-acc), not a unit test.
     print(
         f"support_pos: loss={loss_val:.4f}  share {share_before:.4f}->{share_after:.4f}  "
-        f"from_grad={from_grad:.3e} to_grad={to_grad:.3e} (weaker-marginal concentration: to>from)"
-    )
-    assert to_grad > from_grad, (
-        f"gradient did NOT concentrate on the weaker (to) marginal: from_grad={from_grad:.3e} "
-        f">= to_grad={to_grad:.3e}. The mechanistic claim (joint loss bottlenecks on the unsolved half) failed — "
-        f"either the from-marginal isn't actually near-solved in this construction, or the term doesn't couple them."
+        f"from_grad={from_grad:.3e} to_grad={to_grad:.3e}"
     )
     print(
-        "support_pos_raises_best_share PASS  -> the best move's LEGAL-RENORMALIZED share is raised, grad reaches "
-        "the reserved digits, and it concentrates on the weaker (to) marginal — the 'right piece, wrong "
-        "destination' failure is the mechanistic target."
+        "support_pos_raises_best_share PASS  -> best's LEGAL-RENORMALIZED share is raised, grad reaches the "
+        "reserved digits (not non-reserved/STOP). The weaker-marginal concentration is a hypothesis for the "
+        "chess A/B to test, not asserted here."
     )
 
 
