@@ -351,6 +351,64 @@ class SupportNegTerm(_LossTerm):
         return (self.key, (sum_neg / sum_leg * has_neg[:, None]).sum() / n, a.lam_support_neg)
 
 
+class SupportPosTerm(_LossTerm):
+    """LEGAL-MOVE-RENORMALIZED POSITIVE (FSQ label_dims path): the positive analog of SupportNegTerm. Where
+    LabelDimsTerm trains per-digit MARGINALS only (CE on each reserved digit independently), the decode reads
+    the JOINT-RENORMALIZED P(best)/Σ_legal P(legal) — which is never directly trained, so SF-best sits at rank
+    17-37 with <1% mass on the trained models (the "barely considers best" failure, validated on 4 boards).
+
+    This term is cross-entropy toward best over the legal-move renormalized distribution:
+        loss = -log( P(best) / Σ_legal P(legal) )
+    Same machinery as SupportNegTerm (the precomputed legal-move support index tensor), opposite sign. Grad
+    flows into dim_lg / level_proj; mechanistically it concentrates on the WEAKER marginal (the to-square,
+    where TO-acc < FROM-acc) because the joint product P(best.from)·P(best.to) is bottlenecked by the smaller
+    factor — so the gradient lands where the marginal is unsolved, not where it's already correct.
+
+    'best' is support_codes[row][0] by convention (the positive label = the first entry of the legal-move
+    support list emitted by the data builder). Self-skips when `lam_support_pos<=0`, no support codes, no
+    `label_plan`, or non-FSQ (dim_lg None) — byte-identical to before when off."""
+
+    key = "loss_support_pos"
+
+    def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
+        a, self_ = c.args, c.trainer
+        if a.lam_support_pos <= 0 or c.dim_lg is None:
+            return None
+        plan = self_.label_plan
+        leg_idx, leg_n = getattr(self_, "support_idx", None), getattr(self_, "support_n", None)
+        if leg_idx is None or leg_n is None or plan is None:
+            return None
+        rcols = [cj for (cj, _, _) in plan]
+        if not rcols:
+            return None
+        soft = torch.softmax(
+            c.dim_lg[:, : c.lmax, 1:, :][:, :, rcols, :].float(), -1
+        )  # [B, lmax, n_reserved, V]
+        bidx = torch.as_tensor(c.bidx, device=c.dev, dtype=torch.long)
+        idx = leg_idx[bidx].to(c.dev)  # [B, max_legal, n_reserved]
+        nn = leg_n[bidx].to(c.dev)  # [B]
+        idx = idx.clamp(min=0)  # padding sentinels (-1) -> 0 (OOB on CUDA gather; masked out below)
+        probs = [
+            soft[:, :, d, :].gather(-1, idx[:, None, :, d].expand(-1, c.lmax, -1))
+            for d in range(len(rcols))
+        ]
+        p_cw = torch.stack(probs, -1).prod(-1)  # [B, lmax, max_legal] per-codeword raw probs
+        mask = (torch.arange(idx.size(1), device=c.dev)[None, :] < nn[:, None]).to(p_cw.dtype)
+        p_cw = p_cw * mask[:, None, :]  # zero padding
+        sum_leg = p_cw.sum(-1).clamp(min=1e-8)  # [B, lmax] Σ_legal (renorm denominator)
+        # best = the FIRST legal move in each row's support list (the positive label, by convention)
+        p_best = p_cw[:, :, 0]  # [B, lmax]
+        has_best = (nn > 0).to(p_best.dtype)  # [B] only count rows that have a support set
+        n = float(has_best[:, None].expand(-1, c.lmax).sum().item())
+        if n == 0:
+            return None
+        return (
+            self.key,
+            (-(p_best / sum_leg).clamp(min=1e-8).log() * has_best[:, None]).sum() / n,
+            a.lam_support_pos,
+        )
+
+
 class SupConTerm(_LossTerm):
     """Supervised-contrastive shaping over emitted latents by the per-item `sup_field` group labels."""
 
@@ -427,6 +485,7 @@ def build_loss_terms(args: TrainingArguments) -> list[_LossTerm]:
         HardNegTerm(),
         LabelNegTerm(),
         SupportNegTerm(),
+        SupportPosTerm(),
         SupConTerm(),
     ]
 

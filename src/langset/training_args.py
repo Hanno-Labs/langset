@@ -103,6 +103,14 @@ class TrainingArguments:
     # 0 = off (byte-identical). Pairs ONLY with `label_dims` + `label_neg_field`; ignored otherwise.
     lam_support_neg: float = 0.0
     support_field: Optional[str] = None
+    # LEGAL-MOVE-RENORMALIZED POSITIVE (FSQ label_dims path): the positive analog of `lam_support_neg`. Where
+    # LabelDimsTerm trains per-digit MARGINALS only, this term cross-entropy-trains the JOINT-RENORMALIZED
+    # P(best)/Σ_legal P(legal) — the exact quantity the decode metric reads — directly promoting the best move's
+    # share of the legal-move mass. Reuses `support_field` for the support set (no separate column); 'best' is
+    # the first entry of each row's legal-move list (the positive label, by convention). Mechanistically
+    # concentrates gradient on the weaker (unsolved) marginal — the to-square when from is already near-correct.
+    # 0 = off (byte-identical). Pairs ONLY with `label_dims` + `support_field`; ignored otherwise.
+    lam_support_pos: float = 0.0
 
     # supervised-contrastive label shaping (Khosla et al.): name a dataset column of GROUP LABELS the emitted latents
     # should organize into SEPARATE REGIONS by. SINGLE-latent: one scalar label per row. MULTI-latent: a per-row LIST
