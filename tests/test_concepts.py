@@ -76,8 +76,8 @@ def test_facets_get_separate_slices_and_separate_softmaxes() -> None:
     )
     share = m.head.state_dim // len(alpha)
     facets = []
-    for f in alpha:
-        g = torch.Generator().manual_seed(hash(f) % 10_000)
+    for seed, f in enumerate(alpha):
+        g = torch.Generator().manual_seed(seed)
         facets.append((f, torch.randn(len(alpha[f]), share, generator=g), share))
     m.head.set_concepts(facets)
     assert m.head.concept_names == list(alpha)

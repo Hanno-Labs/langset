@@ -2113,7 +2113,6 @@ class Trainer:
                     "loss_state": "state",
                     "loss_concept": "concept",
                     "emit_cos": "emit_cos",
-                    "res_share": "res_share",  # how much of the emission the alphabet could NOT name
                 }
                 base_s = " ".join(f"{v}={row[k]:.3f}" for k, v in _names.items() if k in row)
                 # per-facet concept losses are discovered from the data, so their keys are not known here

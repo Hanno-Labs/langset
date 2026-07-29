@@ -145,9 +145,8 @@ def main() -> None:
         "--res-dim",
         type=int,
         default=64,
-        help="Width of the residual half under --state-residual (0 = pure state). The residual is what "
-        "keeps a named alphabet from being a ceiling: watch `res_share` in the logs, which is how "
-        "much of the emission the alphabet could NOT account for.",
+        help="Width of the residual half under --state-residual (0 = pure state). The residual keeps "
+        "a named alphabet from being a ceiling by carrying information outside the named state.",
     )
     p.add_argument(
         "--concepts",

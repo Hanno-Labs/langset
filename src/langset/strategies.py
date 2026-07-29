@@ -922,14 +922,7 @@ class StateResidualObjective(_EmissionObjective):
             emission = state
         with torch.no_grad():
             emit_cos = F.cosine_similarity(emission[valid], target_lat[valid], dim=-1).mean()
-            res_share = (
-                (emission[valid][:, -self.res_dim :].norm(dim=-1) ** 2).mean()
-                if self.res_dim
-                else torch.zeros((), device=dev)
-            )
         logs = {"loss_state": loss_state, "loss_stop": loss_stop, "emit_cos": emit_cos}
-        if self.res_dim:
-            logs["res_share"] = res_share  # how much of the emission the alphabet could NOT name
         return EmissionOut(
             recon=emission,
             base_loss=loss_state + loss_stop,

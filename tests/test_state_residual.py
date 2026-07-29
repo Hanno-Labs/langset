@@ -5,7 +5,7 @@ Both DECODE meaning out of a latent the twin defined. This third mode CONSTITUTE
 are a mixture over a named alphabet, its trailing `res_dim` dims are a residual nothing names.
 
 The split is what makes adopting a named alphabet safe. An alphabet is a ceiling — whatever it cannot name, the
-emission cannot carry — so the residual is where the unnamed goes, and `res_share` measures how much that is.
+emission cannot carry — so the residual is where unnamed information can go.
 """
 
 import os
