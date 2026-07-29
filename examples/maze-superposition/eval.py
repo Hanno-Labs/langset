@@ -5,7 +5,7 @@ example): this file is now just maze glue — roll the model out, name the two g
 and solvability), and hand them to the library. Everything reads off `rollout(..., return_soft=True)`:
 
   * SUPERPOSITION CALIBRATION (headline) — `calibration_corr(entropy, nbranch)`: does the emitted latent's native
-    FSQ entropy track the true frontier size? Positive = a *calibrated* set of next states, not one guess.
+    concept entropy track the true frontier size? Positive = a *calibrated* set of next states, not one guess.
   * SOLVABILITY — `linear_decodability(terminal/mean latent -> solvable)`: can the emitted trajectory separate a
     SOLVABLE maze from an UNSOLVABLE one?
 

@@ -4,7 +4,7 @@ Each row is one maze; its `target_texts` are the per-tick frontiers of a paralle
 (see gen_maze.py). The model emits ONE latent per tick, and each tick's target describes the whole SET of
 wavefront cells active that tick — so a single emitted latent must represent a *superposition* of next states,
 not one. Reading out `rollout(..., return_soft=True)`, eval.py then checks the headline property: the emitted
-latent's FSQ entropy tracks the frontier SIZE (calibrated uncertainty), and the frontier is recoverable across
+concept distribution's entropy tracks the frontier SIZE (calibrated uncertainty), and the frontier is recoverable across
 branch counts. That's a world model that holds the distribution of where the search could be, not a single guess.
 
 Two langset pieces make this work:
@@ -33,7 +33,6 @@ from langset.strategies import (
     CODE_SOURCES,
     ConceptObjective,
     SIGRegTarget,
-    StateResidualObjective,
     last_epoch_selector,
 )
 
@@ -89,8 +88,6 @@ def main() -> None:
     p.add_argument(
         "--max-fut", type=int, default=32, help="cap on emitted latents (ticks) per maze"
     )
-    p.add_argument("--fsq-dim", type=int, default=256)
-    p.add_argument("--fsq-levels", type=int, default=8)
     p.add_argument(
         "--kv-cache",
         action="store_true",
@@ -132,37 +129,17 @@ def main() -> None:
         "Use a gentler lr (~2e-5) so full-FT does not overwrite the pretrained knowledge.",
     )
     p.add_argument(
-        "--state-residual",
-        action="store_true",
-        help="STATE + RESIDUAL emission (the third way to shape the latent, next to --fsq-dim and "
-        "emb_slots). The latent splits: its first dims are a MIXTURE over the grid*grid cells — "
-        "one softmax, soft 1/k target, so the cells COMPETE for a fixed budget of mass and the "
-        "emission is constituted from the frontier rather than having it decoded back out — and "
-        "the last --res-dim dims are a residual the cell alphabet cannot name, shaped by the "
-        "twin/recon terms. Needs --grid; reuses the same per-tick cell column as --concepts.",
-    )
-    p.add_argument(
         "--res-dim",
         type=int,
         default=64,
-        help="Width of the residual half under --state-residual (0 = pure state). The residual keeps "
+        help="Width of the unnamed residual (0 = pure named state). The residual keeps "
         "a named alphabet from being a ceiling by carrying information outside the named state.",
-    )
-    p.add_argument(
-        "--concepts",
-        action="store_true",
-        help="CONCEPTS emission (the text-in form of --state-residual, and the one to prefer). Each "
-        "tick's frontier is written as cell NAMES (r3c4) in a `concepts` column; langset "
-        "discovers the alphabet and builds the codebook via --code-source. With one facet, "
-        "--code-source random and --res-dim 0 this is exactly the arm that beat the text "
-        "baseline at wide frontiers — a soft 1/k target over the cells, so they compete for a "
-        "fixed budget of mass, plus an independent stop head.",
     )
     p.add_argument(
         "--code-source",
         default="random",
         choices=sorted(CODE_SOURCES),
-        help="Where each cell's vector comes from under --state-residual. 'random' = seeded "
+        help="Where each named cell's vector comes from. 'random' = seeded "
         "orthonormal, arbitrary but LOSSLESSLY decodable (the benchmark default: no probe, so "
         "recall measures the emission). 'model' = the base model's embedding of the cell's name, "
         "so adjacent cells are related — semantic, but a mixture no longer inverts exactly. "
@@ -181,11 +158,8 @@ def main() -> None:
     )
     p.add_argument("--wandb-project", default="langset-maze")
     a = p.parse_args()
-    if a.state_residual and a.concepts:
-        p.error("--state-residual and --concepts are alternative state-data interfaces; choose one")
-
     z = np.load(a.data, allow_pickle=True)
-    rows = build_rows(z, a.max_fut, grid=a.grid if (a.state_residual or a.concepts) else 0)
+    rows = build_rows(z, a.max_fut, grid=a.grid)
     print(f"[train] {len(rows)} maze rows | backbone={a.backbone} | device={a.device}", flush=True)
 
     if a.random_init:  # CONTROL ARM: no pretrained knowledge, full-param train, chosen tokenizer
@@ -202,12 +176,10 @@ def main() -> None:
             latent_dim=None,
             n_latents=1,
             multi_latent=True,
-            fsq_dim=a.fsq_dim,
-            fsq_levels=a.fsq_levels,
             max_len=a.max_len,
-            code_emit=(a.state_residual or a.concepts),
-            n_codes=a.grid * a.grid if (a.state_residual or a.concepts) else 0,
-            res_dim=a.res_dim if (a.state_residual or a.concepts) else 0,
+            code_emit=True,
+            n_codes=a.grid * a.grid,
+            res_dim=a.res_dim,
             bf16=(a.device == "cuda"),
             device=a.device,
             arch_overrides=overrides,
@@ -223,12 +195,10 @@ def main() -> None:
             latent_dim=None,
             n_latents=1,
             multi_latent=True,
-            fsq_dim=1 if (a.state_residual or a.concepts) else a.fsq_dim,
-            fsq_levels=a.fsq_levels,
             max_len=a.max_len,
-            code_emit=(a.state_residual or a.concepts),
-            n_codes=a.grid * a.grid if (a.state_residual or a.concepts) else 0,
-            res_dim=a.res_dim if (a.state_residual or a.concepts) else 0,
+            code_emit=True,
+            n_codes=a.grid * a.grid,
+            res_dim=a.res_dim,
             train_base=a.train_base,
             bf16=(a.device == "cuda"),
             device=a.device,
@@ -247,21 +217,7 @@ def main() -> None:
         report_to="wandb" if a.wandb else None,
         wandb_project=a.wandb_project,
     )
-    if a.concepts:  # text-in concepts: cells as named members, one facet
-        opts.update(emission=ConceptObjective, concept_field="concepts", code_source=a.code_source)
-    if a.state_residual:  # named half = the cells; unnamed half = the residual
-        # The alphabet is given as NAMES ("r3c4"), and `code_source` decides what vector each one gets — the
-        # trade being measured here: "random" is arbitrary but decodes losslessly, so a recall number reflects
-        # the emission and not a clever readout; "model"/"twin" put neighbouring cells near each other and give
-        # that exactness up. Same alphabet either way, so the two are directly comparable on this task.
-        cell_names = [f"r{i // a.grid}c{i % a.grid}" for i in range(a.grid * a.grid)]
-        opts.update(
-            emission=StateResidualObjective,
-            state_field="frontier",
-            state_classes=a.grid * a.grid,
-            code_source=a.code_source,
-            code_names=cell_names,
-        )
+    opts.update(emission=ConceptObjective, concept_field="concepts", code_source=a.code_source)
     if a.sigreg:  # optional: EMA-free isotropic-Gaussian anti-collapse (see langset/sigreg.py)
         opts.update(target_source=SIGRegTarget, sigreg_lambda=a.sigreg_lambda)
     if a.wandb:

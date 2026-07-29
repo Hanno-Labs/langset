@@ -12,9 +12,9 @@ import tempfile
 import torch
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
-import test_trainer_multi_characterization as M  # noqa: E402
+import multi_state_helpers as M  # noqa: E402
 
-from langset import Trainer, TrainingArguments  # noqa: E402
+from langset import Trainer  # noqa: E402
 from langset.strategies import CoTGenTerm, MultiStepCtx  # noqa: E402
 
 
@@ -46,10 +46,7 @@ def _cot_loss(model, padding_side: str) -> float:
         valid=None,
         target_lat=None,
         recon=None,
-        dim_lg=None,
         lmax=1,
-        fsq_levels=8,
-        lab_label=None,
         target_source=None,
         phase_head=None,
         phase_ids={},
@@ -75,9 +72,7 @@ def test_cot_loss_is_padding_side_invariant() -> None:
 def _cot_texts_for(rows: list[dict], column_mapping=None) -> list[str]:
     model = M._build_model()
     with tempfile.TemporaryDirectory() as td:  # bare args: exercise only the __init__ cot_text load
-        args = TrainingArguments(
-            epochs=1, batch_size=4, output_dir=td, report_to=None, verbose=False
-        )
+        args = M._args(td, epochs=1, batch_size=4, sup_field=None, lam_sup=0.0, lam_phase=0.0)
         tr = Trainer(model, args, rows, column_mapping=column_mapping)
     return tr.cot_texts
 
