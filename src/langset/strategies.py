@@ -706,6 +706,7 @@ class ConceptObjective(_EmissionObjective):
         n_codes = self.m.head.n_codes
         tgt = torch.zeros(b, lmax, n_codes, device=self.dev)
         seen = torch.zeros(b, lmax, len(self.spans), dtype=torch.bool, device=self.dev)
+        assert self.laws is not None
         for r, k in enumerate(bidx):
             per_tick = self.laws[k]
             for t in range(min(lens_l[r], lmax, len(per_tick))):
@@ -883,6 +884,7 @@ class StateResidualObjective(_EmissionObjective):
         # STATE: soft-target CE over the alphabet, mass split evenly across each tick's live members.
         tgt = torch.zeros(b, lmax, self.n_codes, device=dev)
         has = torch.zeros(b, lmax, dtype=torch.bool, device=dev)
+        assert self.labels is not None
         for r, k in enumerate(bidx):
             per_tick = self.labels[k]
             for t in range(min(lens_l[r], lmax, len(per_tick))):
@@ -1129,13 +1131,25 @@ def parse_concepts(raw: object) -> "dict[str, dict[str, float]]":
     """One row's (or tick's) concepts -> {facet: {concept: weight}}, weights normalized within each facet."""
     if raw is None:
         return {}
+    if not isinstance(raw, dict):
+        raise TypeError("concepts must be a dictionary")
     out: dict[str, dict[str, float]] = {}
-    for facet, members in dict(raw).items():
+    for facet, members in raw.items():
         if isinstance(members, dict):
-            w = {str(k): float(v) for k, v in members.items() if float(v) > 0}
-        else:  # a list/tuple/str: every listed concept is equally true
-            names = [members] if isinstance(members, str) else list(members)
+            w = {}
+            for name, value in members.items():
+                if not isinstance(value, (int, float, str)):
+                    raise TypeError("concept weights must be numeric")
+                weight = float(value)
+                if weight > 0:
+                    w[str(name)] = weight
+        elif isinstance(members, str):
+            w = {members: 1.0} if members.strip() else {}
+        elif isinstance(members, (list, tuple)):
+            names = list(members)
             w = {str(n): 1.0 for n in names if str(n).strip()}
+        else:
+            raise TypeError("concept members must be a dictionary, list, tuple, or string")
         tot = sum(w.values())
         if tot > 0:
             out[str(facet)] = {k: v / tot for k, v in w.items()}
