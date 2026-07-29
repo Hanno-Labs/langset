@@ -459,8 +459,8 @@ Requirements and what stays exact:
 | exactness | **bit-exact** (the whole loss is cached) | cross-batch **InfoNCE exact**; the per-row base loss (stop/dims/recon) is accumulated per chunk (a small `gc_chunk`-dependent reweighting, negligible in practice) |
 
 `gc_chunk=0` (default) or `grad_cache=False` leaves training byte-identical. GradCache is only defined for the
-contrastive path, so `SIGRegTarget` (a cross-batch regularizer) and the concept label subspace (which reads the
-rollout logits, not the cached latent) are rejected with a clear error when `grad_cache=True`.
+contrastive path, so `SIGRegTarget` (a cross-batch regularizer) is rejected with a clear error when
+`grad_cache=True`.
 
 ## Long rollouts without the memory — KV cache
 
