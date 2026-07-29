@@ -98,6 +98,46 @@ guess).
 Every knob below is a **strategy injected into `TrainingArguments`**, not a boolean on a monolith — the defaults
 give you the FSQ + EMA-twin world model, and each injection swaps one piece.
 
+### Named state emission — `ConceptObjective`
+
+FSQ learns an implicit discrete code. When the state vocabulary is known, `ConceptObjective` instead constructs
+each emitted latent from a soft mixture over named members. Lists split probability mass equally; dictionaries
+provide explicit weights. Each facet gets its own softmax, so values in `stage` compete with other stages without
+competing with values in `result`.
+
+```python
+from langset import LangSetModel, Trainer, TrainingArguments
+from langset.strategies import ConceptObjective
+
+rows = [{
+    "input_text": "candidate X after phase 1",
+    "target_texts": ["phase 2 is ongoing", "phase 3 missed its endpoint"],
+    "concepts": [
+        {"stage": ["ph2"], "result": ["ongoing"]},
+        {"stage": ["ph3"], "result": ["missed"]},
+    ],
+}]
+
+model = LangSetModel.from_pretrained(
+    "HuggingFaceTB/SmolLM2-135M",
+    multi_latent=True,
+    code_emit=True,
+    n_codes=4,
+    res_dim=32,
+)
+Trainer(model, TrainingArguments(
+    emission=ConceptObjective,
+    concept_field="concepts",
+    code_source="random",
+), rows).train()
+```
+
+The emitted vector is `[named state | residual]`. The state portion is a mixture over a fixed codebook and can
+be read back by projection; the residual carries context that the named alphabet cannot express. Set
+`res_dim=0` for pure named state. `StateResidualObjective` exposes the same mechanism through indexed per-tick
+member lists when a dataset already has a stable integer vocabulary. Codebooks can be random orthonormal,
+model-embedded, orthogonalized model embeddings, or vectors encoded through the target path.
+
 ### Anti-collapse: EMA twin (default) vs SIGReg (LeJEPA)
 
 By default the multi-latent path prevents representation collapse with an **EMA target twin** — a stop-grad

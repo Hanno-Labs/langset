@@ -530,6 +530,413 @@ class FSQObjective(_EmissionObjective):
         return soft[valid], z_tgt
 
 
+class CodeSoftmaxObjective(_EmissionObjective):
+    """CODEBOOK emission: ONE softmax over the head's fixed codebook (plus STOP), trained toward the target's own
+    distribution over codes. Inject with `TrainingArguments(emission=CodeSoftmaxObjective)` and a head built with
+    `code_emit=True` (see EmitHead.set_code).
+
+    Use this when an emission is a SET drawn from a known alphabet (maze frontier: which of 256 cells) rather than
+    a point to quantize. The FSQ default spends `fsq_dim` independent softmaxes on a learned grid, and a per-member
+    readout off that grid is `n_codes` INDEPENDENT decisions, so nothing forces the emission to choose among
+    members: every member can be scored high at once. A single normalized softmax has to ALLOCATE its mass, so the
+    members compete, and the emitted latent is the mixture they form.
+
+    The target law is read off the target latent itself, no extra column: for an orthonormal codebook and a
+    membership target `normalize(multi_hot @ code.T)`, projecting back with `target @ code.T` recovers the members
+    (equal weight) and ~0 elsewhere, so an L1 normalize gives the uniform-over-members law to match. Loss is the
+    soft-target cross-entropy over the codes, plus an INDEPENDENT sigmoid terminator (see `emit` for why STOP
+    must not be folded into the membership softmax the way the FSQ path folds it into dim-0).
+    """
+
+    codebook = True
+
+    def __init__(
+        self, model: LangSetModel, args: TrainingArguments, dev: torch.device, trainer: Trainer
+    ) -> None:
+        super().__init__(model, args, dev, trainer)
+        assert model.head.code_emit, (
+            "CodeSoftmaxObjective needs a codebook head: build the model with code_emit=True, n_codes=<alphabet>"
+        )
+        self.n_codes = int(model.head.n_codes)
+
+    def emit(
+        self,
+        se: dict[str, torch.Tensor],
+        target_lat: torch.Tensor,
+        valid: torch.Tensor,
+        lens_l: list[int],
+        bidx: list[int],
+        b: int,
+        lmax: int,
+        ep: int,
+        ss_mask: Optional[torch.Tensor] = None,
+    ) -> EmissionOut:
+        m, a, dev = self.m, self.a, self.dev
+        ss_prob = a.ss_prob
+        assert ss_prob is not None  # Trainer resolves the None sentinel before any emit
+        eff_ss = ss_prob if a.ss_warmup <= 0 else ss_prob * min(1.0, ep / a.ss_warmup)
+        dim_lg, stop_lg, _digits, recon = m.rollout_train_codebook(
+            se["input_ids"],
+            se["attention_mask"],
+            target_lat,
+            a.tau,
+            train_hops=a.train_hops,
+            ss_prob=eff_ss,
+            ss_sample=a.ss_sample,
+            ss_mask=ss_mask,
+            kv_cache=a.kv_cache,
+        )
+        code = m.head.code  # [n_codes, d] fixed
+        with torch.no_grad():  # the target's law over codes, recovered from the target latent
+            w = F.relu(target_lat.float() @ code.t())  # [b, lmax, n_codes]
+            w = w / w.sum(-1, keepdim=True).clamp_min(1e-9)
+        # MEMBERSHIP: soft-target CE over the codes ALONE, at real emission slots.
+        cell_logp = F.log_softmax(dim_lg[:, :lmax, 0, :].float(), -1)  # [b, lmax, n_codes]
+        loss_code = -(w * cell_logp).sum(-1)[valid].mean()
+        # TERMINATION: an INDEPENDENT sigmoid, not a class inside the membership softmax. Folding STOP in (the
+        # FSQ default) is fair when dim-0's target is itself one-hot, but a set-valued target is 1/k-diffuse and
+        # the two then share one normalizer: at a member position the target is 0 on STOP, so the gradient
+        # pushing the stop logit DOWN is proportional to P(STOP) -- which shrinks as the set widens, because the
+        # denominator carries k members. Wider sets suppress the terminator more weakly and it ratchets up.
+        # Factored out, "continue vs stop" is trained by its own signal and never rides on set width.
+        stop_lab = torch.zeros(b, lmax + 1, device=dev)
+        keep = torch.zeros(b, lmax + 1, dtype=torch.bool, device=dev)
+        for r, nl in enumerate(lens_l):
+            stop_lab[r, nl] = 1.0  # continue through the tick's members, then stop after the last
+            keep[r, : nl + 1] = True
+        loss_stop = F.binary_cross_entropy_with_logits(
+            stop_lg.squeeze(-1).float()[keep], stop_lab[keep]
+        )
+        # `recon` is the contract every loss term reads as "the model's emission, with gradient" (MultiNCETerm
+        # and HardNegTerm both build their query from it). The rollout's own recon is the TARGET here -- this
+        # path is lossless, so it carries no gradient at all, and a term querying it would compare each target
+        # against itself: near-zero loss, exactly zero gradient, silently inert. Hand back the DIFFERENTIABLE
+        # committed mixture instead, which is both the true emission and the vector fed back each tick.
+        mix = F.normalize(dim_lg[:, :lmax, 0, :].float().softmax(-1) @ code, dim=-1)  # [b, lmax, d]
+        with (
+            torch.no_grad()
+        ):  # diagnostic: how close the emitted mixture lands to the target latent
+            emit_cos = F.cosine_similarity(mix[valid], target_lat[valid], dim=-1).mean()
+        del recon
+        return EmissionOut(
+            recon=mix,
+            base_loss=loss_code + loss_stop,
+            logs={"loss_code": loss_code, "loss_stop": loss_stop, "emit_cos": emit_cos},
+            dim_lg=dim_lg,
+            lab_label=None,  # the FSQ label subspace has no analogue here: one softmax, no dims to reserve
+        )
+
+    def z_for_reg(
+        self, em: EmissionOut, target_lat: torch.Tensor, valid: torch.Tensor, lmax: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Regularize the DISTRIBUTIONS, the codebook analogue of FSQ's pre-quantization z: predicted law vs target
+        # law over codes, so a penalty spreads usage across the alphabet instead of collapsing onto a few codes.
+        dim_lg = em.dim_lg
+        assert dim_lg is not None
+        code = self.m.head.code
+        z_tgt = F.relu(target_lat[valid].float() @ code.t())
+        z_tgt = z_tgt / z_tgt.sum(-1, keepdim=True).clamp_min(1e-9)
+        return dim_lg[:, :lmax, 0, :].float().softmax(-1)[valid], z_tgt
+
+
+class ConceptObjective(_EmissionObjective):
+    """Emit a state as a superposition over NAMED CONCEPTS, per facet, with a residual for the unnamed.
+
+    The row format is text the whole way down:
+
+        {"input_text": …, "target_text": …,
+         "concepts": {"vocals": ["yell-singing", "gang-vocals"], "mood": ["angry-but-vulnerable"]}}
+
+    langset discovers each facet's alphabet by scanning the column, so no index is ever written by hand, and
+    the emission's leading dims are CONSTITUTED from those concepts — project them back on the codebook and you
+    get what the latent is made of, in your own vocabulary, with no probe. Each facet is normalized separately,
+    so a wide `vocals` mixture does not make `tempo` look uncertain.
+
+    Reach for this when the twin's geometry is good but WRONG SOMEWHERE. The twin gives a usable space for free
+    and in-batch negatives separate it, but neither lets you say along WHICH axis. Naming one facet overwrites
+    that neighbourhood and leaves the rest to the residual — so the normal configuration is a narrow state half
+    and a wide residual, not the reverse. You are patching a geometry, not adopting an ontology.
+    """
+
+    codebook = True
+
+    def __init__(
+        self, model: LangSetModel, args: TrainingArguments, dev: torch.device, trainer: Trainer
+    ) -> None:
+        super().__init__(model, args, dev, trainer)
+        assert model.head.code_emit, "ConceptObjective needs code_emit=True on the model"
+        self.spans = list(model.head.concept_spans)
+        self.facets = list(model.head.concept_names) or [
+            f"facet{i}" for i in range(len(self.spans))
+        ]
+        self.res_dim = int(model.head.res_dim)
+        self.laws = getattr(trainer, "concept_laws", None) if trainer is not None else None
+        assert self.laws is not None, (
+            "ConceptObjective needs a parsed concepts column — set TrainingArguments.concept_field"
+        )
+        # Build the codebook from the DISCOVERED alphabet: every concept becomes a vector via `code_source`,
+        # laid out per facet. Once, at setup, over the concept names — then frozen for the run.
+        alpha = getattr(trainer, "concept_alphabet", None)
+        if alpha and not bool(model.head.code.abs().sum()):
+            names_per_facet = [(f, alpha[f]) for f in alpha]
+            budget = model.head.state_dim
+            share = max(1, budget // max(len(names_per_facet), 1))
+            facets_in = []
+            for f, names in names_per_facet:
+                dims = min(share, budget - share * (len(names_per_facet) - 1 - len(facets_in)))
+                codes = build_codebook(getattr(args, "code_source", "model"), names, dims, model)
+                facets_in.append((f, codes, dims))
+            model.head.set_concepts(facets_in)
+            self.spans = list(model.head.concept_spans)
+            self.facets = list(model.head.concept_names)
+            src = getattr(args, "code_source", "model")
+            print(
+                f"[concepts] codebook from "
+                f"{src if isinstance(src, str) else getattr(src, '__name__', src)!r}: "
+                + ", ".join(
+                    f"{f}={len(n)}c/{d}d" for (f, n), (_, _, d) in zip(names_per_facet, facets_in)
+                )
+                + f" | residual {self.res_dim} dims",
+                flush=True,
+            )
+
+    def _target_law(self, b: int, lmax: int, lens_l: list[int], bidx: list[int]) -> tuple:
+        """Per-row/per-tick target distribution over ALL members, plus a mask of which facets were stated.
+        A row that names only `vocals` trains only those dims — silence about a facet is not evidence."""
+        n_codes = self.m.head.n_codes
+        tgt = torch.zeros(b, lmax, n_codes, device=self.dev)
+        seen = torch.zeros(b, lmax, len(self.spans), dtype=torch.bool, device=self.dev)
+        for r, k in enumerate(bidx):
+            per_tick = self.laws[k]
+            for t in range(min(lens_l[r], lmax, len(per_tick))):
+                for fi, (m_lo, m_hi, _, _) in enumerate(self.spans):
+                    w = per_tick[t].get(fi)
+                    if w:
+                        for m_idx, weight in w.items():
+                            tgt[r, t, m_lo + m_idx] = weight
+                        seen[r, t, fi] = True
+        return tgt, seen
+
+    def emit(
+        self,
+        se: dict[str, torch.Tensor],
+        target_lat: torch.Tensor,
+        valid: torch.Tensor,
+        lens_l: list[int],
+        bidx: list[int],
+        b: int,
+        lmax: int,
+        ep: int,
+        ss_mask: Optional[torch.Tensor] = None,
+    ) -> EmissionOut:
+        m, a, dev = self.m, self.a, self.dev
+        ss_prob = a.ss_prob
+        assert ss_prob is not None
+        eff_ss = ss_prob if a.ss_warmup <= 0 else ss_prob * min(1.0, ep / a.ss_warmup)
+        dim_lg, stop_lg, _d, _r, emit_hid = m.rollout_train_codebook(
+            se["input_ids"],
+            se["attention_mask"],
+            target_lat,
+            a.tau,
+            train_hops=a.train_hops,
+            ss_prob=eff_ss,
+            ss_sample=a.ss_sample,
+            ss_mask=ss_mask,
+            kv_cache=a.kv_cache,
+            return_emit_hidden=True,
+        )
+        flat = dim_lg[:, :lmax, 0, :].float()  # [b, lmax, n_codes]
+        tgt, seen = self._target_law(b, lmax, lens_l, bidx)
+
+        # one soft-target CE PER FACET, over that facet's members only
+        losses, per_facet = [], {}
+        for fi, (m_lo, m_hi, _, _) in enumerate(self.spans):
+            sel = seen[:, :, fi] & valid
+            if not bool(sel.any()):
+                continue
+            logp = F.log_softmax(flat[..., m_lo:m_hi], -1)
+            li = -(tgt[..., m_lo:m_hi] * logp).sum(-1)[sel].mean()
+            losses.append(li)
+            per_facet[f"c_{self.facets[fi]}"] = li
+        loss_concept = torch.stack(losses).sum() if losses else flat.new_zeros(())
+
+        stop_lab = torch.zeros(b, lmax + 1, device=dev)
+        keep = torch.zeros(b, lmax + 1, dtype=torch.bool, device=dev)
+        for r, nl in enumerate(lens_l):
+            stop_lab[r, nl] = 1.0
+            keep[r, : nl + 1] = True
+        loss_stop = F.binary_cross_entropy_with_logits(
+            stop_lg.squeeze(-1).float()[keep], stop_lab[keep]
+        )
+
+        # the emission the rest of the trainer sees — WITH gradient, or every aux term silently idles
+        p = m.head.concept_probs(dim_lg[:, :lmax])
+        state = F.normalize(p @ m.head.code, dim=-1)
+        emission = (
+            torch.cat([state, m.head.residual(emit_hid[:, :lmax])], -1) * (0.5**0.5)
+            if self.res_dim
+            else state
+        )
+        with torch.no_grad():
+            emit_cos = F.cosine_similarity(emission[valid], target_lat[valid], dim=-1).mean()
+        return EmissionOut(
+            recon=emission,
+            base_loss=loss_concept + loss_stop,
+            logs={
+                "loss_concept": loss_concept,
+                "loss_stop": loss_stop,
+                "emit_cos": emit_cos,
+                **per_facet,
+            },
+            dim_lg=dim_lg,
+            lab_label=None,
+        )
+
+
+class StateResidualObjective(_EmissionObjective):
+    """STATE + RESIDUAL emission: a named half and an unnamed half, in one latent.
+
+    The latent splits at `head.res_dim`. The STATE half is a mixture over a fixed alphabet of members you can
+    name, trained by soft-target cross-entropy against the members that are actually live this tick. The
+    RESIDUAL half is trained by whatever the surrounding terms already do (recon to the target, in-batch NCE),
+    so it carries what the alphabet cannot say.
+
+    Why both. A named alphabet is the strongest signal available -- the emission is CONSTITUTED from the members
+    rather than having them decoded out of it -- but it is also a ceiling: anything the alphabet cannot name,
+    the emission cannot hold, and a world model whose ontology has gaps will silently refuse to represent them.
+    The residual is where the unnamed goes, and how much it carries is measurable: ablate it at eval and the
+    drop is how incomplete the alphabet was.
+
+    It also keeps a self-supervised component in the design. The state half's meaning is externally specified
+    (you chose the members); the residual half's is not, so the latent is not wholly hand-defined.
+
+    Labels come from a per-row column named by `state_field`: a per-tick list of ACTIVE member indices (sparse,
+    e.g. `[[3, 47], [12], ...]`). Mass is split evenly over each tick's live members, so a tick holding four
+    members asks the emission to spread over four -- the superposition, written as the target.
+
+      TrainingArguments(emission=StateResidualObjective, state_field="frontier", state_classes=256)
+      LangSetModel.from_pretrained(..., code_emit=True, n_codes=256, res_dim=64)
+    """
+
+    codebook = True
+
+    def __init__(
+        self, model: LangSetModel, args: TrainingArguments, dev: torch.device, trainer: Trainer
+    ) -> None:
+        super().__init__(model, args, dev, trainer)
+        assert model.head.code_emit, (
+            "StateResidualObjective needs a codebook head: build with code_emit=True, n_codes=<alphabet>"
+        )
+        self.n_codes = int(model.head.n_codes)
+        self.res_dim = int(model.head.res_dim)
+        # Build the codebook ONCE, here, from the injected `code_source` — over the alphabet's NAMES, not over
+        # the training data. Skipped when a codebook was already installed by hand (head.set_code before train).
+        names = getattr(args, "code_names", None)
+        if names is not None and not bool(model.head.code.abs().sum()):
+            codes = build_codebook(
+                getattr(args, "code_source", "random"), list(names), model.head.state_dim, model
+            )
+            model.head.set_code(codes.to(model.head.code.device))
+            src = getattr(args, "code_source", "random")
+            print(
+                f"[state] codebook: {len(names)} members x {model.head.state_dim} dims "
+                f"from {src if isinstance(src, str) else getattr(src, '__name__', src)!r}"
+                f" | residual {self.res_dim} dims",
+                flush=True,
+            )
+        self.labels = getattr(trainer, "state_labels", None) if trainer is not None else None
+        assert self.labels is not None, (
+            "StateResidualObjective needs per-tick member labels: set TrainingArguments.state_field to a row "
+            "column of per-tick active-index lists"
+        )
+
+    def emit(
+        self,
+        se: dict[str, torch.Tensor],
+        target_lat: torch.Tensor,
+        valid: torch.Tensor,
+        lens_l: list[int],
+        bidx: list[int],
+        b: int,
+        lmax: int,
+        ep: int,
+        ss_mask: Optional[torch.Tensor] = None,
+    ) -> EmissionOut:
+        m, a, dev = self.m, self.a, self.dev
+        ss_prob = a.ss_prob
+        assert ss_prob is not None
+        eff_ss = ss_prob if a.ss_warmup <= 0 else ss_prob * min(1.0, ep / a.ss_warmup)
+        dim_lg, stop_lg, _digits, _recon, emit_hid = m.rollout_train_codebook(
+            se["input_ids"],
+            se["attention_mask"],
+            target_lat,
+            a.tau,
+            train_hops=a.train_hops,
+            ss_prob=eff_ss,
+            ss_sample=a.ss_sample,
+            ss_mask=ss_mask,
+            kv_cache=a.kv_cache,
+            return_emit_hidden=True,  # the residual is a function of the emit hidden, not of the logits
+        )
+        code = m.head.code
+
+        # STATE: soft-target CE over the alphabet, mass split evenly across each tick's live members.
+        tgt = torch.zeros(b, lmax, self.n_codes, device=dev)
+        has = torch.zeros(b, lmax, dtype=torch.bool, device=dev)
+        for r, k in enumerate(bidx):
+            per_tick = self.labels[k]
+            for t in range(min(lens_l[r], lmax, len(per_tick))):
+                members = [int(c) for c in per_tick[t] if 0 <= int(c) < self.n_codes]
+                if members:
+                    tgt[r, t, members] = 1.0 / len(members)
+                    has[r, t] = True
+        cell_logp = F.log_softmax(dim_lg[:, :lmax, 0, :].float(), -1)
+        sel = has & valid
+        loss_state = (
+            -(tgt * cell_logp).sum(-1)[sel].mean() if bool(sel.any()) else cell_logp.new_zeros(())
+        )
+
+        # TERMINATION: its own sigmoid, never folded into the member softmax. Folding is only fair when the
+        # member target is one-hot; against a 1/k-diffuse target the gradient suppressing STOP scales with
+        # P(STOP), which weakens as the set widens, so the rollout truncates exactly where sets get wide.
+        stop_lab = torch.zeros(b, lmax + 1, device=dev)
+        keep = torch.zeros(b, lmax + 1, dtype=torch.bool, device=dev)
+        for r, nl in enumerate(lens_l):
+            stop_lab[r, nl] = 1.0
+            keep[r, : nl + 1] = True
+        loss_stop = F.binary_cross_entropy_with_logits(
+            stop_lg.squeeze(-1).float()[keep], stop_lab[keep]
+        )
+
+        # THE EMISSION the rest of the trainer sees: state mixture ++ residual, exactly what feeds back. It must
+        # be the emission WITH gradient -- every aux term (in-batch NCE, hard negatives) builds its query from
+        # `recon`, and handing back the stop-grad target instead leaves them running but training nothing.
+        p = dim_lg[:, :lmax, 0, :].float().softmax(-1)
+        state = F.normalize(p @ code, dim=-1)
+        if self.res_dim:
+            res = m.head.residual(emit_hid[:, :lmax])
+            emission = torch.cat([state, res], -1) * (0.5**0.5)
+        else:
+            emission = state
+        with torch.no_grad():
+            emit_cos = F.cosine_similarity(emission[valid], target_lat[valid], dim=-1).mean()
+            res_share = (
+                (emission[valid][:, -self.res_dim :].norm(dim=-1) ** 2).mean()
+                if self.res_dim
+                else torch.zeros((), device=dev)
+            )
+        logs = {"loss_state": loss_state, "loss_stop": loss_stop, "emit_cos": emit_cos}
+        if self.res_dim:
+            logs["res_share"] = res_share  # how much of the emission the alphabet could NOT name
+        return EmissionOut(
+            recon=emission,
+            base_loss=loss_state + loss_stop,
+            logs=logs,
+            dim_lg=dim_lg,
+            lab_label=None,
+        )
+
+
 # ---- target source ------------------------------------------------------------------------------
 class _TargetSource:
     """Strategy for the TARGET latents the emission trains toward, plus any anti-collapse regularization.
@@ -704,6 +1111,136 @@ class SIGRegTarget(_TargetSource):
         # Two INDEPENDENT Gaussianity penalties (predicted E[digit] and target z), NOT a match between them —
         # each is pushed toward isotropic Gaussian, spreading codes across the FSQ grid.
         return self.sig_reg(z_pred) + self.sig_reg(z_tgt)
+
+
+# ---- concepts (the text-in format for a named, superposed state) ---------------------------------
+# A row carries a `concepts` column of NAMED FACETS, each holding the concepts that are true of it:
+#
+#     "concepts": {"vocals": ["yell-singing", "gang-vocals"], "tempo": {"7": 0.1, "8": 0.9}}
+#
+# A list means "these are all true, equally" (mass split evenly — the superposition). A dict means explicit
+# weights, which also encodes a CONTINUOUS value as a mixture over ordered concepts: 7.9 is 0.1 of "7" and 0.9
+# of "8", interpolation included, and unlike a regressed scalar you can still read what it says.
+#
+# Everything is text. The alphabet is not configured — it is DISCOVERED by scanning the column, the way a
+# tokenizer's vocabulary is, so nobody writes or maintains an index. Multi-latent rows pass a LIST of these
+# dicts, one per tick, aligned with `target_texts`.
+def parse_concepts(raw: object) -> "dict[str, dict[str, float]]":
+    """One row's (or tick's) concepts -> {facet: {concept: weight}}, weights normalized within each facet."""
+    if raw is None:
+        return {}
+    out: dict[str, dict[str, float]] = {}
+    for facet, members in dict(raw).items():
+        if isinstance(members, dict):
+            w = {str(k): float(v) for k, v in members.items() if float(v) > 0}
+        else:  # a list/tuple/str: every listed concept is equally true
+            names = [members] if isinstance(members, str) else list(members)
+            w = {str(n): 1.0 for n in names if str(n).strip()}
+        tot = sum(w.values())
+        if tot > 0:
+            out[str(facet)] = {k: v / tot for k, v in w.items()}
+    return out
+
+
+def discover_concept_alphabet(rows_concepts: "list[object]") -> "dict[str, list[str]]":
+    """Scan the corpus's concept column -> {facet: sorted concept names}. Sorted for determinism, so the same
+    corpus always yields the same layout and a checkpoint stays readable."""
+    seen: dict[str, set[str]] = {}
+    for raw in rows_concepts:
+        ticks = raw if isinstance(raw, (list, tuple)) else [raw]
+        for tick in ticks:
+            for facet, w in parse_concepts(tick).items():
+                seen.setdefault(facet, set()).update(w)
+    return {f: sorted(v) for f, v in sorted(seen.items())}
+
+
+# ---- code sources (where a named member's vector comes from) -------------------------------------
+# A `code_source` maps the alphabet's member NAMES to their vectors: (names, dim, model) -> [n_members, dim].
+# Called ONCE at setup, over the alphabet (hundreds to a few thousand short strings), never per batch. The
+# result is frozen into a buffer for the run — a codebook that re-embeds while the model trains is a learned
+# codebook in disguise, and re-opens the collapse problem the fixed FSQ grid was chosen to avoid.
+#
+# The choice is a real trade, not a default: an orthonormal codebook decodes losslessly by plain matmul (so a
+# recall number measures the EMISSION, with no probe as a confound) but its members carry no relation to each
+# other; embedded codes put `ph2` near `ph3` and `melanoma` near `breast_neoplasms`, at the cost of exact
+# recovery. Benchmarks want the first, real domains usually want the second.
+def random_orthonormal_codes(names: list[str], dim: int, model: LangSetModel) -> torch.Tensor:
+    """Arbitrary but perfectly decodable: a seeded orthonormal frame, one row per member (`C Cᵀ = I`).
+
+    Member vectors are unrelated by construction — cell 10 and cell 11 are as orthogonal as cell 10 and cell
+    200 — so nothing about the geometry can flatter a result. That is exactly why it belongs on a benchmark."""
+    assert len(names) <= dim, (
+        f"random_orthonormal_codes needs dim >= n_members for an orthonormal frame; got dim={dim}, "
+        f"n_members={len(names)}. Use model_embedded_codes (no such limit) or widen the state half."
+    )
+    g = torch.Generator(device="cpu").manual_seed(0)
+    q = torch.linalg.qr(torch.randn(dim, len(names), generator=g)).Q[:, : len(names)]
+    return q.t().contiguous()
+
+
+def model_embedded_codes(names: list[str], dim: int, model: LangSetModel) -> torch.Tensor:
+    """The base model's own reading of each member's NAME, mean-pooled over its tokens.
+
+    Semantically related members land near each other, which is information the random frame throws away, and
+    the codebook becomes model-derived rather than hand-designed. Not orthonormal, so a mixture no longer
+    recovers its members exactly — read out with top-k over member scores rather than expecting a clean inverse.
+    Unlimited alphabet size (no dim >= n_members constraint)."""
+    emb = model.embed.weight  # [V, h]; tied to the LM head on most small models
+    out = []
+    for nm in names:
+        ids = model.tokenizer(nm, add_special_tokens=False)["input_ids"] or [
+            model.tokenizer.eos_token_id
+        ]
+        v = emb[torch.tensor(ids, device=emb.device)].float().mean(0)
+        out.append(v[:dim] if v.numel() >= dim else F.pad(v, (0, dim - v.numel())))
+    return F.normalize(torch.stack(out), dim=-1)
+
+
+def orthogonalized_codes(names: list[str], dim: int, model: LangSetModel) -> torch.Tensor:
+    """Embed the names, then orthogonalize — keeps a lossless readout and as much of the semantic arrangement
+    as an orthonormal frame can hold. The distortion is the price; the members are no longer purely the model's
+    own vectors."""
+    e = model_embedded_codes(names, dim, model)
+    q = torch.linalg.qr(e.t().float()).Q[:, : len(names)]
+    return q.t().contiguous()
+
+
+def twin_encoded_codes(names: list[str], dim: int, model: LangSetModel) -> torch.Tensor:
+    """Encode each member name with the model's own emit path, so the codebook lands in the SAME space as the
+    training targets.
+
+    This is the coherent option: the state mixture and the twin's target then share one geometry, so the state
+    loss and the recon loss are talking about the same thing, and the residual is precisely the part of the
+    target the named members cannot span. Requires the emit path to be usable at setup."""
+    with torch.no_grad():
+        z = model.emit(list(names))  # [n_members, latent_dim], the target space itself
+    z = z.float()[:, :dim] if z.size(-1) >= dim else F.pad(z.float(), (0, dim - z.size(-1)))
+    return F.normalize(z, dim=-1)
+
+
+CODE_SOURCES = {
+    "random": random_orthonormal_codes,
+    "model": model_embedded_codes,
+    "orthogonal": orthogonalized_codes,
+    "twin": twin_encoded_codes,
+}
+
+
+def build_codebook(
+    source: "str | Callable[[list[str], int, LangSetModel], torch.Tensor]",
+    names: list[str],
+    dim: int,
+    model: LangSetModel,
+) -> torch.Tensor:
+    """Resolve a `code_source` (name or callable) and build the [n_members, dim] codebook. Validates the shape
+    here so a bad custom source fails at setup with a clear message rather than deep inside the first step."""
+    fn = CODE_SOURCES[source] if isinstance(source, str) else source
+    codes = fn(list(names), int(dim), model)
+    assert tuple(codes.shape) == (len(names), dim), (
+        f"code_source {getattr(fn, '__name__', source)!r} returned {tuple(codes.shape)}, "
+        f"expected ({len(names)}, {dim})"
+    )
+    return codes
 
 
 # ---- small function-strategies ------------------------------------------------------------------

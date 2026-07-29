@@ -536,6 +536,50 @@ class Trainer:
                 self.sup_labels = [
                     [str(x) for x in (v if isinstance(v, (list, tuple)) else [v])] for v in raw_sup
                 ]
+            # CONCEPTS (ConceptObjective): a per-row dict of named facets -> the concepts true of each, e.g.
+            # {"vocals": ["yell-singing", "gang-vocals"], "tempo": {"7": 0.1, "8": 0.9}}. Multi-latent rows pass
+            # a LIST of those dicts, one per tick. The alphabet is DISCOVERED here by scanning the column — no
+            # index is ever authored — then frozen into the head's codebook by the injected `code_source`.
+            self.concept_alphabet: Optional[dict[str, list[str]]] = None
+            self.concept_laws: Optional[list[list[dict[int, dict[int, float]]]]] = None
+            concept_field = getattr(args, "concept_field", None)
+            if concept_field is not None:
+                from langset.strategies import discover_concept_alphabet, parse_concepts
+
+                raw_c = list(cols[inv.get(concept_field, concept_field)])
+                self.concept_alphabet = discover_concept_alphabet(raw_c)
+                facets = list(self.concept_alphabet)
+                fidx = {f: i for i, f in enumerate(facets)}
+                midx = {f: {n: i for i, n in enumerate(self.concept_alphabet[f])} for f in facets}
+                laws = []
+                for raw in raw_c:
+                    ticks = raw if isinstance(raw, (list, tuple)) else [raw]
+                    per_tick = []
+                    for tick in list(ticks)[: args.max_target_items]:
+                        d: dict[int, dict[int, float]] = {}
+                        for f, w in parse_concepts(tick).items():
+                            if f in fidx:
+                                d[fidx[f]] = {midx[f][n]: v for n, v in w.items() if n in midx[f]}
+                        per_tick.append(d)
+                    laws.append(per_tick)
+                self.concept_laws = laws
+                sizes = {f: len(v) for f, v in self.concept_alphabet.items()}
+                print(
+                    f"[concepts] discovered {sum(sizes.values())} concepts across {len(sizes)} facets: "
+                    f"{sizes}",
+                    flush=True,
+                )
+            # STATE MEMBER labels (StateResidualObjective): same sparse per-tick shape as the frontier column, but
+            # these are not decoded OUT of the emission by an aux head — they CONSTITUTE its named half, so the
+            # objective reads them directly rather than through a probe.
+            self.state_labels: Optional[list[list[list[int]]]] = None
+            state_field = getattr(args, "state_field", None)
+            if state_field is not None:
+                raw_st = cols[inv.get(state_field, state_field)]
+                self.state_labels = [
+                    [[int(i) for i in tick] for tick in row[: args.max_target_items]]
+                    for row in raw_st
+                ]
             # optional FSQ LABEL SUBSPACE: per-item label columns -> reserved-dim codeword targets (a formal, head-free
             # label space in the emitted code). Builds a class->codeword map per facet and a flat "plan" of which
             # rest-dim column carries which facet's k-th codeword digit.
@@ -1807,9 +1851,11 @@ class Trainer:
                 ):  # inject the cached cross-batch grad through THIS chunk's recon
                     torch.autograd.backward(em_c.recon, gcache[ri])
                 base_tot += float(em_c.base_loss.detach()) * w
-                agg["loss_stop"] += float(em_c.logs["loss_stop"].detach()) * w
-                agg["loss_dims"] += float(em_c.logs["loss_dims"].detach()) * w
-                agg["recon_loss"] += float(em_c.logs["recon_loss"].detach()) * w
+                for (
+                    _k,
+                    _v,
+                ) in em_c.logs.items():  # whatever THIS objective logs (FSQ: stop/dims/recon)
+                    agg[_k] = agg.get(_k, 0.0) + float(_v.detach()) * w
             opt.step()
             target_source.update()
             return base_tot + float(cross.detach())
@@ -1821,7 +1867,9 @@ class Trainer:
                 order = order[: a.max_steps_per_epoch * a.batch_size]
             tot = 0.0
             nb = 0
-            agg = {"loss_stop": 0.0, "loss_dims": 0.0, "recon_loss": 0.0}
+            agg: dict[
+                str, float
+            ] = {}  # accumulates whatever the emission objective logs (its keys, not FSQ's)
             for i in range(0, len(order), a.batch_size):
                 if (
                     learn_pool and float(rng.random()) < a.learn_ratio
@@ -1867,11 +1915,6 @@ class Trainer:
                 with _rf("rollout"):
                     em = objective.emit(se, target_lat, valid, lens_l, bidx, b, lmax, ep)
                 recon, dim_lg, lab_label = em.recon, em.dim_lg, em.lab_label
-                loss_stop, loss_dims, recon_loss = (
-                    em.logs["loss_stop"],
-                    em.logs["loss_dims"],
-                    em.logs["recon_loss"],
-                )
                 loss = em.base_loss  # base objective (emission + STOP + recon); separation below
                 c = MultiStepCtx(  # everything the aux terms read this step
                     trainer=self,
@@ -1978,9 +2021,8 @@ class Trainer:
                     target_source.update()  # EMA twin tracks the online model
                 tot += float(loss.detach())
                 nb += 1
-                agg["loss_stop"] += float(loss_stop.detach())
-                agg["loss_dims"] += float(loss_dims.detach())
-                agg["recon_loss"] += float(recon_loss.detach())
+                for _k, _v in em.logs.items():  # emission-defined keys (FSQ: stop/dims/recon)
+                    agg[_k] = agg.get(_k, 0.0) + float(_v.detach())
                 if _prof is not None:
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
@@ -2061,9 +2103,27 @@ class Trainer:
                 sup_s = f" sup={row['loss_sup']:.3f}" if "loss_sup" in row else ""
                 ph_s = f" phase={row['loss_phase']:.3f}" if "loss_phase" in row else ""
                 pur_s = f" purity={pur:.3f}" if self.sup_labels is not None else ""
+                # the emission's own terms, in a stable order; unchanged for FSQ (stop/dims/recon), and a
+                # different objective prints ITS terms rather than KeyError-ing on FSQ's.
+                _names = {
+                    "loss_stop": "stop",
+                    "loss_dims": "dims",
+                    "recon_loss": "recon",
+                    "loss_code": "code",
+                    "loss_state": "state",
+                    "loss_concept": "concept",
+                    "emit_cos": "emit_cos",
+                    "res_share": "res_share",  # how much of the emission the alphabet could NOT name
+                }
+                base_s = " ".join(f"{v}={row[k]:.3f}" for k, v in _names.items() if k in row)
+                # per-facet concept losses are discovered from the data, so their keys are not known here
+                facet_s = " ".join(
+                    f"{k[2:]}={row[k]:.2f}" for k in sorted(row) if k.startswith("c_")
+                )
+                base_s = f"{base_s} {facet_s}".strip() if facet_s else base_s
                 print(
-                    f"ep{ep:02d} loss={row['loss']:.3f} stop={row['loss_stop']:.3f} dims={row['loss_dims']:.3f} "
-                    f"recon={row['recon_loss']:.3f}{hn_s}{sup_s}{ph_s} | retr_mrr={mrr:.3f}{pur_s} "
+                    f"ep{ep:02d} loss={row['loss']:.3f} {base_s}"
+                    f"{hn_s}{sup_s}{ph_s} | retr_mrr={mrr:.3f}{pur_s} "
                     f"[sel:{a.select}={sel:.3f}] distinct={metrics['n_distinct']} "
                     f"avg_emit={metrics['avg_emitted']:.2f}",
                     flush=True,
