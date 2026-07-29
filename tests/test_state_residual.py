@@ -1,7 +1,6 @@
 """STATE + RESIDUAL emission — the named half and the unnamed half.
 
-`fsq_dim` controls how finely the latent is quantized; `emb_slots` controls which of its dims are made legible.
-Both DECODE meaning out of a latent the twin defined. This third mode CONSTITUTES the latent: its leading dims
+This mode CONSTITUTES the latent: its leading dims
 are a mixture over a named alphabet, its trailing `res_dim` dims are a residual nothing names.
 
 The split is what makes adopting a named alphabet safe. An alphabet is a ceiling — whatever it cannot name, the
@@ -87,8 +86,8 @@ def test_rollout_returns_emit_hidden_only_when_asked() -> None:
     enc = m.tokenizer(["row %d text" % i for i in range(3)], padding=True, return_tensors="pt")
     target = F.normalize(torch.randn(3, 4, m.latent_dim), dim=-1)
     with torch.no_grad():
-        four = m.rollout_train_codebook(enc["input_ids"], enc["attention_mask"], target)
-        five = m.rollout_train_codebook(
+        four = m.rollout_train_state(enc["input_ids"], enc["attention_mask"], target)
+        five = m.rollout_train_state(
             enc["input_ids"], enc["attention_mask"], target, return_emit_hidden=True
         )
     assert len(four) == 4 and len(five) == 5
