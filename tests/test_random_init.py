@@ -97,20 +97,13 @@ def test_from_scratch_trains_through_trainer() -> None:
     import tempfile
 
     sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
-    import multi_state_helpers as M  # noqa: E402
+    import test_trainer_multi_characterization as M  # noqa: E402
 
     from langset import Trainer  # noqa: E402
 
-    M._seed()
     m = LangSetModel.from_scratch(
-        ARCH,
-        device="cpu",
-        multi_latent=True,
-        arch_overrides={"num_hidden_layers": 2},
-        code_emit=True,
-        n_codes=8,
+        ARCH, device="cpu", multi_latent=True, arch_overrides={"num_hidden_layers": 2}
     )
-    m.head.set_code(torch.randn(8, m.latent_dim))
     before = torch.cat([p.detach().flatten() for p in m.parameters() if p.requires_grad]).clone()
     with tempfile.TemporaryDirectory() as td:
         Trainer(m, M._args(td), M._dataset()).train()

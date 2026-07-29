@@ -16,23 +16,14 @@ import os
 import torch
 
 from langset import LangSetModel, Trainer, TrainingArguments
-from langset.strategies import CodeSoftmaxObjective
 
 ARCH = os.environ.get("LANGSET_TEST_MODEL", "hf-internal-testing/tiny-random-LlamaForCausalLM")
 
 
 def _multi_model():
-    m = LangSetModel.from_pretrained(
-        ARCH,
-        device="cpu",
-        dropout=0.0,
-        n_latents=1,
-        multi_latent=True,
-        code_emit=True,
-        n_codes=4,
+    return LangSetModel.from_pretrained(
+        ARCH, device="cpu", dropout=0.0, n_latents=1, multi_latent=True, fsq_dim=8, fsq_levels=4
     )
-    m.head.set_code(torch.eye(4, m.latent_dim))
-    return m
 
 
 def test_shared_ss_mask_full_equals_chunk() -> None:
@@ -49,11 +40,13 @@ def test_shared_ss_mask_full_equals_chunk() -> None:
     ss_mask = torch.rand(B, L) < 0.4  # the shared per-(row, hop) self-feed decisions
 
     with torch.no_grad():
-        _, _, _, recon_full = m.rollout_train_state(ids, am, target, ss_prob=0.4, ss_mask=ss_mask)
+        _, _, _, recon_full = m.rollout_train_codebook(
+            ids, am, target, ss_prob=0.4, ss_mask=ss_mask
+        )
     rows = [0, 1, 2]
     ri = torch.tensor(rows)
     with torch.no_grad():
-        _, _, _, recon_chunk = m.rollout_train_state(
+        _, _, _, recon_chunk = m.rollout_train_codebook(
             ids[ri], am[ri], target[ri], ss_prob=0.4, ss_mask=ss_mask[ri]
         )
     diff = (recon_full[ri] - recon_chunk).abs().max().item()
@@ -81,7 +74,6 @@ def test_multi_gradcache_trains() -> None:
         lr=1e-3,
         max_len=32,
         ss_prob=0.25,
-        emission=CodeSoftmaxObjective,
         lam_recon=0.0,
         val_frac=0.125,
         eval_every=999,

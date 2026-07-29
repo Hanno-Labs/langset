@@ -19,7 +19,7 @@ import pytest
 import torch
 
 from langset import Head, LangSetModel, Trainer, TrainingArguments
-from langset.strategies import CodeSoftmaxObjective, last_epoch_selector
+from langset.strategies import last_epoch_selector
 
 TINY_MODEL = os.environ.get(
     "LANGSET_TEST_MODEL", "hf-internal-testing/tiny-random-LlamaForCausalLM"
@@ -32,18 +32,11 @@ def _seed() -> None:
     torch.use_deterministic_algorithms(True, warn_only=True)
 
 
-def _build_model(*, bf16: bool = False) -> LangSetModel:
+def _build_model() -> LangSetModel:
     _seed()
-    model = LangSetModel.from_pretrained(
-        TINY_MODEL,
-        bf16=bf16,
-        device="cpu",
-        multi_latent=True,
-        code_emit=True,
-        n_codes=8,
+    return LangSetModel.from_pretrained(
+        TINY_MODEL, bf16=False, device="cpu", multi_latent=True, fsq_dim=32, fsq_levels=8
     )
-    model.head.set_code(torch.randn(8, model.latent_dim))
-    return model
 
 
 # 9 rows: seed -> a SET of stage descriptions, with per-item stage labels (phase / recon-ce), a per-ROW scalar
@@ -87,7 +80,6 @@ def _args(out_dir: str, **over: object) -> TrainingArguments:
         val_frac=0.25,
         seed=0,
         sup_field="stage",
-        emission=CodeSoftmaxObjective,
         output_dir=out_dir,
     )
     d.update(over)
@@ -262,7 +254,9 @@ def test_bf16_hidden_and_recon_heads_train() -> None:
         Head(name="v", reads="hidden", target="value", loss="mse", dim=1, transient=False),
         Head(name="d", reads="recon", target="dense", loss="mse", dim=1, transient=False),
     ]
-    model = _build_model(bf16=True)
+    model = LangSetModel.from_pretrained(
+        TINY_MODEL, bf16=True, device="cpu", multi_latent=True, fsq_dim=32, fsq_levels=8
+    )
     with tempfile.TemporaryDirectory() as td:
         Trainer(
             model, _args(td, epochs=2, heads=heads), _dataset()

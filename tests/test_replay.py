@@ -11,7 +11,7 @@ import tempfile
 
 import pytest
 import torch
-from multi_state_helpers import _args, _build_model
+from test_trainer_multi_characterization import _args, _build_model
 
 from langset import Trainer
 from langset.trainer import _replay_ce, _tokenize_replay
@@ -51,7 +51,7 @@ def test_replay_ce_is_padding_invariant():
 def test_replay_training_runs_multi_latent():
     # integration: emit rows + a couple varying-length learn rows, replay firing every step -> the rewired
     # multi-latent learn path must train end-to-end (exercises _tokenize_replay + _replay_ce on real batches).
-    from multi_state_helpers import _flat_trainable
+    from test_trainer_multi_characterization import _flat_trainable
 
     m = _build_model()
     rows = [
@@ -80,6 +80,9 @@ def test_replay_training_runs_multi_latent():
             sup_field=None,
             lam_sup=0.0,
             hard_neg_field=None,
+            lam_hard_neg=0.0,
+            label_dims=None,
+            lam_label_dims=0.0,
         )
         Trainer(m, args, rows).train()  # must not raise; learn_loss fires each step
     assert (
@@ -108,6 +111,9 @@ def test_all_rows_learn_tagged_errors_clearly():
             sup_field=None,
             lam_sup=0.0,
             hard_neg_field=None,
+            lam_hard_neg=0.0,
+            label_dims=None,
+            lam_label_dims=0.0,
         )
         with pytest.raises(ValueError):  # no emit rows left -> a clear, upfront error
             Trainer(model, args, _all_learn_rows()).train()

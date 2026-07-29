@@ -1,12 +1,13 @@
-"""Codebook emission (`code_emit`) uses one softmax over a fixed alphabet.
+"""Codebook emission (`code_emit`) — one softmax over a fixed alphabet instead of the FSQ digit grid.
 
-It commits to the resulting MIXTURE of codes, which is what an emission that
+The FSQ default emits `fsq_dim` independent digit softmaxes over a learned grid. `code_emit` replaces that with a
+SINGLE softmax over a fixed codebook and commits to the resulting MIXTURE of codes, which is what an emission that
 is a SET (maze frontier: which of 256 cells) actually needs: mass has to be allocated among the members instead of
 each member being scored independently.
 
 These pin the three properties the maze arm depends on:
-  * the rollout is shape-clean and the commit is the mixture, not a single winner;
-  * KV-cache stays numerically identical on this path;
+  * the rollout is shape-clean at fsq_dim == 1 and the commit is the mixture, not a single winner;
+  * KV-cache stays numerically identical on this path too (it must, since the loops are shared with FSQ);
   * an orthonormal codebook round-trips: a membership target projects back to the uniform-over-members law, which
     is what CodeSoftmaxObjective trains toward, and the emitted mixture decodes to the right members.
 """
@@ -47,7 +48,7 @@ def _members(m, cells: list[list[int]]) -> torch.Tensor:
 
 
 def test_code_emit_shapes_and_mixture_commit() -> None:
-    """emit_logits returns one n_codes softmax; commit returns the softmax mixture of codes."""
+    """emit_logits collapses fsq_dim to 1 and widens to n_codes; commit returns the softmax mixture of codes."""
     torch.manual_seed(0)
     m = _code_model()
     m.eval()
@@ -104,10 +105,10 @@ def test_code_emit_kv_cache_matches_recompute() -> None:
         4, 5, dtype=torch.bool
     )  # self-feed: exercises commit() at each sequential hop
     with torch.no_grad():
-        d0, s0, _, _ = m.rollout_train_state(
+        d0, s0, _, _ = m.rollout_train_codebook(
             ids, am, target, ss_prob=0.4, ss_mask=ss_mask, train_hops=3, kv_cache=False
         )
-        d1, s1, _, _ = m.rollout_train_state(
+        d1, s1, _, _ = m.rollout_train_codebook(
             ids, am, target, ss_prob=0.4, ss_mask=ss_mask, train_hops=3, kv_cache=True
         )
     assert d0.shape == d1.shape == (4, 6, 1, N_CODES), f"unexpected logit shape {tuple(d0.shape)}"
@@ -166,7 +167,7 @@ def test_code_emit_recon_carries_emission_gradient() -> None:
     """`recon` must be the EMISSION with gradient, not the target.
 
     Every auxiliary loss term builds its query from `c.recon` (MultiNCETerm: "emitted, gradient flows here";
-    the auxiliary contrastive terms). The codebook path is lossless, so the rollout's own recon IS the
+    HardNegTerm's continuous branch). The codebook path is lossless, so the rollout's own recon IS the
     stop-grad target -- handing that back makes in-batch InfoNCE compare each target against itself: near-zero
     loss, zero gradient, silently inert. Caught in a live run as a `loss - loss_code` gap pinned at 0.145 for
     five straight epochs while loss_code fell 5.17 -> 3.19."""

@@ -24,7 +24,7 @@ from langset.strategies import (
     MultiStepCtx,
 )  # the aux-term step context; trainer builds it each step. The concrete
 
-#   strategies (emission/target strategies/...) are injected via TrainingArguments and read off `a`, not imported here.
+#   strategies (FSQObjective/EMATwinTarget/...) are injected via TrainingArguments and read off `a`, not imported here.
 from langset.training_args import TrainingArguments
 
 if TYPE_CHECKING:  # only for local annotations of the injected strategy instances
@@ -404,7 +404,7 @@ class Trainer:
         # (e.g. modal Volume.commit) so another process can eval the live best checkpoint mid-training.
         self.on_checkpoint = on_checkpoint
         # ONE switch routes the whole trainer: a multi_latent model emits a VARIABLE-LENGTH latent set, so it reads
-        # a `target_texts` (list[str] per row) column and runs the selected emission strategy; otherwise the single-latent
+        # a `target_texts` (list[str] per row) column and runs the FSQ token-native loop; otherwise the single-latent
         # self-contrastive path (byte-for-byte unchanged) reads a scalar `target_text` column.
         self.multi_latent = bool(model.head.multi_latent)
         # ROLLOUT MUST BE TRAINED. A multi_latent model emits its latent set AUTOREGRESSIVELY at inference (rollout()
@@ -412,11 +412,6 @@ class Trainer:
         # rollout is never actually trained — you cannot roll out what you did not train. Enforce it against the
         # ss_prob sentinel: unset (None) -> 0.25 (scheduled sampling on); an EXPLICIT ss_prob=0 -> hard error.
         if self.multi_latent:
-            if args.emission is None:
-                raise ValueError(
-                    "multi_latent=True requires an explicit emission strategy: ConceptObjective, "
-                    "StateResidualObjective, CodeSoftmaxObjective, or QueryBridgeEmission"
-                )
             if args.ss_prob is None:
                 args.ss_prob = 0.25
                 print(
@@ -433,6 +428,24 @@ class Trainer:
                 )
         elif args.ss_prob is None:
             args.ss_prob = 0.0  # single-latent never rolls; teacher-forced is correct
+        # VALIDATE emb_slots up front (both paths): a bad slice/kind otherwise fails deep in train() with an opaque
+        # Linear-shape or CE error. Enforce 0 <= lo < hi <= latent_dim (contiguous, in-bounds) and a supported kind.
+        slots = getattr(args, "emb_slots", None)
+        if slots:
+            d = model.latent_dim
+            for field, spec in slots.items():
+                if not (isinstance(spec, (tuple, list)) and len(spec) == 3):
+                    raise ValueError(f"emb_slots[{field!r}] must be (lo, hi, kind); got {spec!r}")
+                lo, hi, kind = spec
+                if kind not in ("classify", "regress"):
+                    raise ValueError(
+                        f"emb_slots[{field!r}] kind must be 'classify' or 'regress'; got {kind!r}"
+                    )
+                if not (isinstance(lo, int) and isinstance(hi, int) and 0 <= lo < hi <= d):
+                    raise ValueError(
+                        f"emb_slots[{field!r}] slice must satisfy 0 <= lo < hi <= latent_dim ({d}); "
+                        f"got [{lo}:{hi}]"
+                    )
         # PLUGGABLE AUXILIARY HEADS are multi-latent only (they generalize the phase head, which lives only there).
         if getattr(args, "heads", None) and not self.multi_latent:
             raise ValueError(
@@ -470,7 +483,7 @@ class Trainer:
             cols = {**cols, "input_text": _init, "target_text": list(self._mask_texts)}
             # input_text/target_text are now SYNTHESIZED under their canonical keys -> read them directly (any
             # column_mapping for them is meaningless: their source is `text`, not a real input/target column). But
-            # KEEP `inv` intact so the optional fields below (mask_field, hard_neg_field, learn_field)
+            # KEEP `inv` intact so the optional fields below (mask_field, hard_neg_field, emb_slots, learn_field)
             # still honor column_mapping exactly as the non-masked path does -> same dataset+mapping, same behavior.
             get = lambda canon: cols[canon]  # type: ignore[index]  # noqa: E731
         self.input_text = [str(x) for x in get("input_text")]
@@ -497,7 +510,8 @@ class Trainer:
                 if cot_key in cols
                 else [""] * len(self.input_text)
             )
-            # QueryBridge may consume a per-row list of hard-negative texts in its own contrastive denominator.
+            # optional MULTI-latent hard negatives: a per-row LIST of texts the emitted latents must be pushed AWAY
+            # from (batch-pooled InfoNCE bank, weight lam_hard_neg). Empty/None rows contribute no negatives.
             self.hard_neg_texts: Optional[list[list[str]]] = None
             hn_field = getattr(args, "hard_neg_field", None)
             if hn_field is not None:
@@ -566,6 +580,75 @@ class Trainer:
                     [[int(i) for i in tick] for tick in row[: args.max_target_items]]
                     for row in raw_st
                 ]
+            # optional FSQ LABEL SUBSPACE: per-item label columns -> reserved-dim codeword targets (a formal, head-free
+            # label space in the emitted code). Builds a class->codeword map per facet and a flat "plan" of which
+            # rest-dim column carries which facet's k-th codeword digit.
+            self.label_cols: Optional[dict[str, list[list[str]]]] = None
+            self.label_codewords: dict[str, dict[str, list[int]]] = {}
+            self.label_plan: Optional[list[tuple[int, str, int]]] = (
+                None  # (rest_col = dim-1, field, digit_pos)
+            )
+            label_dims = getattr(args, "label_dims", None)
+            if label_dims:
+                fsq_levels = int(model.head.fsq_levels)
+                self.label_cols = {}
+                plan: list[tuple[int, str, int]] = []
+                for field, dims in label_dims.items():
+                    raw = cols[inv.get(field, field)]
+                    seqs = [
+                        [str(x) for x in (v if isinstance(v, (list, tuple)) else [v])] for v in raw
+                    ]
+                    self.label_cols[field] = seqs
+                    classes = sorted(
+                        {
+                            c
+                            for s in seqs
+                            for c in s
+                            if str(c).lower() not in ("", "unknown", "none", "na", "nan")
+                        }
+                    )
+                    m_dims = len(dims)
+                    if len(classes) > fsq_levels**m_dims:
+                        raise ValueError(
+                            f"label_dims[{field}]: {len(classes)} classes > {fsq_levels}^{m_dims} "
+                            f"codewords — reserve more digits"
+                        )
+                    cw: dict[str, list[int]] = {}
+                    for ci, c in enumerate(classes):
+                        x, digs = ci, []
+                        for _ in range(m_dims):
+                            digs.append(x % fsq_levels)
+                            x //= fsq_levels  # little-endian base-fsq_levels codeword
+                        cw[c] = digs
+                    self.label_codewords[field] = cw
+                    for pos, dd in enumerate(dims):
+                        if int(dd) < 1:
+                            raise ValueError(
+                                f"label_dims dim {dd} must be >=1 (dim 0 is STOP-coupled)"
+                            )
+                        plan.append((int(dd) - 1, field, pos))
+                self.label_plan = plan
+                if args.verbose:
+                    print(
+                        "[langset] FSQ label subspace: "
+                        + "; ".join(
+                            f"{f}->{label_dims[f]} ({len(self.label_codewords[f])} cls)"
+                            for f in label_dims
+                        ),
+                        flush=True,
+                    )
+            # optional CONTINUOUS EMB SLOTS (multi-latent): per-row facet label columns (named by the emb_slots dict
+            # keys), stashed as raw strings — MIRRORS the single-latent reader below (392-399). The class<->id maps +
+            # transient decoder heads are built in _train_multi(). Set HERE because this branch returns before the
+            # single-latent slot setup. Facet labels are PER-ROW; the multi-latent decode mean-pools the emitted
+            # latent SET before slicing (see the slot loss in _train_multi). None = off (byte-identical).
+            self.slot_labels: Optional[dict[str, list[str]]] = None
+            slot_specs = getattr(args, "emb_slots", None)
+            if slot_specs:
+                self.slot_labels = {}
+                for field in slot_specs:
+                    raw = cols[inv.get(field, field)]
+                    self.slot_labels[field] = [("" if v is None else str(v)) for v in raw]
             # optional PLUGGABLE AUXILIARY HEADS (langset.heads): each user Head names a `target` dataset column. Read
             # the RAW per-row values here (a list per row for reads="recon", a scalar for reads="hidden"); resolution
             # to class maps / float tensors happens per-loss-kind in _train_multi. The phase shim reuses sup_labels,
@@ -612,6 +695,16 @@ class Trainer:
         if hn_field is not None:
             raw = cols[inv.get(hn_field, hn_field)]
             self.hard_neg_text = [str(v) if v not in (None, "") else "" for v in raw]
+        # optional CONTINUOUS EMB SLOTS: per-row facet label columns (named by the emb_slots dict keys). Stashed as raw
+        # strings here; the class<->id maps + transient decoder heads are built in train() (see TrainingArguments.emb_slots).
+        # (type declared once in the multi_latent branch above; plain re-assign here to avoid a mypy no-redef.)
+        self.slot_labels = None
+        slot_specs = getattr(args, "emb_slots", None)
+        if slot_specs:
+            self.slot_labels = {}
+            for field in slot_specs:
+                raw = cols[inv.get(field, field)]
+                self.slot_labels[field] = [("" if v is None else str(v)) for v in raw]
         # optional knowledge-injection: rows tagged "learn" train next-token CE (input_text -> target_text) instead
         # of contrastive; they're pulled OUT of the contrastive split and fed as a separate learn pool.
         self.is_learn: list[bool] = [False] * len(self.input_text)
@@ -719,8 +812,39 @@ class Trainer:
                 m, ln_doc_ids[pos], ln_doc_mask[pos], ln_tgt_ids[pos], ln_tgt_mask[pos], vsz
             )
 
+        # CONTINUOUS EMB SLOTS: one TRANSIENT decoder head per facet, each reading ONLY its reserved dim slice of the
+        # emit vector `pred`. CE (classify) / MSE (regress). Grad flows into the encoder through those dims -> the
+        # facet is routed INTO the slice. Heads are trained but NOT saved (like the phase head; eval re-fits its own).
+        slot_plan: list[tuple[str, int, int, str, torch.nn.Module, dict[str, int]]] = []
+        if self.slot_labels is not None:
+            emb_slots = a.emb_slots
+            assert emb_slots is not None  # slot_labels is populated iff emb_slots was set
+            for field, (lo, hi, kind) in emb_slots.items():
+                labs = self.slot_labels[field]
+                if kind == "classify":
+                    classes = sorted(
+                        {v for v in labs if v.lower() not in ("", "unknown", "none", "nan", "na")}
+                    )
+                    cls2id = {c: i for i, c in enumerate(classes)}
+                    head: torch.nn.Module = torch.nn.Linear(hi - lo, len(classes)).to(dev)
+                else:  # regress
+                    cls2id = {}
+                    head = torch.nn.Linear(hi - lo, 1).to(dev)
+                slot_plan.append((field, lo, hi, kind, head, cls2id))
+            if a.verbose:
+                print(
+                    "[langset] emb slots: "
+                    + "; ".join(
+                        f"{f}->[{lo}:{hi}] {kind}({len(c) if c else 'reg'})"
+                        for f, lo, hi, kind, _, c in slot_plan
+                    ),
+                    flush=True,
+                )
+        slot_params = [p for (_, _, _, _, h, _) in slot_plan for p in h.parameters()]
         opt = torch.optim.AdamW(
-            [p for p in m.parameters() if p.requires_grad] + list(connector.parameters()),
+            [p for p in m.parameters() if p.requires_grad]
+            + list(connector.parameters())
+            + slot_params,
             lr=a.lr,
         )
         run = None
@@ -752,6 +876,17 @@ class Trainer:
                 if nm in _params:
                     _params[nm].data.copy_(t.to(_params[nm].device, _params[nm].dtype))
             connector.load_state_dict({k: v.to(dev) for k, v in ck["connector"].items()})
+            for (
+                field,
+                _,
+                _,
+                _,
+                head,
+                _,
+            ) in slot_plan:  # transient slot heads (present only if emb_slots on)
+                sd = ck.get("slot_heads", {}).get(field)
+                if sd is not None:
+                    head.load_state_dict({k: v.to(dev) for k, v in sd.items()})
             opt.load_state_dict(ck["opt"])
             for (
                 stt
@@ -787,6 +922,10 @@ class Trainer:
                         nm: p.detach().cpu() for nm, p in m.named_parameters() if p.requires_grad
                     },
                     "connector": {k: v.detach().cpu() for k, v in connector.state_dict().items()},
+                    "slot_heads": {
+                        f: {k: v.detach().cpu() for k, v in h.state_dict().items()}
+                        for f, _, _, _, h, _ in slot_plan
+                    },
                     "opt": opt.state_dict(),
                     "ep": int(next_ep),
                     "best_score": float(best_score),
@@ -866,7 +1005,7 @@ class Trainer:
         ) -> torch.Tensor:
             """Single-latent contrastive loss as a PURE FUNCTION OF THE EMBEDDINGS (pred/target/hn) — the
             GradCache-compatible factoring of the inline step below. Contains every term that reads only the
-            pooled embeddings (in-batch-negative InfoNCE + false-neg / hard-neg masking facets +
+            pooled embeddings (in-batch-negative InfoNCE + false-neg / hard-neg masking + emb_slots facets +
             uniformity); the recon aux is NOT here (it needs the per-token backbone graph, so it stays on the
             direct path and grad_cache asserts lam_recon==0). Byte-identical math to the inline step, so
             grad_cache=False is unchanged."""
@@ -898,6 +1037,37 @@ class Trainer:
                     neg_mask, float("-inf")
                 )  # diagonal (positive) always kept
             loss = F.cross_entropy(logits, torch.arange(B, device=dev))  # primary
+            for (
+                field,
+                lo,
+                hi,
+                kind,
+                head,
+                cls2id,
+            ) in slot_plan:  # aux: CONTINUOUS EMB SLOTS (pure fn of pred)
+                sl = self.slot_labels
+                assert sl is not None
+                labs = sl[field]
+                sub = pred[:, lo:hi]
+                rows_i = idx.tolist()
+                if kind == "classify":
+                    yi = torch.tensor([cls2id.get(labs[j], -100) for j in rows_i], device=dev)
+                    if bool((yi >= 0).any()):
+                        loss = loss + a.lam_emb_slots * F.cross_entropy(
+                            head(sub), yi, ignore_index=-100
+                        )
+                else:  # regress: MSE on known rows
+                    keep = [
+                        k
+                        for k, j in enumerate(rows_i)
+                        if labs[j].lower() not in ("", "unknown", "none", "nan", "na")
+                    ]
+                    if keep:
+                        ki = torch.tensor(keep, device=dev)
+                        yt = torch.tensor(
+                            [float(labs[rows_i[k]]) for k in keep], device=dev
+                        ).unsqueeze(1)
+                        loss = loss + a.lam_emb_slots * F.mse_loss(head(sub[ki]), yt)
             if a.lam_uniform > 0 and B > 1:  # aux: uniformity
                 sq = torch.pdist(F.normalize(pred, p=2, dim=-1), p=2).pow(2)
                 loss = loss + a.lam_uniform * sq.mul(-2.0).exp().mean().log()
@@ -1012,7 +1182,7 @@ class Trainer:
                     # HARD NEGATIVES flow through _sl_loss as extra negative columns; grad still reaches only `pred`.
                     loss = _sl_loss(
                         pred, target, hn, idx
-                    )  # InfoNCE + false-neg/hard-neg masking + uniformity (factored above)
+                    )  # InfoNCE + false-neg/hard-neg masking + emb_slots + uniformity (factored above)
                     if (
                         engine.supports_recon and a.lam_recon > 0
                     ):  # aux: grounding. At 0 the term is zero anyway;
@@ -1137,15 +1307,19 @@ class Trainer:
         return m
 
     def _train_multi(self) -> LangSetModel:
-        """Train an explicitly selected multi-vector emission objective.
-
-        Named-state objectives autoregressively feed each committed concept mixture back and learn an independent
-        STOP decision. QueryBridge emits an unordered continuous vector set in one pass. A target-source strategy
-        supplies the comparison geometry, while optional auxiliary terms shape it without choosing the emitter."""
+        """Multi-latent (variable-length FSQ latent-set) training. `input_text` seeds an autoregressive emission of a
+        latent per `target_texts` item, terminated by a learned STOP. Each target latent is supplied by a stop-grad
+        EMA twin (BYOL/JEPA) — MANDATORY here: with the online model emitting its own target both sides move and the
+        geometry collapses. Objective = per-dim FSQ digit CE + a folded-in STOP CE + a cosine reconstruction; one
+        loss, no lam_* knobs. Selection = retrieval MRR against the row's own targets, with a non-collapse diversity
+        count logged as the anti-collapse guard. (Generalized from the validated regulatory seed-token loop.)"""
         a, m = self.args, self.model
         dev = m.device
         tok = m.tokenizer
+        head = m.head
         d = int(m.latent_dim)
+        fsq_levels = int(head.fsq_levels)  # only for MultiStepCtx; the emission objective derives
+        #                                                         its own fsq_dim/fsq_levels/stop_idx off model.head
         torch.manual_seed(a.seed)
         rng = np.random.default_rng(a.seed)
 
@@ -1156,7 +1330,7 @@ class Trainer:
         futs = [lst[: a.max_target_items] for lst in self.target_texts]  # cap targets per row
         if a.emit_seed:
             # PHASE-0 as an emitted node: prepend each seed's OWN text as target position 0, so the emitter learns to
-            # produce its start-state latent before the futures. Everything downstream (state/STOP/recon/phase head/
+            # produce its start-state latent before the futures. Everything downstream (digits/STOP/recon/phase head/
             # eval bank) shifts by one automatically; sup_labels gets a leading "phase0" class. Must happen HERE —
             # before evaluate() closes over `futs` and before the phase_head label set is built from self.sup_labels.
             futs = [[seeds[i], *futs[i]] for i in range(len(futs))]
@@ -1230,24 +1404,58 @@ class Trainer:
         ):  # persisted heads: register on the model so they serialize + are queryable at inference
             if not h.spec.transient:
                 m.add_aux_head(h.module, h.spec_dict())
+        # CONTINUOUS EMB SLOTS (multi-latent port): one TRANSIENT decoder head per facet, each reading ONLY its reserved
+        # dim slice of the row's emit. In the single-latent path the emit is one vector; here the model emits a
+        # VARIABLE-LENGTH latent SET (em.recon [B, L, d] + valid [B, L]). DESIGN DECISION: to decode a PER-ROW facet
+        # from a per-row SET we mean-pool the VALID latents over L -> [B, d], then slice [:, lo:hi] — this mirrors
+        # single-latent semantics (one vector per row) exactly and is the safe default. The transient head + CE/MSE loss
+        # (see the slot loss in the step loop) then force the encoder to route the facet into that slice; grad reaches
+        # every emitted latent equally through the mean-pool. ALTERNATIVE (future work): slot a single DESIGNATED latent
+        # (e.g. position 0 / the emit_seed node), or give each latent its OWN per-position slot label — both need a
+        # richer per-position label schema than the per-row columns we have, so pooling is preferred until that lands.
+        # Heads are trained but NOT saved to the model (like phase_head; eval re-fits its own probe on the slice).
+        slot_plan: list[tuple[str, int, int, str, torch.nn.Module, dict[str, int]]] = []
+        if self.slot_labels is not None:
+            emb_slots = a.emb_slots
+            assert emb_slots is not None  # slot_labels is populated iff emb_slots was set
+            for field, (lo, hi, kind) in emb_slots.items():
+                labs = self.slot_labels[field]
+                if kind == "classify":
+                    classes = sorted(
+                        {v for v in labs if v.lower() not in ("", "unknown", "none", "nan", "na")}
+                    )
+                    cls2id = {c: i for i, c in enumerate(classes)}
+                    slot_head: torch.nn.Module = torch.nn.Linear(hi - lo, len(classes)).to(dev)
+                else:  # regress
+                    cls2id = {}
+                    slot_head = torch.nn.Linear(hi - lo, 1).to(dev)
+                slot_plan.append((field, lo, hi, kind, slot_head, cls2id))
+            if a.verbose:
+                print(
+                    "[langset] emb slots (multi, mean-pooled): "
+                    + "; ".join(
+                        f"{f}->[{lo}:{hi}] {kind}({len(c) if c else 'reg'})"
+                        for f, lo, hi, kind, _, c in slot_plan
+                    ),
+                    flush=True,
+                )
         # Build the emission strategy BEFORE the optimizer: a strategy may register its OWN trainable module on the
         # model (e.g. a parallel-query bridge over a frozen backbone), and `params` below must then capture it via
-        # `m.parameters()`.
-        assert (
-            a.emission is not None
-        )  # validated in __init__; narrows the injected callable for the type checker
+        # `m.parameters()`. FSQ registers nothing extra, so this is byte-identical for the default path.
         objective: _EmissionObjective = a.emission(
             m, a, dev, self
         )  # emission strategy (INJECTED), built ONCE
+        slot_params = [p for (_, _, _, _, h, _) in slot_plan for p in h.parameters()]
         params = [
             p for p in m.parameters() if p.requires_grad
         ]  # includes PERSISTED aux heads + any strategy module registered above
         # TRANSIENT aux-head params are trainer-owned (not on the model), so add them explicitly — exactly as the old
-        # phase head did. Parameter order does not affect AdamW's per-parameter update.
+        # phase head did. Ordering (base+head, then transient heads, then slots) preserves the byte-identical default
+        # (phase-only: base+head, phase, slots) since param order doesn't affect AdamW's per-parameter update.
         transient_head_params = [
             p for h in rt_heads if h.spec.transient for p in h.module.parameters()
         ]
-        opt = torch.optim.AdamW(params + transient_head_params, lr=a.lr)
+        opt = torch.optim.AdamW(params + transient_head_params + slot_params, lr=a.lr)
         run = None
         if a.report_to == "wandb":
             import wandb  # type: ignore[import-untyped]  # ty: ignore[unresolved-import]  # optional dep, not installed
@@ -1258,7 +1466,7 @@ class Trainer:
         def evaluate() -> dict[str, float]:
             """Free-roll each val seed -> emitted latents; decode each by nearest-neighbor against an EMA-emitted bank
             of the val `target_texts`. Reports (a) retrieval MRR vs the chain's OWN targets and (b) a NON-COLLAPSE
-            diversity count = distinct nearest-bank items produced (state must not mean-collapse to one mode)."""
+            diversity count = distinct nearest-bank items produced (FSQ must not mean-collapse to one mode)."""
             m.eval()
             import time as _et
 
@@ -1288,7 +1496,7 @@ class Trainer:
             emit_labs: list[str] = []  # position-aligned sup label of each emission
             for i in range(0, len(veval), a.batch_size):
                 chunk = veval[i : i + a.batch_size]
-                # emission-strategy owns inference: state delegates to the AR rollout; a parallel-query family emits
+                # emission-strategy owns inference: FSQ delegates to the AR rollout; a parallel-query family emits
                 # in ONE pass. Both return (lat [B,Lmax,d], len [B]).
                 lats, lens = objective.emit_infer([seeds[c] for c in chunk], a.max_steps)
                 for kk, ci in enumerate(chunk):
@@ -1355,6 +1563,17 @@ class Trainer:
                 hsd = ck.get("aux_heads", {}).get(h.spec.name)
                 if hsd is not None:
                     h.module.load_state_dict({k: v.to(dev) for k, v in hsd.items()})
+            for (
+                field,
+                _,
+                _,
+                _,
+                s_head,
+                _,
+            ) in slot_plan:  # transient slot heads (present only if emb_slots on)
+                sd = ck.get("slot_heads", {}).get(field)
+                if sd is not None:
+                    s_head.load_state_dict({k: v.to(dev) for k, v in sd.items()})
             opt.load_state_dict(ck["opt"])
             for (
                 stt
@@ -1401,6 +1620,11 @@ class Trainer:
                 payload["aux_heads"] = {
                     h.spec.name: {k: v.detach().cpu() for k, v in h.module.state_dict().items()}
                     for h in rt_heads
+                }
+            if slot_plan:  # transient slot heads (only when emb_slots on)
+                payload["slot_heads"] = {
+                    f: {k: v.detach().cpu() for k, v in h.state_dict().items()}
+                    for f, _, _, _, h, _ in slot_plan
                 }
             torch.save(payload, tmp)
             tmp.replace(d / "resume.pt")
@@ -1488,6 +1712,10 @@ class Trainer:
                 "grad_cache is incompatible with a cross-batch regularizer (e.g. SIGRegTarget): it is computed "
                 "over the whole batch's latents and is not cached. Use the EMA twin, or grad_cache=False."
             )
+            assert self.label_plan is None, (
+                "grad_cache is incompatible with the FSQ label subspace (LabelDimsTerm reads dim_lg, the rollout "
+                "logits, not the cached recon). Drop label_field or grad_cache."
+            )
             assert not any(getattr(t, "isolated_backward", False) for t in loss_terms), (
                 "grad_cache does not support isolated-backward loss terms."
             )
@@ -1511,7 +1739,7 @@ class Trainer:
         ) -> float:
             """Multi-latent GradCache. Phase 1 rolls out the FULL batch under no_grad (a SHARED ss_mask makes the
             scheduled-sampling rollout deterministic), runs the cross-batch recon-pure terms (InfoNCE, hard-neg,
-            supcon, phase) on the full-batch recon, and caches d(loss)/d(recon). Phase 2 re-rolls each
+            supcon, phase, emb_slots) on the full-batch recon, and caches d(loss)/d(recon). Phase 2 re-rolls each
             gc_chunk WITH grad, backprops the (row-weighted) base loss, and injects the cached recon-grads -> the
             cross-batch term is EXACT full-batch; the per-row base loss is accumulated (pragmatic, see grad_cache
             docs). Peak activation = one chunk."""
@@ -1540,7 +1768,10 @@ class Trainer:
                 valid=valid,
                 target_lat=target_lat,
                 recon=recon_rg,
+                dim_lg=None,
                 lmax=lmax,
+                fsq_levels=fsq_levels,
+                lab_label=None,
                 target_source=target_source,
                 phase_head=phase_head,
                 phase_ids=phase_ids,
@@ -1562,6 +1793,34 @@ class Trainer:
                 if raw_h is not None:
                     cross = cross + h.spec.eff_weight(ep) * raw_h
                     agg[h.spec.loss_key] = agg.get(h.spec.loss_key, 0.0) + float(raw_h.detach())
+            if slot_plan:  # emb_slots facets: pure fn of the pooled recon
+                _vm = valid.unsqueeze(-1).to(recon_rg.dtype)
+                pooled = (recon_rg * _vm).sum(1) / _vm.sum(1).clamp(min=1.0)
+                for field, lo, hi, kind, slot_head, cls2id in slot_plan:
+                    sl = self.slot_labels
+                    assert sl is not None
+                    labs = sl[field]
+                    sub = pooled[:, lo:hi]
+                    if kind == "classify":
+                        yi = torch.tensor([cls2id.get(labs[j], -100) for j in bidx], device=dev)
+                        if bool((yi >= 0).any()):
+                            _sl = F.cross_entropy(slot_head(sub), yi, ignore_index=-100)
+                            cross = cross + a.lam_emb_slots * _sl
+                            agg["loss_slots"] = agg.get("loss_slots", 0.0) + float(_sl.detach())
+                    else:
+                        keep = [
+                            k
+                            for k, j in enumerate(bidx)
+                            if labs[j].lower() not in ("", "unknown", "none", "nan", "na")
+                        ]
+                        if keep:
+                            ki = torch.tensor(keep, device=dev)
+                            yt = torch.tensor(
+                                [float(labs[bidx[k]]) for k in keep], device=dev
+                            ).unsqueeze(1)
+                            _sl = F.mse_loss(slot_head(sub[ki]), yt)
+                            cross = cross + a.lam_emb_slots * _sl
+                            agg["loss_slots"] = agg.get("loss_slots", 0.0) + float(_sl.detach())
             opt.zero_grad()
             if cross.requires_grad:
                 cross.backward()  # fills recon_rg.grad (+ any head params: phase_head, slot heads)
@@ -1595,9 +1854,7 @@ class Trainer:
                 for (
                     _k,
                     _v,
-                ) in (
-                    em_c.logs.items()
-                ):  # whatever THIS objective logs (objective-defined components)
+                ) in em_c.logs.items():  # whatever THIS objective logs (FSQ: stop/dims/recon)
                     agg[_k] = agg.get(_k, 0.0) + float(_v.detach()) * w
             opt.step()
             target_source.update()
@@ -1612,7 +1869,7 @@ class Trainer:
             nb = 0
             agg: dict[
                 str, float
-            ] = {}  # accumulates whatever the emission objective logs (its keys, not another objective's)
+            ] = {}  # accumulates whatever the emission objective logs (its keys, not FSQ's)
             for i in range(0, len(order), a.batch_size):
                 if (
                     learn_pool and float(rng.random()) < a.learn_ratio
@@ -1657,7 +1914,7 @@ class Trainer:
                     continue
                 with _rf("rollout"):
                     em = objective.emit(se, target_lat, valid, lens_l, bidx, b, lmax, ep)
-                recon = em.recon
+                recon, dim_lg, lab_label = em.recon, em.dim_lg, em.lab_label
                 loss = em.base_loss  # base objective (emission + STOP + recon); separation below
                 c = MultiStepCtx(  # everything the aux terms read this step
                     trainer=self,
@@ -1670,7 +1927,10 @@ class Trainer:
                     valid=valid,
                     target_lat=target_lat,
                     recon=recon,
+                    dim_lg=dim_lg,
                     lmax=lmax,
+                    fsq_levels=fsq_levels,
+                    lab_label=lab_label,
                     target_source=target_source,
                     phase_head=phase_head,
                     phase_ids=phase_ids,
@@ -1690,7 +1950,7 @@ class Trainer:
                     # phase-only run is byte-identical. Each self-skips (loss_on -> None) when nothing supervises it.
                     if (
                         h.spec.reads == "recon"
-                    ):  # per emitted latent (grad shapes the emission geometry, like the phase head)
+                    ):  # per emitted latent (grad shapes the FSQ geometry, like the phase head)
                         pred = h.module(recon[valid].float())
                         flat = h._flat_recon_targets(bidx, lens_l)
                     else:  # "hidden": pooled per-sequence seed hidden — a separate backbone forward whose grad shapes it
@@ -1712,6 +1972,39 @@ class Trainer:
                     )  # wants_regularizer=True sources return a tensor here
                     loss = loss + a.sigreg_lambda * loss_sig
                     agg["loss_sig"] = agg.get("loss_sig", 0.0) + float(loss_sig.detach())
+                if slot_plan:  # aux: CONTINUOUS EMB SLOTS (per-row facet, mean-pooled)
+                    # MEAN-POOL the emitted latent SET over its VALID positions -> one [b, d] vector per row (the
+                    # single-latent analog), then decode each facet from its reserved slice. gradient flows back
+                    # through every valid emitted latent equally, routing the facet INTO those dims.
+                    _vm = valid.unsqueeze(-1).to(em.recon.dtype)  # [b, lmax, 1]
+                    pooled = (em.recon * _vm).sum(1) / _vm.sum(1).clamp(
+                        min=1.0
+                    )  # [b, d] mean over valid latents
+                    for field, lo, hi, kind, slot_head, cls2id in slot_plan:
+                        sl = self.slot_labels
+                        assert sl is not None  # slot_plan is non-empty only when slot_labels is set
+                        labs = sl[field]  # decode facet from pooled[:, lo:hi]
+                        sub = pooled[:, lo:hi]  # -> encoder routes it there
+                        if kind == "classify":
+                            yi = torch.tensor([cls2id.get(labs[j], -100) for j in bidx], device=dev)
+                            if bool((yi >= 0).any()):
+                                _sl = F.cross_entropy(slot_head(sub), yi, ignore_index=-100)
+                                loss = loss + a.lam_emb_slots * _sl
+                                agg["loss_slots"] = agg.get("loss_slots", 0.0) + float(_sl.detach())
+                        else:  # regress: MSE on known rows
+                            keep = [
+                                k
+                                for k, j in enumerate(bidx)
+                                if labs[j].lower() not in ("", "unknown", "none", "nan", "na")
+                            ]
+                            if keep:
+                                ki = torch.tensor(keep, device=dev)
+                                yt = torch.tensor(
+                                    [float(labs[bidx[k]]) for k in keep], device=dev
+                                ).unsqueeze(1)
+                                _sl = F.mse_loss(slot_head(sub[ki]), yt)
+                                loss = loss + a.lam_emb_slots * _sl
+                                agg["loss_slots"] = agg.get("loss_slots", 0.0) + float(_sl.detach())
                 opt.zero_grad()
                 with _rf("backward"):
                     loss.backward()  # frees the main graph before any isolated term runs
@@ -1728,10 +2021,7 @@ class Trainer:
                     target_source.update()  # EMA twin tracks the online model
                 tot += float(loss.detach())
                 nb += 1
-                for (
-                    _k,
-                    _v,
-                ) in em.logs.items():  # emission-defined keys (objective-defined components)
+                for _k, _v in em.logs.items():  # emission-defined keys (FSQ: stop/dims/recon)
                     agg[_k] = agg.get(_k, 0.0) + float(_v.detach())
                 if _prof is not None:
                     if torch.cuda.is_available():
@@ -1813,8 +2103,8 @@ class Trainer:
                 sup_s = f" sup={row['loss_sup']:.3f}" if "loss_sup" in row else ""
                 ph_s = f" phase={row['loss_phase']:.3f}" if "loss_phase" in row else ""
                 pur_s = f" purity={pur:.3f}" if self.sup_labels is not None else ""
-                # the emission's own terms, in a stable order; unchanged for state (stop/dims/recon), and a
-                # different objective prints ITS terms rather than KeyError-ing on another objective's.
+                # the emission's own terms, in a stable order; unchanged for FSQ (stop/dims/recon), and a
+                # different objective prints ITS terms rather than KeyError-ing on FSQ's.
                 _names = {
                     "loss_stop": "stop",
                     "loss_dims": "dims",

@@ -8,8 +8,13 @@ quadrature on [0, 3]. If every random 1-D projection looks standard-normal, the 
 Gaussian (Cramer-Wold).
 
 Used by SIGRegTarget (inject via `TrainingArguments(target_source=SIGRegTarget)`) as the alternative to the EMA
-twin. TRAINING-ONLY (never persisted, never used at eval). Each emission objective selects the representation
-to regularize through ``z_for_reg``; codebook objectives use predicted and target laws over named members.
+twin. TRAINING-ONLY (never persisted, never used at eval). For a token-native FSQ head, apply it NOT to the
+emitted reconstruction but to the quantizer's own coordinates, penalized independently on each side (see
+FSQObjective.z_for_reg): the TARGET side uses the pre-quantization z = down_proj(target_latent) (the raw FSQ
+input), and the PREDICTED side uses the expected digit E[digit] = Σ softmax(dim_logits)·levels (there is no
+down_proj on the predicted path — the model emits digit logits, so its analogue of the pre-quant coordinate is
+the soft digit expectation). Regularizing these spreads the encoder's codes across the whole grid, which is what
+stops the (twin-free) live encoder folding every input into one cell.
 """
 
 from __future__ import annotations

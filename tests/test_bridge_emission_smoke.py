@@ -104,6 +104,7 @@ def test_query_bridge_emission_folds_hard_negatives_into_the_bank() -> None:
             emission=QueryBridgeEmission,
             target_source=FrozenEncoderTarget,
             lam_multi_nce=0.0,
+            lam_hard_neg=0.0,  # bridge consumes hard_neg_field IN-BANK; separate term stays off
             hard_neg_field="hard_neg",  # <-- pooled adjacent-confusables folded into the bridge's InfoNCE
             output_dir=out,
         )

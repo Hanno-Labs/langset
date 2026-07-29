@@ -148,7 +148,7 @@ def build_row(rng: random.Random, h: int, w: int, wall_p: float,
     nbranch = [str(len(rec["active"])) for rec in seq] + ["0"]   # verdict tick has no wavefront cells
     solv = "yes" if solvable else "no"
     return {"seed": render_seed(grid), "fut_text": fut, "label_nbranch": nbranch,
-            "label_solvable": [solv] * len(fut),
+            "label_solvable": [solv] * len(fut),               # per-tick solvable label (FSQ subspace-ready)
             "game": f"maze_{h}x{w}_{'S' if solvable else 'U'}_{rng.random():.9f}",  # unique id for holdout
             "solvable": solvable,
             "max_branches": max_branches, "n_ticks": len(seq),

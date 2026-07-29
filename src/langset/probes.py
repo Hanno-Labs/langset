@@ -46,7 +46,7 @@ def calibration_corr(
     """Superposition CALIBRATION: Pearson corr between the emitted latent's native entropy and the ground-truth
     number of possible next states at that emission.
 
-    entropy      per-emission concept entropy from `rollout(..., return_soft=True)`.
+    entropy      per-emission native FSQ entropy — the `ent` array from `rollout(..., return_soft=True)`.
     cardinality  per-emission ground-truth set size (how many next states were actually possible there).
     groups       optional per-emission group id (e.g. trajectory/maze id). If given with `test_groups`, the
                  correlation is computed on the held-out group split only, so it matches a decodability probe's

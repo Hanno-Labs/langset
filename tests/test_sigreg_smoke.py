@@ -1,5 +1,6 @@
 """SMOKE test for the SIGReg (LeJEPA) anti-collapse target source.
 
+The multi-latent characterization golden (test_trainer_multi_characterization.py) pins the DEFAULT EMA-twin path.
 SIGReg is a different training path (no EMA twin, live gradient targets, in-batch NCE gated off, an extra
 isotropic-Gaussian penalty), so it needs its own coverage. This is a fast CPU/fp32 smoke, not a golden: it just
 proves the injected `target_source=SIGRegTarget` path RUNS, stays finite, and actually changes training vs the
@@ -14,9 +15,9 @@ import tempfile
 import numpy as np
 import torch
 
-# Reuse the named-state harness (tiny model, deterministic seed, 8-row dataset).
+# reuse the golden harness (tiny model, deterministic seed, 8-row dataset, aux-term-exercising args)
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
-import multi_state_helpers as M  # noqa: E402
+import test_trainer_multi_characterization as M  # noqa: E402
 
 from langset import Trainer  # noqa: E402
 from langset.sigreg import SIGReg  # noqa: E402
