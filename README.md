@@ -110,11 +110,28 @@ from langset import LangSetModel, Trainer, TrainingArguments
 from langset.strategies import ConceptObjective
 
 rows = [{
-    "input_text": "candidate X after phase 1",
-    "target_texts": ["phase 2 is ongoing", "phase 3 missed its endpoint"],
+    "input_text": "release 2.4 has entered canary deployment",
+    "target_texts": [
+        "the canary receives a small traffic share",
+        "health checks remain stable",
+        "the release expands to all regions",
+    ],
     "concepts": [
-        {"stage": ["ph2"], "result": ["ongoing"]},
-        {"stage": ["ph3"], "result": ["missed"]},
+        {
+            "phase": ["canary"],
+            "traffic": {"low": 0.9, "medium": 0.1},
+            "health": ["observing"],
+        },
+        {
+            "phase": ["canary"],
+            "traffic": ["medium"],
+            "health": ["healthy"],
+        },
+        {
+            "phase": ["complete"],
+            "traffic": ["full"],
+            "health": ["healthy"],
+        },
     ],
 }]
 
