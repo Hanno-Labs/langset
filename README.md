@@ -26,12 +26,7 @@ Language models and world models are usually posed as a *choice*. It's a false b
 an architecture question: does moving from next-token prediction to **latent** prediction require a new
 primitive? It doesn't.
 
-LeCun names what a language model lacks — an abstract latent variable, *discrete, low-capacity,
-collapse-resistant*. langset gives a pretrained model exactly that, **inside its own vocabulary**: a
-self-supervised JEPA latent emitted as **FSQ digit tokens through the ordinary softmax**, trained toward the
-model's *own* latent (kept from collapsing by a standard self-supervised mechanism) — no decoder, no target
-outside the model. Latents and text co-train under one next-token cross-entropy. **Quantize the latent, keep
-the token.**
+LangSet adds a learned vector-emission interface to a pretrained language model. A model may emit one ordinary continuous embedding, an unordered continuous vector set through `QueryBridgeEmission`, or an autoregressive sequence of named-state superpositions through a fixed concept codebook. The output geometry is explicit rather than hidden in quantizer digits.
 
 In practice you write the *states* of a process as `target_texts`, and the model learns to emit the set of
 admissible next states — no labels, no hand-built simulator. What that buys:
@@ -39,9 +34,9 @@ admissible next states — no labels, no hand-built simulator. What that buys:
 * 🔎 **Readout, not acquisition.** The emitted latents *surface* world knowledge the pretrained model already
   held. Scramble the vocabulary so the task keeps its dynamics but loses its meaning, and much of that knowledge
   falls away with it — evidence the latents read it out of pretraining, not out of the task.
-* 🎲 **One latent, several futures.** A single emission can hold several live continuations at once — its
-  uncertainty rising with how many remain, dropping none of them. A *calibrated* superposition, read from the
-  digit softmax (see the [maze-superposition example](examples/maze-superposition)).
+* 🎲 **One latent, several futures.** A single emission can hold several live continuations at once, with
+  uncertainty rising as probability mass spreads across named concepts. See the
+  [maze-superposition example](examples/maze-superposition).
 * 💬 **Reason in words, then emit.** When holding those futures takes reasoning rather than perception, one
   emission isn't enough on its own — but because the latent shares the stream, the model can reason in tokens
   first, and that reasoning is what calibrates its uncertainty.
@@ -62,15 +57,27 @@ set back plus its per-step entropy — the model's own calibrated uncertainty.
 
 ```python
 from langset import LangSetModel, Trainer, TrainingArguments
+from langset.strategies import ConceptObjective
 
-rows = [{"input_text": "<a state>", "target_texts": ["<next state A>", "<next state B>", "<next state C>"]},
-        # ...one row per state; target_texts is the SET of admissible next states
-       ]
-model = LangSetModel.from_pretrained("HuggingFaceTB/SmolLM2-135M", multi_latent=True)   # FSQ set-emission head
-Trainer(model, TrainingArguments(epochs=15), rows).train()
+rows = [{
+    "input_text": "<a state>",
+    "target_texts": ["<the next tick>"],
+    "concepts": [{"future": ["next state A", "next state B", "next state C"]}],
+}]
+model = LangSetModel.from_pretrained(
+    "HuggingFaceTB/SmolLM2-135M",
+    multi_latent=True,
+    code_emit=True,
+    n_codes=1,  # placeholder; ConceptObjective discovers and installs the real alphabet
+)
+Trainer(model, TrainingArguments(
+    epochs=15,
+    emission=ConceptObjective,
+    concept_field="concepts",
+), rows).train()
 
 lat, lengths, soft, ent = model.rollout("<a state>", return_soft=True)
-# soft = the expected latent SET (the superposition); ent = per-step entropy (higher = a more open future)
+# soft = named-state superposition; ent = uncertainty over the concepts at each tick
 ```
 
 **[examples/maze-superposition](examples/maze-superposition)** is the end-to-end reference: it trains a world
@@ -83,10 +90,9 @@ guess).
 1. **Predict in latent space (JEPA).** Each emitted latent is trained to match the **stop-grad target latents**
    of its next states (in-batch negatives keep distinct states apart). Predicting a target-encoder's latents —
    not pixels, not tokens — is exactly the JEPA objective, here run *inside* a pretrained LLM.
-2. **Token-native emission.** Each latent is finite-scalar-quantized (FSQ) into per-dimension digits the model
-   predicts, with **STOP folded into dim-0's softmax**; every emitted latent is fed back into the stream so the
-   next one is conditioned on those already emitted. The latent is literally a token — text and latents share
-   one softmax/CE interface.
+2. **Named-state emission.** The autoregressive path predicts a distribution over a fixed concept codebook plus
+   an independent **STOP** decision. The committed superposition is fed back into the stream, so each later state
+   is conditioned on those already emitted.
 3. **Anti-collapse is the JEPA apparatus.** A stop-grad **EMA target twin** (BYOL/JEPA) supplies the targets by
    default; inject `SIGRegTarget` for the EMA-free **LeJEPA** alternative
    ([details below](#anti-collapse-ema-twin-default-vs-sigreg-lejepa)).
@@ -95,13 +101,14 @@ guess).
 
 ## World-model knobs
 
-Every knob below is a **strategy injected into `TrainingArguments`**, not a boolean on a monolith — the defaults
-give you the FSQ + EMA-twin world model, and each injection swaps one piece.
+Every multi-vector run chooses an explicit emission strategy in `TrainingArguments`: a named-state objective for
+ordered autoregressive state, or `QueryBridgeEmission` for an unordered continuous vector set. The target source
+and auxiliary terms remain independently injectable.
 
 ### Named state emission — `ConceptObjective`
 
-FSQ learns an implicit discrete code. When the state vocabulary is known, `ConceptObjective` instead constructs
-each emitted latent from a soft mixture over named members. Lists split probability mass equally; dictionaries
+`ConceptObjective` constructs each emitted latent from a soft mixture over named members. Lists split probability
+mass equally; dictionaries
 provide explicit weights. Each facet gets its own softmax, so values in `stage` compete with other stages without
 competing with values in `result`.
 
@@ -195,7 +202,7 @@ the validated default.
 By default the model emits latents straight from the input seed. Injecting the CoT strategy pair inserts a
 **chain-of-thought step**: the model is co-trained to *generate* a per-row reasoning string (a `cot_text` column)
 before it emits the latents, and the latent forward is conditioned on `seed + CoT`. Two objectives share one
-optimizer step — the FSQ latent loss, and a next-token cross-entropy on the CoT string (weight `lam_cot`) through
+optimizer step — the concept latent loss, and a next-token cross-entropy on the CoT string (weight `lam_cot`) through
 the tied embedding, i.e. the **same CE machinery the latents already use**.
 
 It's selected by *injecting two strategies* (not a flag): `loss_terms=build_cot_loss_terms` adds the isolated
@@ -223,7 +230,7 @@ long (train-time cost scales with CoT length, not the short latents). You need a
 time it's a teacher-forcing target; the measured result is the *lift* from the model learning to produce its own
 CoT (self-generated reasoning helps even when the CoT text itself came from a stronger teacher, which is not a
 fair ceiling to compare against). Without the injected strategies (or with an absent `cot_text` column) the path
-is byte-identical to the plain FSQ emission — `CoTGenTerm` self-skips on empty reasoning.
+is byte-identical to the plain concept emission — `CoTGenTerm` self-skips on empty reasoning.
 
 ### Superposition — one latent, several futures
 
@@ -369,8 +376,8 @@ for v in lat:                                                        # one laten
 
 ### Retrieval-preserving multi-vector — `emission=QueryBridgeEmission`
 
-The default emission is **FSQ**: discrete digits, emitted **autoregressively** (each latent conditioned on the
-last), an **ordered** sequence. When the output is instead an **unordered set of items in a real vector space** —
+Named-state emission is an **ordered autoregressive** sequence: each state conditions the next. When the output is
+instead an **unordered set of items in a real vector space** —
 a document's facts, a passage's claims, the entities in a sentence — inject `emission=QueryBridgeEmission` for the
 **parallel-query** family: `N` learned query tokens cross-attend the backbone's per-token states in **one forward
 pass** and emit an unordered set of **L2-normalized vectors**, each with a **validity gate** that decides how many
@@ -392,7 +399,7 @@ rows = [{"input_text": "The X200 ships in slate and sand, weighs 1.2 kg, and run
        ]
 model = LangSetModel.from_pretrained("Qwen/Qwen3-Embedding-0.6B", multi_latent=True, freeze_backbone=True)
 Trainer(model, TrainingArguments(
-    emission=QueryBridgeEmission,        # one-pass parallel-query set-emitter (vs the default FSQ rollout)
+    emission=QueryBridgeEmission,        # one-pass parallel-query continuous set emitter
     target_source=FrozenEncoderTarget,   # targets = the frozen encoder's own embedding of each fact
     lam_multi_nce=0.0,                   # the bridge's base loss already runs the per-fact contrastive term
     n_queries=16,                        # max facts per input; the validity gate picks the actual count
@@ -408,16 +415,16 @@ Trainer(model, TrainingArguments(
 * 🧷 **A set, in the same space, cosine-ready.** Every emitted vector is a normal unit vector in the encoder's
   space, so a query can retrieve the **specific** fact instead of a blurred whole-document average — and the set
   drops straight into any cosine ANN / multi-vector index (ColBERT-style late interaction), no new primitive.
-* ⚡ **One pass, unordered.** Unlike the autoregressive FSQ rollout, all items emit together — cheaper at
+* ⚡ **One pass, unordered.** Unlike the autoregressive concept rollout, all items emit together — cheaper at
   inference and the natural shape when order is meaningless.
 * 🎯 **Hard negatives fold in.** Set `hard_neg_field="..."` (a per-row list of confusable near-misses — e.g. a
   fact that differs from the real one in a single attribute) and they join the emitter's **own** contrastive
   denominator, so each vector learns to separate the look-alikes a single averaged vector blurs together.
 
-Reach for FSQ (the default) when the emission is an **ordered rollout** whose steps condition each other — a world
-model. Reach for `QueryBridgeEmission` when it's an **unordered set of vectors in an existing embedding space** —
+Reach for `ConceptObjective` when the emission is an **ordered rollout** whose steps condition each other. Reach
+for `QueryBridgeEmission` when it is an **unordered set of vectors in an existing embedding space** —
 multi-vector retrieval or multi-item extraction where the base retriever's geometry must stay intact. Injected via
-`emission=` / `target_source=`; with no `emission` set the default FSQ path is byte-identical.
+`emission=` / `target_source=`; multi-vector training requires an explicit `emission=` choice.
 
 ## Big batches without the memory — GradCache
 
@@ -452,8 +459,8 @@ Requirements and what stays exact:
 | exactness | **bit-exact** (the whole loss is cached) | cross-batch **InfoNCE exact**; the per-row base loss (stop/dims/recon) is accumulated per chunk (a small `gc_chunk`-dependent reweighting, negligible in practice) |
 
 `gc_chunk=0` (default) or `grad_cache=False` leaves training byte-identical. GradCache is only defined for the
-contrastive path, so `SIGRegTarget` (a cross-batch regularizer) and the FSQ label subspace (which reads the
-rollout logits, not the cached latent) are rejected with a clear error when `grad_cache=True`.
+contrastive path, so `SIGRegTarget` (a cross-batch regularizer) is rejected with a clear error when
+`grad_cache=True`.
 
 ## Long rollouts without the memory — KV cache
 

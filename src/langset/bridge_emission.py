@@ -13,8 +13,7 @@ Inject with `TrainingArguments(emission=QueryBridgeEmission, freeze_backbone=Tru
 
 HARD NEGATIVES: set `hard_neg_field="<col>"` (a per-row list of confusable texts, e.g. adjacent-quarter queries) and
 the family folds them into its OWN InfoNCE denominator — one softmax over [in-batch targets ++ hard-negs], the exact
-mechanism that lets the emitted vector separate same-entity/wrong-time near-misses. Keep `lam_hard_neg=0` so langset's
-separate HardNegTerm does not double-count. Absent `hard_neg_field`, the bank is plain in-batch (byte-identical).
+mechanism that lets the emitted vector separate same-entity/wrong-time near-misses. Absent `hard_neg_field`, the bank is plain in-batch (byte-identical).
 
 Retrieval is preserved BY CONSTRUCTION: the backbone is frozen, so the base embedder's geometry is untouched;
 the bridge is a pure add-on. Eval routes through `emit_infer` (one pass, validity-gated) instead of the AR
@@ -93,7 +92,7 @@ class QueryBridge(nn.Module):
 
 
 class QueryBridgeEmission(_EmissionObjective):
-    """Parallel-query continuous emission (see module docstring). `codebook=False`: no FSQ digits, no AR rollout."""
+    """Parallel-query continuous emission (see module docstring). `codebook=False`: no codebook and no AR rollout."""
 
     codebook = False
 
@@ -215,8 +214,7 @@ class QueryBridgeEmission(_EmissionObjective):
             base_loss=base,
             # reuse the canonical log keys (semantic map: recon_loss<-InfoNCE, loss_stop<-validity BCE, loss_dims<-0)
             logs={"loss_stop": vloss.detach(), "loss_dims": zero, "recon_loss": nce.detach()},
-            dim_lg=None,
-            lab_label=None,
+            code_logits=None,
         )
 
     @torch.no_grad()

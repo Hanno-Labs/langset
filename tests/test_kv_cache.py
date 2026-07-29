@@ -1,6 +1,6 @@
 """KV-cache rollout exactness (multi-latent).
 
-The KV-cache path (`rollout_train_codebook(..., kv_cache=True)`) forwards the prompt ONCE and then each latent
+The KV-cache path (`rollout_train_state(..., kv_cache=True)`) forwards the prompt ONCE and then each latent
 token alone against the cached prefix K/V, instead of re-running the full growing sequence every tick. Its whole
 justification is that it is NUMERICALLY IDENTICAL to the recompute path — same emit logits, same feeds — while
 holding ~1 prompt forward + n single tokens of activations instead of n full-prefix forwards (killing the
@@ -22,13 +22,21 @@ ARCH = os.environ.get("LANGSET_TEST_MODEL", "hf-internal-testing/tiny-random-Lla
 
 
 def _multi_model():
-    return LangSetModel.from_pretrained(
-        ARCH, device="cpu", dropout=0.0, n_latents=1, multi_latent=True, fsq_dim=8, fsq_levels=4
+    m = LangSetModel.from_pretrained(
+        ARCH,
+        device="cpu",
+        dropout=0.0,
+        n_latents=1,
+        multi_latent=True,
+        code_emit=True,
+        n_codes=4,
     )
+    m.head.set_code(torch.eye(4, m.latent_dim))
+    return m
 
 
 def _run(m, ids, am, target, ss_mask, kv_cache, train_hops=None):
-    return m.rollout_train_codebook(
+    return m.rollout_train_state(
         ids, am, target, ss_prob=0.4, ss_mask=ss_mask, kv_cache=kv_cache, train_hops=train_hops
     )
 
