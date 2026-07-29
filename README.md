@@ -98,6 +98,63 @@ guess).
 Every knob below is a **strategy injected into `TrainingArguments`**, not a boolean on a monolith — the defaults
 give you the FSQ + EMA-twin world model, and each injection swaps one piece.
 
+### Named state emission — `ConceptObjective`
+
+FSQ learns an implicit discrete code. When the state vocabulary is known, `ConceptObjective` instead constructs
+each emitted latent from a soft mixture over named members. Lists split probability mass equally; dictionaries
+provide explicit weights. Each facet gets its own softmax, so values in `stage` compete with other stages without
+competing with values in `result`.
+
+```python
+from langset import LangSetModel, Trainer, TrainingArguments
+from langset.strategies import ConceptObjective
+
+rows = [{
+    "input_text": "release 2.4 has entered canary deployment",
+    "target_texts": [
+        "the canary receives a small traffic share",
+        "health checks remain stable",
+        "the release expands to all regions",
+    ],
+    "concepts": [
+        {
+            "phase": ["canary"],
+            "traffic": {"low": 0.9, "medium": 0.1},
+            "health": ["observing"],
+        },
+        {
+            "phase": ["canary"],
+            "traffic": ["medium"],
+            "health": ["healthy"],
+        },
+        {
+            "phase": ["complete"],
+            "traffic": ["full"],
+            "health": ["healthy"],
+        },
+    ],
+}]
+
+model = LangSetModel.from_pretrained(
+    "HuggingFaceTB/SmolLM2-135M",
+    multi_latent=True,
+    code_emit=True,
+    n_codes=4,
+    res_dim=32,
+)
+Trainer(model, TrainingArguments(
+    emission=ConceptObjective,
+    concept_field="concepts",
+    code_source="random",
+), rows).train()
+```
+
+The emitted vector is `[named state | residual]`. The state portion is a mixture over a fixed codebook and can
+be read back by projection; the residual carries context that the named alphabet cannot express. Set
+`res_dim=0` for pure named state. `StateResidualObjective` exposes the same mechanism through indexed per-tick
+member lists when a dataset already has a stable integer vocabulary. Codebooks can be random orthonormal,
+model-embedded, orthogonalized model embeddings, or vectors encoded through the target path.
+
 ### Anti-collapse: EMA twin (default) vs SIGReg (LeJEPA)
 
 By default the multi-latent path prevents representation collapse with an **EMA target twin** — a stop-grad

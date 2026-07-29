@@ -75,6 +75,10 @@ class EmitHead(nn.Module):
         fsq_dim: int = 128,
         fsq_levels: int = 8,
         fsq_emit: bool = False,
+        code_emit: bool = False,
+        n_codes: int = 0,
+        code_tau: float = 0.07,
+        res_dim: int = 0,
     ) -> None:
         super().__init__()
         self.n_latents = n_latents
@@ -93,18 +97,78 @@ class EmitHead(nn.Module):
         self.fsq_emit = fsq_emit
         self.fsq_dim, self.fsq_levels = fsq_dim, fsq_levels
         _mk_fsq = multi_latent or fsq_emit
+        _mk_stop = _mk_fsq or code_emit
         self.down_proj = nn.Linear(d, fsq_dim) if _mk_fsq else None  # d -> FSQ bottleneck (learned)
         self.up_proj = nn.Linear(fsq_dim, d) if _mk_fsq else None  # FSQ -> d (learned decoder)
         self.level_proj = (
             nn.Linear(h, fsq_dim * fsq_levels) if _mk_fsq else None
         )  # per-dim digit logits
         self.stop_proj = (
-            nn.Linear(h, 1) if _mk_fsq else None
-        )  # STOP logit (folded into dim-0 softmax)
+            nn.Linear(h, 1) if _mk_stop else None
+        )  # STOP logit (folded into dim-0 softmax; unused on the single-latent path)
+        # CODEBOOK EMISSION: replace the FSQ product-quantizer with ONE softmax over a fixed codebook. The head
+        # projects the hidden to a query, scores it against every code, and COMMITS to the softmax MIXTURE of
+        # codes rather than to a per-dim digit grid. Emitting a SET (maze frontier: which cells) is then a single
+        # normalized decision over the set's alphabet instead of `fsq_dim` independent ones, so mass must be
+        # ALLOCATED across the active members. `code` is a buffer, not a parameter: like the FSQ grid it cannot
+        # drift or collapse, so the geometry stays a constant of the run (see set_code).
+        # STATE + RESIDUAL. `res_dim` splits the latent in two: the first `d - res_dim` dims are the STATE, a
+        # mixture over the named codebook, and the last `res_dim` dims are a RESIDUAL that nothing names. The
+        # split is what makes a named alphabet safe to adopt: an alphabet is a CEILING (whatever it cannot name,
+        # the emission cannot carry), and the residual is where the unnamed goes. It also restores a
+        # self-supervised component — the residual is shaped by the twin/recon terms, not by the labels.
+        #
+        # This differs from `emb_slots` in kind, not degree. emb_slots DECODES a facet out of a latent whose
+        # meaning came from the twin; the state half here CONSTITUTES the latent from the alphabet. A decode head
+        # cannot create information the model never computed (the frontier-head arm sat at its base-rate floor
+        # for exactly that reason); building the emission out of the members puts it there.
+        self.code_emit = code_emit
+        self.n_codes, self.code_tau = n_codes, code_tau
+        self.res_dim = int(res_dim)
+        self.state_dim = d - self.res_dim
+        if code_emit:
+            assert n_codes > 0, "code_emit requires n_codes > 0"
+            assert 0 <= self.res_dim < d, (
+                f"res_dim must satisfy 0 <= res_dim < latent_dim ({d}); got {res_dim}"
+            )
+            self.register_buffer(
+                "code", torch.zeros(n_codes, self.state_dim)
+            )  # [C, state_dim] via set_code()
+            # CONCEPT FACETS. `concept_spans` carves the codebook into named groups: facet f owns member rows
+            # [m_lo, m_hi) and latent dims [d_lo, d_hi), and its rows are ZERO outside its own dims. So one
+            # matmul yields every facet's logits at once, while each facet gets its OWN softmax — an album can
+            # be a wide mixture of `vocals` and certain of its `tempo` at the same time, and a filing's `stage`
+            # can be confident while its `result` is undecided. One span = the plain single-alphabet case.
+            self.concept_spans: list[tuple[int, int, int, int]] = [(0, n_codes, 0, self.state_dim)]
+            self.concept_names: list[str] = []
+            self.query_proj: Optional[nn.Linear] = nn.Linear(
+                h, self.state_dim
+            )  # hidden -> state query
+            # residual head: only built when a residual is asked for, so res_dim=0 stays byte-identical
+            self.res_proj: Optional[nn.Linear] = (
+                nn.Linear(h, self.res_dim) if self.res_dim else None
+            )
+        else:
+            self.query_proj = None
+            self.res_proj = None
 
     def forward(
         self, hid_emit: torch.Tensor
     ) -> torch.Tensor:  # [B, n_latents, h] -> [B, n_latents, d]
+        if self.code_emit:
+            # EMBEDDING AS A SUPERPOSITION. The retrieval vector is a mixture over the NAMED alphabet, so it is
+            # interpretable by construction: project it back onto the codebook and you get the members it is
+            # made of, in the domain's own vocabulary, with no probe. Nothing supervises the weights here —
+            # the ordinary contrastive/recon objective decides them, so an alphabet buys legibility without
+            # requiring per-row state labels. (`fsq_emit` established this shape: a retrieval vector generated
+            # THROUGH the emission head rather than a plain linear.)
+            lg, _ = self.emit_logits(hid_emit)  # [B, nl, 1, n_codes]
+            p = self.concept_probs(lg)  # [B, nl, n_codes] per-facet softmax
+            state = F.normalize(p @ self.code, p=2, dim=-1)
+            if self.res_dim == 0:
+                return state
+            res = self.residual(hid_emit)  # what the alphabet cannot name
+            return torch.cat([state, res], -1) * (0.5**0.5)
         if self.fsq_emit:
             lg, _ = self.emit_logits(hid_emit)  # [B, nl, fsq_dim, fsq_levels] digit logits
             levels = torch.arange(self.fsq_levels, device=lg.device, dtype=torch.float32)
@@ -129,8 +193,75 @@ class EmitHead(nn.Module):
         zq = zb + (zr - zb).detach()  # straight-through, in [0, L-1]
         return zq, zr.long()
 
+    def set_code(self, code: torch.Tensor) -> None:
+        """Install the fixed codebook [n_codes, state_dim] (rows L2-normalized). Call once after construction."""
+        assert self.code_emit and tuple(code.shape) == tuple(self.code.shape), (
+            f"set_code expects [{self.n_codes}, {self.code.size(-1)}], got {tuple(code.shape)}"
+        )
+        self.code.copy_(F.normalize(code.float(), dim=-1).to(self.code.device))
+
+    def set_concepts(self, facets: "list[tuple[str, torch.Tensor, int]]") -> None:
+        """Install named concept facets: [(name, codes [n_members_f, dims_f], dims_f), ...].
+
+        Lays them out block-wise down the state half — facet f's member rows carry its codes in its own dim
+        slice and zeros elsewhere — so `query @ code.T` produces all facets' logits in one matmul while each
+        facet keeps a separate softmax."""
+        total_m = sum(c.shape[0] for _, c, _ in facets)
+        total_d = sum(d for _, _, d in facets)
+        # The alphabet is DISCOVERED from the corpus, so its size is not knowable when the head is built —
+        # `n_codes` at construction is only an upper bound. Resize to what the data actually contained rather
+        # than making the caller predict it; the true size is persisted in the config, so a reload rebuilds
+        # at the right width.
+        if total_m != self.n_codes:
+            self.n_codes = total_m
+            self.register_buffer(
+                "code", torch.zeros(total_m, self.state_dim, device=self.code.device)
+            )
+        assert total_d <= self.state_dim, (
+            f"concept facets need {total_d} dims but the state half is {self.state_dim} "
+            f"(latent_dim {self.state_dim + self.res_dim} minus res_dim {self.res_dim})"
+        )
+        block = torch.zeros(self.n_codes, self.state_dim)
+        spans, names, m0, d0 = [], [], 0, 0
+        for name, codes, dims in facets:
+            n_m = codes.shape[0]
+            block[m0 : m0 + n_m, d0 : d0 + dims] = F.normalize(codes.float(), dim=-1)[:, :dims]
+            spans.append((m0, m0 + n_m, d0, d0 + dims))
+            names.append(name)
+            m0, d0 = m0 + n_m, d0 + dims
+        self.code.copy_(block.to(self.code.device))
+        self.concept_spans, self.concept_names = spans, names
+
+    def concept_probs(self, lg: torch.Tensor) -> torch.Tensor:
+        """Emission logits -> per-facet probabilities, concatenated back into one [.., n_codes] vector.
+
+        Each facet is normalized WITHIN itself, so mass never leaks between facets: `vocals` summing to 1 says
+        nothing about how certain `tempo` is."""
+        flat = lg.float().squeeze(-2)  # [.., n_codes]
+        out = torch.zeros_like(flat)
+        for m_lo, m_hi, _, _ in self.concept_spans:
+            out[..., m_lo:m_hi] = flat[..., m_lo:m_hi].softmax(-1)
+        return out
+
+    def residual(self, hid: torch.Tensor) -> torch.Tensor:
+        """[.., h] -> the unnamed half of the emission [.., res_dim], L2-normalized. Empty when res_dim == 0."""
+        if self.res_proj is None:
+            return hid.new_zeros(*hid.shape[:-1], 0)
+        return F.normalize(self.res_proj(self.drop(hid.float())), dim=-1)
+
     def encode(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Target embedding -> (digits [.., fsq_dim], recon [.., d]). Grad flows to down/up_proj (recon loss)."""
+        if (
+            self.code_emit
+        ):  # no quantizer: the target IS the reconstruction, so teacher forcing feeds it exactly
+            # the codebook spans only the STATE half, so score the target's state dims against it — the residual
+            # dims are unnamed by construction and have no nearest code
+            ts = F.normalize(t.float()[..., : self.state_dim], dim=-1)
+            idx = (ts @ self.code.t()).argmax(-1, keepdim=True)
+            return (
+                idx,
+                t.float(),
+            )  # (nearest code [.., 1], recon [.., d] = the target itself, lossless)
         assert self.down_proj is not None and self.up_proj is not None
         zq, digits = self.fsq(self.down_proj(t.float()))
         return digits, self.up_proj(zq)
@@ -138,14 +269,54 @@ class EmitHead(nn.Module):
     def reconstruct(
         self, digits: torch.Tensor
     ) -> torch.Tensor:  # digits [.., fsq_dim] in [0, L-1] -> [.., d]
+        if self.code_emit:  # a "digit" is a code index; reconstruction is the code itself
+            return self.code[digits.long().squeeze(-1)]
         assert self.up_proj is not None
         return self.up_proj(digits.float())
 
     def emit_logits(self, hid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """[.., h] -> (per-dim digit logits [.., fsq_dim, fsq_levels], STOP logit [.., 1])."""
-        assert self.level_proj is not None and self.stop_proj is not None
+        """[.., h] -> (per-dim digit logits [.., fsq_dim, fsq_levels], STOP logit [.., 1]).
+
+        Codebook mode returns the SAME rank with fsq_dim collapsed to 1: [.., 1, n_codes] — one softmax over the
+        alphabet instead of fsq_dim softmaxes over levels. Every caller downstream (STOP fold, commit, argmax)
+        is shape-agnostic, so the rollout loops are untouched."""
+        assert self.stop_proj is not None
+        if self.code_emit:
+            assert self.query_proj is not None
+            q = F.normalize(self.query_proj(self.drop(hid.float())), dim=-1)  # [.., d]
+            return (q @ self.code.t()).unsqueeze(-2) / self.code_tau, self.stop_proj(hid.float())
+        assert self.level_proj is not None
         lg = self.level_proj(self.drop(hid.float())).unflatten(-1, (self.fsq_dim, self.fsq_levels))
         return lg, self.stop_proj(hid.float())
+
+    def commit(
+        self, lg: torch.Tensor, sample: bool = False, hid: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Emission logits -> the latent that gets FED BACK to advance one tick. The FSQ branch is the historical
+        argmax(digits) -> up_proj, byte-for-byte. The codebook branch commits to the softmax MIXTURE of codes: a
+        genuine SUPERPOSITION of the members it is holding, not a single winner, which is the whole point of
+        emitting a set. `sample` draws instead of taking the mode (FSQ only; the mixture is already the full
+        distribution)."""
+        if self.code_emit:
+            p = self.concept_probs(lg)  # [.., n_codes] each facet normalized within itself
+            state = F.normalize(
+                p @ self.code, dim=-1
+            )  # [.., state_dim] facet mixtures, laid out side by side
+            if self.res_dim == 0:
+                return state
+            assert hid is not None, (
+                "commit(): a residual emission needs the emit hidden (pass hid=)"
+            )
+            # halve each half's norm so the concatenation is unit-norm and neither half can dominate the
+            # feedback vector purely by scale
+            return torch.cat([state, self.residual(hid)], -1) * (0.5**0.5)
+        if sample:
+            pred = torch.multinomial(
+                torch.softmax(lg.float(), -1).reshape(-1, self.fsq_levels), 1
+            ).reshape(*lg.shape[:-2], -1)
+        else:
+            pred = lg.argmax(-1)  # [.., fsq_dim] (own emission, never STOP)
+        return self.reconstruct(pred)
 
     def stop_logit(self, hidden: torch.Tensor, tok_embed: nn.Module) -> torch.Tensor:
         """Alignment of the hidden state to the model's real EOS embedding (continuous-mode terminator)."""
@@ -373,6 +544,10 @@ class LangSetModel(nn.Module):
         fsq_levels: int = 8,
         fsq_emit: bool = False,
         pool_mode: str = "",
+        code_emit: bool = False,
+        n_codes: int = 0,
+        code_tau: float = 0.07,
+        res_dim: int = 0,
     ) -> None:
         super().__init__()
         self.backbone = backbone
@@ -407,6 +582,10 @@ class LangSetModel(nn.Module):
             fsq_dim=fsq_dim,
             fsq_levels=fsq_levels,
             fsq_emit=fsq_emit,
+            code_emit=code_emit,
+            n_codes=n_codes,
+            code_tau=code_tau,
+            res_dim=res_dim,
         )
         self.llm_model = llm_model
         self.max_len = max_len
@@ -462,6 +641,10 @@ class LangSetModel(nn.Module):
         fsq_emit: bool = False,
         pool_mode: str = "",
         freeze_backbone: bool = False,
+        code_emit: bool = False,
+        n_codes: int = 0,
+        code_tau: float = 0.07,
+        res_dim: int = 0,
     ) -> "LangSetModel":
         from transformers import AutoTokenizer  # type: ignore[import-untyped]
 
@@ -495,6 +678,10 @@ class LangSetModel(nn.Module):
             fsq_levels,
             fsq_emit=fsq_emit,
             pool_mode=pool_mode,
+            code_emit=code_emit,
+            n_codes=n_codes,
+            code_tau=code_tau,
+            res_dim=res_dim,
         )
         model._lora_top_k = int(lora_top_k)  # persisted in config so load() rebuilds same adapters
         model._full_ft = bool(
@@ -877,8 +1064,8 @@ class LangSetModel(nn.Module):
         # token-native (multi-latent) FSQ path (codebook). Single-latent falls to the out_proj else-branch below.
         codebook = self.head.multi_latent
         stop_idx = (
-            self.head.fsq_levels if codebook else -1
-        )  # STOP is the extra class in dim-0's softmax
+            (self.head.n_codes if self.head.code_emit else self.head.fsq_levels) if codebook else -1
+        )  # STOP is the extra class in dim-0's softmax (codebook mode: the class past the last code)
         pad_side = (
             "left" if codebook else self.tokenizer.padding_side
         )  # left-pad so [:, -1] is the last real token
@@ -912,48 +1099,80 @@ class LangSetModel(nn.Module):
                 d0_full = torch.cat(
                     [dim_lg[:, 0, :], stop_lg], -1
                 )  # [B, L+1] over [L levels; STOP]
+                # CODEBOOK: termination is FACTORIZED out of the emission softmax. Folding STOP in (as the FSQ
+                # path does) is fair when dim-0's own target is one-hot, but a set-valued target is 1/k-diffuse
+                # and sharing one normalizer couples them: the gradient suppressing STOP at a member position
+                # scales with P(STOP), which weakens as the set widens. Independent sigmoid: "continue or stop"
+                # is decided on its own logit and never rides on how wide the set is.
+                code_stop = self.head.code_emit
+                pick = (
+                    dim_lg[:, 0, :] if code_stop else d0_full
+                )  # codebook: members only, STOP is separate
                 if temperature and temperature > 0:  # SAMPLE each digit (stochastic futures)
                     dim0 = torch.multinomial(
-                        torch.softmax(d0_full.float() / temperature, -1), 1
+                        torch.softmax(pick.float() / temperature, -1), 1
                     ).squeeze(-1)
-                    rest = torch.multinomial(
-                        torch.softmax(dim_lg[:, 1:, :].float() / temperature, -1).reshape(
-                            -1, self.head.fsq_levels
-                        ),
-                        1,
-                    ).reshape(b, -1)
+                    rest = (
+                        dim0.new_zeros(b, 0)  # codebook: fsq_dim == 1, so there are no other dims
+                        if code_stop
+                        else torch.multinomial(
+                            torch.softmax(dim_lg[:, 1:, :].float() / temperature, -1).reshape(
+                                -1, self.head.fsq_levels
+                            ),
+                            1,
+                        ).reshape(b, -1)
+                    )
                 else:  # deterministic argmax (default)
-                    dim0 = d0_full.argmax(-1)
-                    rest = dim_lg[:, 1:, :].argmax(-1)
-                emit_now = alive & (dim0 != stop_idx)  # halt on STOP (or already-dead rows)
+                    dim0 = pick.argmax(-1)
+                    rest = dim_lg[:, 1:, :].argmax(-1)  # [B, 0] under codebook emission
+                emit_now = (
+                    alive & (torch.sigmoid(stop_lg.squeeze(-1)) < 0.5)  # independent terminator
+                    if code_stop
+                    else alive & (dim0 != stop_idx)  # halt on STOP (or already-dead rows)
+                )
                 if return_confidence:  # the model's OWN emission uncertainty
-                    p0 = torch.softmax(d0_full.float(), -1)  # [B, L+1]
-                    conf_stop.append(p0[:, -1])  # P(STOP) at this step
-                    conf_dig0.append(p0[:, :-1].max(-1).values)  # digit-0 level certainty
+                    p0 = torch.softmax(pick.float(), -1)  # [B, L+1] (codebook: [B, n_codes])
+                    conf_stop.append(  # P(STOP): its own sigmoid under codebook, else the folded class
+                        torch.sigmoid(stop_lg.squeeze(-1)) if code_stop else p0[:, -1]
+                    )
+                    conf_dig0.append((p0 if code_stop else p0[:, :-1]).max(-1).values)
                     conf_code.append(
                         torch.softmax(dim_lg.float(), -1).max(-1).values.mean(-1)
                     )  # mean code certainty
                 if return_soft:  # the SUPERPOSITION reads out HERE, not from argmax
-                    levels = torch.arange(
-                        self.head.fsq_levels, device=dim_lg.device, dtype=torch.float32
-                    )
                     p = torch.softmax(
                         dim_lg.float(), -1
                     )  # [B, fsq_dim, L] per-dim digit distribution
-                    soft_z = self.head.reconstruct(
-                        (p * levels).sum(-1)
-                    )  # E[digit] -> up_proj = expected latent [B, d]
-                    ent = (-(p.clamp_min(1e-9).log() * p).sum(-1)).mean(
-                        -1
-                    )  # [B] mean per-dim entropy (native fuzziness)
+                    if (
+                        self.head.code_emit
+                    ):  # ONE distribution over the alphabet: mixture + its entropy
+                        pc = p.squeeze(-2)  # [B, n_codes]
+                        soft_z = F.normalize(pc @ self.head.code, dim=-1)  # mixture of codes [B, d]
+                        ent = -(pc.clamp_min(1e-9).log() * pc).sum(
+                            -1
+                        )  # [B] entropy = how many codes it is holding
+                    else:
+                        levels = torch.arange(
+                            self.head.fsq_levels, device=dim_lg.device, dtype=torch.float32
+                        )
+                        soft_z = self.head.reconstruct(
+                            (p * levels).sum(-1)
+                        )  # E[digit] -> up_proj = expected latent [B, d]
+                        ent = (-(p.clamp_min(1e-9).log() * p).sum(-1)).mean(
+                            -1
+                        )  # [B] mean per-dim entropy (native fuzziness)
                     soft_cols.append(
                         torch.where(emit_now.unsqueeze(1), soft_z, torch.zeros_like(soft_z))
                     )
                     ent_cols.append(torch.where(emit_now, ent, torch.zeros_like(ent)))
                 digits = torch.cat(
-                    [dim0.clamp(max=self.head.fsq_levels - 1).unsqueeze(-1), rest], -1
-                )  # [B, fsq_dim]
-                z = self.head.reconstruct(digits)  # [B, d]
+                    [dim0.clamp(max=stop_idx - 1).unsqueeze(-1), rest], -1
+                )  # [B, fsq_dim] (codebook: [B, 1], the top code index)
+                z = (  # the emitted latent: FSQ commits to the argmax code, codebook to the mixture
+                    self.head.commit(dim_lg, hid=hid)
+                    if self.head.code_emit
+                    else self.head.reconstruct(digits)
+                )  # [B, d]
                 cols.append(torch.where(emit_now.unsqueeze(1), z, torch.zeros_like(z)))
                 lengths = lengths + emit_now.long()
                 seq = torch.cat([seq, self.head.feedback(z).unsqueeze(1).to(seq.dtype)], 1)
@@ -1046,7 +1265,8 @@ class LangSetModel(nn.Module):
         ss_sample: bool = False,
         ss_mask: Optional[torch.Tensor] = None,
         kv_cache: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_emit_hidden: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
         """Token-native AR pass (multi-latent, FSQ). Quantizes the TRUE target latents to per-dim digits and predicts
         the digits at each of L+1 positions (targets 0..L-1 then a STOP at position L). Returns (dim_logits
         [B, L+1, fsq_dim, fsq_levels], stop_logits [B, L+1, 1], digits [B, L, fsq_dim], recon [B, L, d]) — the STOP
@@ -1071,7 +1291,8 @@ class LangSetModel(nn.Module):
         digits, recon = self.head.encode(target_latents.reshape(-1, target_latents.size(-1)))
         digits = digits.view(bsz, n, -1)  # [B, L, fsq_dim]
         recon = recon.view(bsz, n, -1)  # [B, L, d] — clean feedback + recon target
-        if ss_prob <= 0 or n == 0:  # TEACHER-FORCED one-shot (default, fast)
+        H = n if train_hops is None else max(0, min(int(train_hops), n))
+        if ss_prob <= 0 or n == 0 or H == 0:  # TEACHER-FORCED one-shot (default, fast)
             seed = self.embed(input_ids)
             fb = self.head.feedback(
                 recon.detach().to(seed.dtype)
@@ -1083,11 +1304,13 @@ class LangSetModel(nn.Module):
             )  # PLE-safe teacher-forced read
             hf = hid[:, s_len - 1 : s_len - 1 + n + 1]  # [B, L+1, h] — +1 to predict the STOP
             dim_lg, stop_lg = self.head.emit_logits(hf)  # [B, L+1, fsq_dim, L], [B, L+1, 1]
-            return dim_lg, stop_lg, digits, recon
+            return (
+                (dim_lg, stop_lg, digits, recon, hf)
+                if return_emit_hidden
+                else (dim_lg, stop_lg, digits, recon)
+            )
         # SCHEDULED-SAMPLING multi-hop path
-        H = n if train_hops is None else max(0, min(int(train_hops), n))
         dev = recon.device
-        Lv = self.head.fsq_levels
         if (
             kv_cache
         ):  # KV-CACHE rollout: forward the prompt ONCE, then each latent token ALONE against the
@@ -1108,13 +1331,7 @@ class LangSetModel(nn.Module):
             def _feed(
                 dl_h: torch.Tensor, t: int
             ) -> torch.Tensor:  # the latent to advance tick t -> t+1
-                if ss_sample:
-                    pred_dig = torch.multinomial(
-                        torch.softmax(dl_h.float(), -1).reshape(-1, Lv), 1
-                    ).reshape(bsz, -1)
-                else:
-                    pred_dig = dl_h.argmax(-1)  # [B, fsq_dim] (own emission, never STOP)
-                recon_pred = self.head.reconstruct(pred_dig).detach()
+                recon_pred = self.head.commit(dl_h, ss_sample, hid=hid).detach()
                 if t < H:  # self-feed region: own emission or ground truth by the ss decision
                     if (
                         ss_mask is not None
@@ -1132,41 +1349,60 @@ class LangSetModel(nn.Module):
             cur_am = attention_mask
             dim_parts = []
             stop_parts = []
-            for t in range(n):  # emit tick t, then feed one latent to advance to tick t+1
+            hid_parts = []
+            for t in range(H):  # emit tick t, then feed one latent to advance to tick t+1
                 dl, sl = self.head.emit_logits(hid)
                 dim_parts.append(dl.unsqueeze(1))
                 stop_parts.append(sl.unsqueeze(1))
+                hid_parts.append(hid.unsqueeze(1))
                 fb = self.head.feedback(_feed(dl, t).to(seq0.dtype)).unsqueeze(1)  # [B, 1, h]
                 cur_am = torch.cat([cur_am, cur_am.new_ones(bsz, 1)], 1)
                 out = self._run_backbone(fb, cur_am, None, 0, past_key_values=pkv, use_cache=True)
                 pkv = getattr(out, "past_key_values", None)
                 hid = self._last_hidden(out)[:, -1]
-            dl, sl = self.head.emit_logits(hid)  # tick n = the STOP position
-            dim_parts.append(dl.unsqueeze(1))
-            stop_parts.append(sl.unsqueeze(1))
-            return torch.cat(dim_parts, 1), torch.cat(stop_parts, 1), digits, recon
+            if H < n:
+                # The scheduled-sampling prefix must stay serial: each self-fed token depends on the preceding
+                # emission.  Once that prefix ends, however, the remaining *known* feedback tokens are ordinary
+                # teacher forcing.  Feed the whole tail against the cached prefix in one call, rather than making
+                # n-H needless one-token cache calls. `hid` predicts tick H; the tail outputs predict H+1..n.
+                fb_tail = self.head.feedback(recon[:, H:].detach().to(seq0.dtype))
+                tail_am = torch.cat([cur_am, cur_am.new_ones(bsz, n - H)], 1)
+                tail_out = self._run_backbone(
+                    fb_tail, tail_am, None, 0, past_key_values=pkv, use_cache=True
+                )
+                tail_hid = self._last_hidden(tail_out)
+                hid_tail = torch.cat([hid.unsqueeze(1), tail_hid], 1)
+                dl_tail, sl_tail = self.head.emit_logits(hid_tail)
+                dim_parts.append(dl_tail)
+                stop_parts.append(sl_tail)
+                hid_parts.append(hid_tail)
+            else:
+                dl, sl = self.head.emit_logits(hid)  # tick n = the STOP position
+                dim_parts.append(dl.unsqueeze(1))
+                stop_parts.append(sl.unsqueeze(1))
+                hid_parts.append(hid.unsqueeze(1))
+            out4 = (torch.cat(dim_parts, 1), torch.cat(stop_parts, 1), digits, recon)
+            return (*out4, torch.cat(hid_parts, 1)) if return_emit_hidden else out4
         seq = self.embed(input_ids)
         am = attention_mask
         dim_parts: list[torch.Tensor] = []
         stop_parts: list[torch.Tensor] = []
+        hid_parts: list[torch.Tensor] = []
         for h in range(H):  # AR self-feed region
             hid = self._last_hidden(self._run_backbone(seq, am, input_ids, 0))[:, -1]
             dl, sl = self.head.emit_logits(hid)  # [B, fsq_dim, L], [B, 1]
             dim_parts.append(dl.unsqueeze(1))
             stop_parts.append(sl.unsqueeze(1))
-            if ss_sample:
-                pred_dig = torch.multinomial(
-                    torch.softmax(dl.float(), -1).reshape(-1, Lv), 1
-                ).reshape(bsz, -1)
-            else:
-                pred_dig = dl.argmax(-1)  # [B, fsq_dim] (own emission, never STOP)
-            recon_pred = self.head.reconstruct(pred_dig).detach()  # own emitted latent (detached)
+            hid_parts.append(hid.unsqueeze(1))
+            recon_pred = self.head.commit(
+                dl, ss_sample, hid=hid
+            ).detach()  # own emitted latent (detached)
             if (
                 ss_mask is not None
             ):  # GradCache: replay the SHARED per-(row,hop) decisions (deterministic rollout)
                 use_own = (
                     ss_mask[:, h].to(device=dev, dtype=torch.bool).unsqueeze(1)
-                )  # normalize: caller may pass a CPU/int mask
+                )  # normalize: caller may pass CPU/int
             else:
                 use_own = (torch.rand(bsz, device=dev) < ss_prob).unsqueeze(1)
             feed_h = torch.where(use_own, recon_pred, recon[:, h].detach())
@@ -1183,6 +1419,9 @@ class LangSetModel(nn.Module):
             torch.cat(dim_parts + [dl_rest], 1) if dim_parts else dl_rest
         )  # [B, n+1, fsq_dim, L]
         stop_lg = torch.cat(stop_parts + [sl_rest], 1) if stop_parts else sl_rest  # [B, n+1, 1]
+        if return_emit_hidden:
+            emit_hid = torch.cat(hid_parts + [hf_rest], 1) if hid_parts else hf_rest
+            return dim_lg, stop_lg, digits, recon, emit_hid
         return dim_lg, stop_lg, digits, recon
 
     def get_sentence_embedding_dimension(self) -> int:
@@ -1238,6 +1477,12 @@ class LangSetModel(nn.Module):
                     "fsq_levels": self.fsq_levels,
                     "lora_top_k": self._lora_top_k,
                     "fsq_emit": self.head.fsq_emit,
+                    "code_emit": self.head.code_emit,
+                    "n_codes": self.head.n_codes,
+                    "code_tau": self.head.code_tau,
+                    "res_dim": self.head.res_dim,
+                    "concept_spans": getattr(self.head, "concept_spans", None),
+                    "concept_names": getattr(self.head, "concept_names", None),
                     "pool_mode": self.pool_mode,
                     "pretrained": self._pretrained,
                     "full_ft": self._full_ft,
@@ -1273,6 +1518,10 @@ class LangSetModel(nn.Module):
                 fsq_levels=cfg.get("fsq_levels", 8),
                 lora_top_k=int(cfg.get("lora_top_k", 0)),
                 fsq_emit=cfg.get("fsq_emit", False),
+                code_emit=cfg.get("code_emit", False),
+                n_codes=int(cfg.get("n_codes", 0)),
+                code_tau=float(cfg.get("code_tau", 0.07)),
+                res_dim=int(cfg.get("res_dim", 0)),
                 pool_mode=cfg.get("pool_mode", ""),
                 device=device,
                 attn_implementation=attn_implementation,
@@ -1295,6 +1544,9 @@ class LangSetModel(nn.Module):
         m._full_ft = bool(
             cfg.get("full_ft", False)
         )  # restore the flag so a re-save round-trips the same way
+        if cfg.get("concept_spans"):
+            m.head.concept_spans = [tuple(x) for x in cfg["concept_spans"]]
+            m.head.concept_names = list(cfg.get("concept_names") or [])
         sd = torch.load(p / "langset.pt", map_location=m.device, weights_only=False)
         # select by the ACTUAL payload (not the flag): a full-FT pretrained model persists "backbone", not "lora".
         m.backbone.load_state_dict(sd["backbone"] if "backbone" in sd else sd["lora"], strict=False)

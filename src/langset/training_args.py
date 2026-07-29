@@ -141,6 +141,33 @@ class TrainingArguments:
     emb_slots: Optional[dict[str, tuple[int, int, str]]] = None
     lam_emb_slots: float = 1.0
 
+    # STATE + RESIDUAL emission (multi-latent, StateResidualObjective) — a THIRD way to shape the latent,
+    # alongside `fsq_dim` (how finely it is quantized) and `emb_slots` (which of its dims are made legible).
+    # Those two both DECODE meaning out of a latent the twin defined; this one CONSTITUTES the latent: its first
+    # `latent_dim - res_dim` dims are a mixture over a NAMED alphabet, and the remaining `res_dim` are a residual
+    # the alphabet cannot name (shaped by the twin/recon terms, so a self-supervised component survives).
+    # `state_field` names a per-row column of per-tick ACTIVE MEMBER index lists — the same sparse shape as
+    # `concept_field` — and `state_classes` is the alphabet size. Pair with `code_emit=True, n_codes=<alphabet>,
+    # res_dim=<width>` on the model. Off (None) = byte-identical.
+    state_field: Optional[str] = None
+    state_classes: int = 0
+    # CONCEPTS — the text-in form of the above, and the one to reach for. Name a row column holding a dict of
+    # named facets to the concepts true of each ({"vocals": ["yell-singing", ...]}; a dict gives explicit
+    # weights, which also expresses a continuous value as a mixture over ordered concepts). Multi-latent rows
+    # pass a LIST of those dicts, one per tick. The alphabet is DISCOVERED from the column, so no index is ever
+    # authored, and `code_source` turns the names into vectors. Pair with emission=ConceptObjective and a model
+    # built with code_emit=True, n_codes=<total concepts>, res_dim=<width left to the twin>.
+    concept_field: Optional[str] = None
+    # WHERE each named member's vector comes from. A name from strategies.CODE_SOURCES ("random" | "model" |
+    # "orthogonal" | "twin") or your own (names, dim, model) -> [n_members, dim] callable. Resolved ONCE at
+    # setup over the alphabet, then frozen — a codebook that re-embeds during training is a learned codebook,
+    # with the drift/collapse problem the fixed FSQ grid exists to avoid. "random" is arbitrary but decodes
+    # losslessly (right for benchmarks: the readout cannot flatter the emission); "model"/"twin" put related
+    # members near each other but give up exact recovery. `code_names` lists the member names in INDEX order,
+    # so names[i] is the member whose index appears in the `state_field` column.
+    code_source: "str | Callable[..., object]" = "random"
+    code_names: Optional[list[str]] = None
+
     # MULTI-HOP training (scheduled sampling). For the first `train_hops` emitted positions (None = ALL), feed the
     # model's OWN predicted latent back with probability ss_prob instead of ground truth — the exposure-bias fix that
     # makes multi-hop rollout TRAINED rather than emergent. ss_sample samples the self-fed digits instead of argmax.

@@ -57,6 +57,7 @@ below.
 | `selector=last_epoch_selector` | retrieval MRR rewards a **collapsed** one-cell-per-tick geometry — exactly the wrong signal here (it's *meant to fall* as the latent spreads over the set), so keep the last epoch instead of early-stopping on it |
 | `rollout(..., return_soft=True)` | at eval, read the **expected** latent and its per-dim **entropy** — the model's native uncertainty — instead of the argmax |
 | `target_source=SIGRegTarget` *(optional, `--sigreg`)* | EMA-free anti-collapse (LeJEPA) instead of the stop-grad twin — see [`langset/sigreg.py`](../../src/langset/sigreg.py) |
+| `emission=ConceptObjective` *(optional, `--concepts`)* | construct each tick's latent directly from a soft mixture over named frontier cells instead of encoding the state through FSQ digits |
 | `langset.probes` | the world-model property tests themselves — `calibration_corr` (entropy ↔ frontier size) and `linear_decodability` (probe the emitted latent), reused by `eval.py` so this signal isn't maze-only |
 
 None of this is a monolithic config: `multi_latent` builds the set-emission head, `selector` and `target_source`
@@ -70,6 +71,8 @@ pip install "langset[probes]"                    # eval uses langset.probes (pul
 
 python gen_maze.py build 4000 maze.npz          # training corpus (mixed sizes, ~55% solvable)
 python train.py --data maze.npz --out maze_model --wandb
+# named-state alternative: one softmax over cells, no residual
+python train.py --data maze.npz --out maze_concepts --concepts --code-source random --res-dim 0 --wandb
 python gen_maze.py build 800 maze_eval.npz 999  # DISJOINT eval corpus (different seed → no leakage)
 python eval.py  --data maze_eval.npz --ckpt maze_model
 ```
