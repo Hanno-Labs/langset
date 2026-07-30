@@ -1510,11 +1510,10 @@ class Trainer:
             agg: dict[str, float],
         ) -> float:
             """Multi-latent GradCache. Phase 1 rolls out the FULL batch under no_grad (a SHARED ss_mask makes the
-            scheduled-sampling rollout deterministic), runs the cross-batch recon-pure terms (InfoNCE, hard-neg,
-            supcon, phase) on the full-batch recon, and caches d(loss)/d(recon). Phase 2 re-rolls each
-            gc_chunk WITH grad, backprops the (row-weighted) base loss, and injects the cached recon-grads -> the
-            cross-batch term is EXACT full-batch; the per-row base loss is accumulated (pragmatic, see grad_cache
-            docs). Peak activation = one chunk."""
+            scheduled-sampling rollout deterministic), runs the cross-batch recon-pure terms on the full-batch
+            recon, and caches d(loss)/d(recon). Phase 2 re-rolls each gc_chunk WITH grad, backprops the (row-weighted)
+            base loss, and injects the cached recon-grads -> the cross-batch term is EXACT full-batch; the per-row
+            base loss is accumulated (pragmatic, see grad_cache docs). Peak activation = one chunk."""
             ss_prob = a.ss_prob
             assert (
                 ss_prob is not None

@@ -391,6 +391,9 @@ class CodeSoftmaxObjective(_EmissionObjective):
         assert model.head.code_emit, (
             "CodeSoftmaxObjective needs a codebook head: build the model with code_emit=True, n_codes=<alphabet>"
         )
+        assert model.head.res_dim == 0, (
+            "CodeSoftmaxObjective requires res_dim=0; use StateResidualObjective for named state plus a residual"
+        )
         self.n_codes = int(model.head.n_codes)
 
     def emit(

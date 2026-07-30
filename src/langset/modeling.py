@@ -1003,7 +1003,9 @@ class LangSetModel(nn.Module):
         OWN emitted latent instead of the ground truth, so the emitter learns to consume its own (imperfect)
         predictions. This is the exposure-bias fix that makes MULTI-HOP rollout trained rather than emergent. Self-
         fed latents are DETACHED (standard scheduled sampling). Cost = train_hops+1
-        backbone passes (positions past train_hops are teacher-forced in one pass).         `ss_mask` (optional [B, H] bool): the PRECOMPUTED per-(row, hop) self-feed decisions. When given, the loop
+        backbone passes (positions past train_hops are teacher-forced in one pass).
+
+        `ss_mask` (optional [B, H] bool): the PRECOMPUTED per-(row, hop) self-feed decisions. When given, the loop
         uses `ss_mask[:, h]` in place of a fresh `torch.rand < ss_prob` draw. This makes the rollout DETERMINISTIC
         given the mask, so GradCache's phase-1 (no_grad, full batch) and phase-2 (grad, per chunk) forwards produce
         identical `recon` and the cached gradients line up exactly. None = sample as usual (byte-identical)."""
