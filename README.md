@@ -28,8 +28,9 @@ primitive? It doesn't.
 
 LangSet adds a learned vector-emission interface to a pretrained language model. A model may emit one ordinary continuous embedding, an unordered continuous vector set through `QueryBridgeEmission`, or an autoregressive sequence of named-state superpositions through a fixed concept codebook. The output geometry is explicit rather than hidden in quantizer digits.
 
-In practice you write the *states* of a process as `target_texts`, and the model learns to emit the set of
-admissible next states — no labels, no hand-built simulator. What that buys:
+In practice, `target_texts` describes the ordered ticks of a process. For named-state training, a parallel
+`concepts` entry describes the distribution of admissible states *within each tick*. The model learns both the
+trajectory and the uncertainty inside each step — no hand-built simulator. What that buys:
 
 * 🔎 **Readout, not acquisition.** The emitted latents *surface* world knowledge the pretrained model already
   held. Scramble the vocabulary so the task keeps its dynamics but loses its meaning, and much of that knowledge
@@ -51,9 +52,10 @@ pip install langset
 
 ## Quickstart — a world model
 
-Rows are `input_text` (a state) → `target_texts` (the **set** of possible next states). The model learns to emit
-that set, deciding *how many* via a learned STOP; at inference `rollout(..., return_soft=True)` reads the emitted
-set back plus its per-step entropy — the model's own calibrated uncertainty.
+Rows are `input_text` (the current state) → `target_texts` (the **ordered ticks** to emit). A matching `concepts`
+entry describes the named-state distribution inside each tick. The learned STOP decides how many ticks to emit;
+at inference, `rollout(..., return_soft=True)` returns the trajectory, its soft named-state mixtures, and the
+entropy of each mixture.
 
 ```python
 from langset import LangSetModel, Trainer, TrainingArguments
@@ -68,7 +70,7 @@ model = LangSetModel.from_pretrained(
     "HuggingFaceTB/SmolLM2-135M",
     multi_latent=True,
     code_emit=True,
-    n_codes=1,  # placeholder; ConceptObjective discovers and installs the real alphabet
+    n_codes=1,  # placeholder; ConceptObjective discovers the alphabet from `concepts`
 )
 Trainer(model, TrainingArguments(
     epochs=15,
@@ -105,12 +107,18 @@ Every multi-vector run chooses an explicit emission strategy in `TrainingArgumen
 ordered autoregressive state, or `QueryBridgeEmission` for an unordered continuous vector set. The target source
 and auxiliary terms remain independently injectable.
 
+| desired output | model shape | emission strategy |
+|---|---|---|
+| one continuous embedding | default single-latent model | default |
+| ordered ticks, each a named-state superposition | `multi_latent=True, code_emit=True` | `ConceptObjective` |
+| unordered set of continuous vectors | `multi_latent=True` | `QueryBridgeEmission` |
+
 ### Named state emission — `ConceptObjective`
 
 `ConceptObjective` constructs each emitted latent from a soft mixture over named members. Lists split probability
-mass equally; dictionaries
-provide explicit weights. Each facet gets its own softmax, so values in `stage` compete with other stages without
-competing with values in `result`.
+mass equally; dictionaries provide explicit weights. Each facet gets its own softmax, so values in `stage` compete
+with other stages without competing with values in `result`. `target_texts[i]` and `concepts[i]` describe the same
+tick: the text supervises its continuous context, while the concepts supervise its readable named state.
 
 ```python
 from langset import LangSetModel, Trainer, TrainingArguments
@@ -146,7 +154,7 @@ model = LangSetModel.from_pretrained(
     "HuggingFaceTB/SmolLM2-135M",
     multi_latent=True,
     code_emit=True,
-    n_codes=4,
+    n_codes=1,  # placeholder; replaced with the discovered concept alphabet
     res_dim=32,
 )
 Trainer(model, TrainingArguments(
@@ -156,15 +164,21 @@ Trainer(model, TrainingArguments(
 ), rows).train()
 ```
 
-The emitted vector is `[named state | residual]`. The state portion is a mixture over a fixed codebook and can
-be read back by projection; the residual carries context that the named alphabet cannot express. Set
-`res_dim=0` for pure named state. `StateResidualObjective` exposes the same mechanism through indexed per-tick
-member lists when a dataset already has a stable integer vocabulary. Codebooks can be random orthonormal,
-model-embedded, orthogonalized model embeddings, or vectors encoded through the target path.
+Each tick emits one concatenated vector: `[named state | residual]`. `ConceptObjective` discovers the concept
+alphabet from the training rows and installs a fixed codebook. The named-state portion is the differentiable
+mixture of that tick's concept distributions and can be read back by projection. When `res_dim>0`, a learned
+residual projection fills the trailing dimensions and is trained against the corresponding portion of the
+target-text embedding, preserving context outside the named alphabet. The two portions are normalized together
+before the vector is fed back for the next autoregressive tick. Set `res_dim=0` for pure named state.
+
+`StateResidualObjective` exposes the same representation through indexed per-tick member lists when a dataset
+already has a stable integer vocabulary. `CodeSoftmaxObjective` is the pure-state variant and therefore requires
+`res_dim=0`. Codebooks can be random orthonormal, model-embedded, orthogonalized model embeddings, or vectors
+encoded through the target path.
 
 ### Anti-collapse: EMA twin (default) vs SIGReg (LeJEPA)
 
-By default the multi-latent path prevents representation collapse with an **EMA target twin** — a stop-grad
+By default the autoregressive named-state path prevents representation collapse with an **EMA target twin** — a stop-grad
 copy of the model whose slowly-moving latents are the targets, so the online model can't trivially match a
 target that moves with it. Injecting `target_source=SIGRegTarget` swaps this for **SIGReg** (Sketched Isotropic Gaussian
 Regularization, from LeJEPA, [Balestriero & LeCun 2025, arXiv:2511.08544](https://arxiv.org/abs/2511.08544)):
@@ -209,11 +223,24 @@ It's selected by *injecting two strategies* (not a flag): `loss_terms=build_cot_
 `CoTGenTerm`, and `seed_builder=cot_seed_texts` conditions the emission on the reasoning:
 
 ```python
-from langset.strategies import build_cot_loss_terms, cot_seed_texts
-rows = [{"input_text": "...", "target_texts": ["...", "..."], "cot_text": "step-by-step reasoning ..."}, ...]
-model = LangSetModel.from_pretrained("Qwen/Qwen3-1.7B-Base", multi_latent=True)
-Trainer(model, TrainingArguments(loss_terms=build_cot_loss_terms, seed_builder=cot_seed_texts, lam_cot=1.0),
-        rows).train()
+from langset.strategies import ConceptObjective, build_cot_loss_terms, cot_seed_texts
+
+rows = [{
+    "input_text": "...",
+    "target_texts": ["...", "..."],
+    "concepts": [{"phase": ["starting"]}, {"phase": ["complete"]}],
+    "cot_text": "step-by-step reasoning ...",
+}, ...]
+model = LangSetModel.from_pretrained(
+    "Qwen/Qwen3-1.7B-Base", multi_latent=True, code_emit=True, n_codes=1
+)
+Trainer(model, TrainingArguments(
+    emission=ConceptObjective,
+    concept_field="concepts",
+    loss_terms=build_cot_loss_terms,
+    seed_builder=cot_seed_texts,
+    lam_cot=1.0,
+), rows).train()
 ```
 
 **Why:** some target latents aren't a direct function of the surface input — they need an intermediate
@@ -234,41 +261,48 @@ is byte-identical to the plain concept emission — `CoTGenTerm` self-skips on e
 
 ### Superposition — one latent, several futures
 
-To make one emitted latent hold a **calibrated superposition** — several possible next states at once, its
-uncertainty rising with how many are live — supervise it **directly**: write a target text that *describes the
-whole set of futures*. There's no special loss or batching trick — the set is in the target, so the single
-latent that matches it has to hold the set, and its per-step **entropy** (read via `rollout(..., return_soft=True)`)
-tracks how open the future is. The only knob is `selector=last_epoch_selector` — retrieval MRR is *meant* to fall
-as the latent spreads over the set, so it must not gate checkpoint selection.
+To make one tick hold several possible states at once, put those alternatives in that tick's `concepts` entry.
+Lists assign equal mass; dictionaries provide explicit probabilities. This is distinct from `target_texts`:
+multiple `target_texts` entries mean multiple ordered ticks, while multiple concept members mean uncertainty
+inside one tick. `rollout(..., return_soft=True)` exposes the resulting mixture and its entropy.
 
 ```python
 from langset import LangSetModel, Trainer, TrainingArguments
-from langset.strategies import last_epoch_selector
+from langset.strategies import ConceptObjective
 
-# one row per state; each target text names the SET of admissible next states — a wider set should read back hotter
-rows = [
-    {"input_text": "a fair coin is flipped",         "target_texts": ["it lands heads or tails"]},                    # 2 live
-    {"input_text": "a six-sided die is rolled",       "target_texts": ["it shows one, two, three, four, five, or six"]},# 6 live
-    {"input_text": "water at sea level reaches 100°C", "target_texts": ["it boils to steam"]},                         # 1 live
-    # ...many states, each target enumerating its own live next-states
-]
-model = LangSetModel.from_pretrained("HuggingFaceTB/SmolLM2-135M", multi_latent=True)
-Trainer(model, TrainingArguments(selector=last_epoch_selector), rows).train()
+rows = [{
+    "input_text": "release 2.4 has entered canary deployment",
+    "target_texts": [
+        "the canary is observed",
+        "the release proceeds based on health",
+    ],
+    "concepts": [
+        {"health": {"healthy": 0.7, "degraded": 0.2, "failing": 0.1}},
+        {"outcome": {"expand": 0.7, "hold": 0.2, "rollback": 0.1}},
+    ],
+}]
+model = LangSetModel.from_pretrained(
+    "HuggingFaceTB/SmolLM2-135M",
+    multi_latent=True,
+    code_emit=True,
+    n_codes=1,
+)
+Trainer(model, TrainingArguments(
+    emission=ConceptObjective,
+    concept_field="concepts",
+), rows).train()
 
-# read the superposition back: entropy should rise with the number of live outcomes (die > coin > boil)
-_, _, soft, ent = model.rollout("a six-sided die is rolled", return_soft=True)   # soft = expected latent, ent = per-step entropy
+lat, lengths, soft, ent = model.rollout(
+    "release 2.4 has entered canary deployment",
+    return_soft=True,
+)
+# Two ordered ticks; each `soft` entry is a distribution over that tick's named states.
 ```
 
 The same shape scales to a real world model: in **[examples/maze-superposition](examples/maze-superposition)**,
 each tick's target is the set of active search-frontier cells, and the emitted latent's entropy provably tracks
 the branch count (`corr(entropy, k) = +0.34–0.39`) — the example *measures* that calibration with
 [`langset.probes`](src/langset/probes.py).
-
-Why `last_epoch_selector`: the default checkpoint selection (`retr_mrr`) rewards a *collapsed* one-future-per-state
-geometry — exactly the wrong signal here, since you *want* retrieval MRR to fall as the latent spreads over the
-set. (There is also a plain `snapshot_every=N` knob that saves the online weights to `{output_dir}_ep{N}`,
-`{output_dir}_ep{2N}`, … after every N epochs — independent of the eval cadence, separate from the best-so-far
-restore — to keep a checkpoint trajectory for offline evaluation.)
 
 ### Text replay — `learn_field` / `learn_ratio`
 
@@ -357,7 +391,7 @@ The variable-length **set** emission is useful even when the set isn't a set of 
 carries an unknown number of things, and a single averaged vector would blur them together:
 
 * **Multi-item extraction** — a latent per entity / keyphrase / skill / ingredient, retrieved against a reference
-  bank ([`examples/ner-multi-latent/`](examples/ner-multi-latent/) does this for named entities).
+  bank.
 * **Multi-vector retrieval** — represent a query or document as a *set* of latents (ColBERT-style late
   interaction) instead of one averaged vector.
 * **Multi-aspect / multi-label** — one latent per facet (`{brand, category, material}`) or applicable label.
@@ -445,6 +479,7 @@ Trainer(model, TrainingArguments(
 
 # multi-latent (world model): the cross-batch InfoNCE is cached exact; scheduled sampling is preserved
 Trainer(model, TrainingArguments(
+    emission=ConceptObjective,
     grad_cache=True, batch_size=512, gc_chunk=16,
     ss_prob=0.25,                                    # kept — a SHARED self-feed mask makes the rollout replay identically across phases
 )).train()
