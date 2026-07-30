@@ -66,12 +66,12 @@ class MultiStepCtx:
 
     Shape legend used below: B = rows in this batch · L = `lmax` (max emitted items across the batch's rows,
     the padded time dim) · N = number of VALID emissions in the batch (= Σ lens_l, since rows differ in length)
-    · d = latent dim · V = `fsq_levels`. The canonical flattened view a term works in is `recon[valid]` -> [N, d],
+    · d = latent dim. The canonical flattened view a term works in is `recon[valid]` -> [N, d],
     and `flat_texts` / `lens_l` / `bidx` are all aligned to that same row-major order.
     """
 
     trainer: Trainer  # the owning Trainer; read its PER-ROW data (indexed by dataset row id):
-    #                                     sup_labels / hard_neg_texts / label_plan + label_cols + label_codewords
+    #                                     sup_labels / hard_neg_texts / concept and state targets
     args: TrainingArguments  # the run config — a term reads its own weight/temperature here (a.lam_*, a.tau)
     model: LangSetModel  # the online model being trained (rarely needed directly — emit via target_source)
     dev: torch.device  # device every tensor below lives on; build new tensors with device=c.dev
@@ -91,14 +91,7 @@ class MultiStepCtx:
     recon: (
         torch.Tensor
     )  # [B, L, d] the model's EMITTED latents this step — gradient flows through these
-    dim_lg: Optional[
-        torch.Tensor
-    ]  # [B, L+1, fsq_dim, V] FSQ per-dim digit logits; None for a non-FSQ objective
     lmax: int  # L above: the padded emitted-item time dim for this batch
-    fsq_levels: int  # V above: FSQ quantization levels per digit
-    lab_label: Optional[
-        torch.Tensor
-    ]  # [B, L, n_reserved] reserved-dim label targets; None unless FSQ label subspace on
     target_source: _TargetSource  # the target provider; call .encode(texts) -> [n, d] normalized latents (hard-neg bank)
     phase_head: Optional[
         torch.nn.Module
@@ -171,29 +164,6 @@ class MultiNCETerm(_LossTerm):
         return (self.key, loss_nce, a.lam_multi_nce)
 
 
-class HardNegTerm(_LossTerm):
-    """Each emitted recon: own EMA target (positive) vs a shared bank of the batch's mined hard-negative texts."""
-
-    key = "loss_hard_neg"
-
-    def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
-        a, self_ = c.args, c.trainer
-        if self_.hard_neg_texts is None or a.lam_hard_neg <= 0:
-            return None
-        hn_flat = [t for k in c.bidx for t in self_.hard_neg_texts[k]]
-        if not hn_flat:
-            return None
-        hn_bank = c.target_source.encode(hn_flat)  # [Nhn, d] stop-grad normalized hard-neg latents
-        rv = F.normalize(c.recon[c.valid], dim=-1)  # [Nvalid, d] emitted reconstructions
-        pos = (rv * c.target_lat[c.valid]).sum(-1, keepdim=True)  # [Nvalid, 1] cos to own target
-        neg = rv @ hn_bank.t()  # [Nvalid, Nhn] cos to every hard neg
-        logits_hn = torch.cat([pos, neg], dim=1) / a.tau
-        loss_hn = F.cross_entropy(
-            logits_hn, torch.zeros(logits_hn.size(0), dtype=torch.long, device=c.dev)
-        )
-        return (self.key, loss_hn, a.lam_hard_neg)
-
-
 class SupConTerm(_LossTerm):
     """Supervised-contrastive shaping over emitted latents by the per-item `sup_field` group labels."""
 
@@ -237,26 +207,6 @@ class PhaseTerm(_LossTerm):
         return (self.key, loss_phase, a.lam_phase)
 
 
-class LabelDimsTerm(_LossTerm):
-    """FSQ LABEL SUBSPACE: full-strength CE on the reserved digit dims so the label lives AS coordinates of the
-    emitted code. FSQ-only (reads dim_lg); skipped when the objective produces no digit logits or no label plan."""
-
-    key = "loss_label"
-
-    def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
-        a, self_ = c.args, c.trainer
-        if c.lab_label is None or c.dim_lg is None or a.lam_label_dims <= 0:
-            return None
-        plan = self_.label_plan
-        assert plan is not None  # a label plan is what produced lab_label upstream
-        rcols = [cj for (cj, _, _) in plan]
-        lab_lg = c.dim_lg[:, : c.lmax, 1:, :][:, :, rcols, :]  # [b, lmax, n_reserved, fsq_levels]
-        loss_label = F.cross_entropy(
-            lab_lg.reshape(-1, c.fsq_levels), c.lab_label.reshape(-1), ignore_index=-100
-        )
-        return (self.key, loss_label, a.lam_label_dims)
-
-
 def build_loss_terms(args: TrainingArguments) -> list[_LossTerm]:
     """DEFAULT loss-term set, built once from the args. Fixed order (label -> multi_nce -> hard_neg -> sup) so the
     float summation is byte-identical; each term self-skips when its weight/column is absent. Inject
@@ -264,12 +214,7 @@ def build_loss_terms(args: TrainingArguments) -> list[_LossTerm]:
     NOTE: the phase head is no longer a term here — it is the `phase` instance of the generic AUXILIARY-HEAD plug
     (langset.heads), applied inline in `_train_multi` right after this loop (the same summation position the old
     `PhaseTerm` held, so lam_phase>0 stays byte-identical). `PhaseTerm` is kept for back-compat injection."""
-    return [
-        LabelDimsTerm(),
-        MultiNCETerm(maskers=[identical_text_mask]),
-        HardNegTerm(),
-        SupConTerm(),
-    ]
+    return [MultiNCETerm(maskers=[identical_text_mask]), SupConTerm()]
 
 
 class CoTGenTerm(_LossTerm):
@@ -333,30 +278,20 @@ def build_cot_loss_terms(args: TrainingArguments) -> list[_LossTerm]:
 # ---- emission objective -------------------------------------------------------------------------
 @dataclass
 class EmissionOut:
-    """Result of one emission forward (shapes as in MultiStepCtx: B rows · L=lmax · d latent · V=fsq_levels).
-    The trainer sets `loss = base_loss`, folds `logs` into its running averages, and passes `recon`/`dim_lg`/
-    `lab_label` on to the aux terms via MultiStepCtx."""
+    """Result of one emission forward."""
 
     recon: torch.Tensor  # [B, L, d] the model's emitted latents — gradient flows through these
-    base_loss: (
-        torch.Tensor
-    )  # scalar: the objective's own loss (FSQ: loss_stop + loss_dims + recon_loss)
+    base_loss: torch.Tensor  # scalar: the objective's own loss (objective-defined scalar)
     logs: dict[
         str, torch.Tensor
-    ]  # UNWEIGHTED scalar components for logging (FSQ: loss_stop / loss_dims / recon_loss)
-    dim_lg: Optional[
-        torch.Tensor
-    ]  # [B, L+1, fsq_dim, V] FSQ per-dim digit logits; None for a non-FSQ objective
-    lab_label: Optional[
-        torch.Tensor
-    ]  # [B, L, n_reserved] reserved-dim label targets; None unless FSQ label subspace on
+    ]  # UNWEIGHTED scalar components for logging (objective-defined components)
+    code_logits: Optional[torch.Tensor] = None
 
 
 class _EmissionObjective:
-    """Strategy for turning the seeded forward into emitted latents + the base emission loss. Default = FSQ
-    (token-native digit CE + folded STOP + cosine recon). Selected ONCE per run so the step loop has no
+    """Strategy for turning the seeded forward into emitted latents + the base emission loss. Selected ONCE per run so the step loop has no
     emission `if`s. `codebook` is a class flag the free-run rollout reads to pick which emission head to use
-    (True = FSQ digit head, False = a raw-vector head). All objectives share the __init__ signature
+    (True = autoregressive codebook, False = strategy-owned continuous vectors). All objectives share the __init__ signature
     (model, args, dev, trainer) so they are interchangeable as an injected `TrainingArguments.emission`."""
 
     codebook: bool = True
@@ -400,7 +335,7 @@ class _EmissionObjective:
     ) -> tuple[torch.Tensor, torch.Tensor, list[int], int]:
         """Shape the per-row target item lists + their encoded latents into the emission's teacher-forcing tensors
         `(target_lat [B,L,d], valid [B,L], lens_l, lmax)`. EXTRACTED verbatim from the trainer's inline block so the
-        STRATEGY owns target↔slot shaping: the AR/FSQ default is positional teacher forcing (item i -> slot i); a
+        STRATEGY owns target↔slot shaping: the autoregressive default is positional teacher forcing (item i -> slot i); a
         future matching family (DETR/parallel-query) overrides this (e.g. all-valid, assignment deferred to its own
         Hungarian match inside emit()). Pure tensor assembly — no model forward."""
         lmax = max(len(x) for x in ent_lists)
@@ -420,7 +355,7 @@ class _EmissionObjective:
     def emit_infer(self, texts: list[str], max_steps: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Inference emission: texts -> (lat [B, Lmax, d], lens [B]), zero-padding halted rows. The eval and
         `model.rollout` route through here so a non-AR family (parallel-query) can emit in one pass. Default
-        delegates to the model's autoregressive rollout (FSQ)."""
+        delegates to the model's autoregressive concept/codebook rollout."""
         lat, lens = self.m.rollout(  # ty: ignore[invalid-assignment]  # return_lengths=True -> (lat, lens)
             texts, max_steps=max_steps, return_lengths=True
         )
@@ -430,122 +365,21 @@ class _EmissionObjective:
         self, em: EmissionOut, target_lat: torch.Tensor, valid: torch.Tensor, lmax: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The (predicted, target) latents a TargetSource.regularizer (e.g. SIGReg) constrains. Default =
-        the emitted vs target latents directly ([N, d]); FSQ overrides this to use the pre-quantization z."""
+        the emitted vs target latents directly ([N, d])."""
         return em.recon[valid], target_lat[valid]
 
 
-class FSQObjective(_EmissionObjective):
-    """DEFAULT emission: predict each item's per-dim FSQ digits (a STOP folded into dim-0's softmax) + a cosine
-    reconstruction to the target. Byte-identical to the historical inline FSQ block. Reads the FSQ grid geometry
-    (fsq_dim/fsq_levels) off model.head, so it takes the uniform (model, args, dev, trainer) signature."""
-
-    codebook = True
-
-    def __init__(
-        self, model: LangSetModel, args: TrainingArguments, dev: torch.device, trainer: Trainer
-    ) -> None:
-        super().__init__(model, args, dev, trainer)
-        head = model.head
-        self.fsq_dim = int(head.fsq_dim)
-        self.fsq_levels = int(head.fsq_levels)
-        self.stop_idx = self.fsq_levels  # STOP is the extra class folded into dim-0's softmax
-
-    def emit(
-        self,
-        se: dict[str, torch.Tensor],
-        target_lat: torch.Tensor,
-        valid: torch.Tensor,
-        lens_l: list[int],
-        bidx: list[int],
-        b: int,
-        lmax: int,
-        ep: int,
-        ss_mask: Optional[torch.Tensor] = None,
-    ) -> EmissionOut:
-        m, a, dev, self_ = self.m, self.a, self.dev, self.trainer
-        fsq_dim, fsq_levels = self.fsq_dim, self.fsq_levels
-        ss_prob = a.ss_prob
-        assert ss_prob is not None  # Trainer resolves the None sentinel to a float before any emit
-        eff_ss = ss_prob if a.ss_warmup <= 0 else ss_prob * min(1.0, ep / a.ss_warmup)
-        dim_lg, stop_lg, digits, recon = m.rollout_train_codebook(
-            se["input_ids"],
-            se["attention_mask"],
-            target_lat,
-            a.tau,
-            train_hops=a.train_hops,
-            ss_prob=eff_ss,
-            ss_sample=a.ss_sample,
-            ss_mask=ss_mask,  # GradCache: shared per-(row,hop) self-feed decisions (deterministic replay)
-            kv_cache=a.kv_cache,  # forward prompt once + single-token hops vs full-prefix recompute (no grad_ckpt)
-        )
-        dim0 = torch.cat([dim_lg[:, :, 0, :], stop_lg], -1)  # [b, lmax+1, L+1] — digit-0 + STOP
-        lab0 = torch.full((b, lmax + 1), -100, dtype=torch.long, device=dev)
-        lab_rest = torch.full((b, lmax, fsq_dim - 1), -100, dtype=torch.long, device=dev)
-        for r, nl in enumerate(lens_l):
-            lab0[r, :nl] = digits[r, :nl, 0]
-            lab0[r, nl] = self.stop_idx  # emit digit-0 per item, then STOP after the last
-            lab_rest[r, :nl] = digits[r, :nl, 1:]
-        lab_label = None  # FSQ LABEL SUBSPACE: reserved dims -> a SEPARATE
-        if self_.label_plan is not None:  # weighted label CE (NOT diluted inside loss_dims)
-            plan = self_.label_plan
-            cols = self_.label_cols
-            assert cols is not None  # label_cols is populated alongside label_plan
-            lab_label = torch.full((b, lmax, len(plan)), -100, dtype=torch.long, device=dev)
-            for s_i, (col_j, field, pos) in enumerate(plan):
-                labs, cw = cols[field], self_.label_codewords[field]
-                for r, kk in enumerate(bidx):
-                    row_labs = labs[kk]
-                    for j in range(lens_l[r]):
-                        code = cw.get(row_labs[j] if j < len(row_labs) else "")
-                        lab_label[r, j, s_i] = code[pos] if code is not None else -100
-                lab_rest[:, :, col_j] = -100  # reserved dims leave the reconstruction CE
-        loss_stop = F.cross_entropy(
-            dim0.reshape(-1, fsq_levels + 1), lab0.reshape(-1), ignore_index=-100
-        )
-        loss_dims = F.cross_entropy(
-            dim_lg[:, :lmax, 1:, :].reshape(-1, fsq_levels), lab_rest.reshape(-1), ignore_index=-100
-        )
-        recon_loss = (1.0 - F.cosine_similarity(recon[valid], target_lat[valid], dim=-1)).mean()
-        return EmissionOut(
-            recon=recon,
-            base_loss=loss_stop + loss_dims + recon_loss,
-            logs={"loss_stop": loss_stop, "loss_dims": loss_dims, "recon_loss": recon_loss},
-            dim_lg=dim_lg,
-            lab_label=lab_label,
-        )
-
-    def z_for_reg(
-        self, em: EmissionOut, target_lat: torch.Tensor, valid: torch.Tensor, lmax: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Regularize the PRE-QUANTIZATION z = down_proj(latent) — the actual FSQ input, before the tanh+round —
-        # so the penalty spreads the encoder's codes across the whole grid. z_pred = predicted E[digit].
-        assert self.m.head.down_proj is not None
-        z_tgt = self.m.head.down_proj(target_lat[valid].float())  # [N, fsq_dim]
-        lvls = torch.arange(self.fsq_levels, device=self.dev, dtype=torch.float32)
-        dim_lg = em.dim_lg
-        assert dim_lg is not None  # FSQ path always populates dim_lg
-        soft = (dim_lg[:, :lmax].float().softmax(-1) * lvls).sum(
-            -1
-        )  # predicted E[digit] [b, lmax, fsq_dim]
-        return soft[valid], z_tgt
-
-
 class CodeSoftmaxObjective(_EmissionObjective):
-    """CODEBOOK emission: ONE softmax over the head's fixed codebook (plus STOP), trained toward the target's own
-    distribution over codes. Inject with `TrainingArguments(emission=CodeSoftmaxObjective)` and a head built with
-    `code_emit=True` (see EmitHead.set_code).
+    """Emit one distribution over a fixed alphabet and commit its codebook mixture.
 
-    Use this when an emission is a SET drawn from a known alphabet (maze frontier: which of 256 cells) rather than
-    a point to quantize. The FSQ default spends `fsq_dim` independent softmaxes on a learned grid, and a per-member
-    readout off that grid is `n_codes` INDEPENDENT decisions, so nothing forces the emission to choose among
-    members: every member can be scored high at once. A single normalized softmax has to ALLOCATE its mass, so the
-    members compete, and the emitted latent is the mixture they form.
+    Inject with `TrainingArguments(emission=CodeSoftmaxObjective)` and a head built with `code_emit=True`.
+    Use this when the target geometry already encodes membership in a known alphabet. One normalized softmax
+    allocates a fixed budget of mass, so members compete and the emitted latent is their superposition.
 
     The target law is read off the target latent itself, no extra column: for an orthonormal codebook and a
     membership target `normalize(multi_hot @ code.T)`, projecting back with `target @ code.T` recovers the members
     (equal weight) and ~0 elsewhere, so an L1 normalize gives the uniform-over-members law to match. Loss is the
-    soft-target cross-entropy over the codes, plus an INDEPENDENT sigmoid terminator (see `emit` for why STOP
-    must not be folded into the membership softmax the way the FSQ path folds it into dim-0).
+    soft-target cross-entropy over the codes, plus an independent sigmoid terminator.
     """
 
     codebook = True
@@ -556,6 +390,9 @@ class CodeSoftmaxObjective(_EmissionObjective):
         super().__init__(model, args, dev, trainer)
         assert model.head.code_emit, (
             "CodeSoftmaxObjective needs a codebook head: build the model with code_emit=True, n_codes=<alphabet>"
+        )
+        assert model.head.res_dim == 0, (
+            "CodeSoftmaxObjective requires res_dim=0; use StateResidualObjective for named state plus a residual"
         )
         self.n_codes = int(model.head.n_codes)
 
@@ -575,14 +412,12 @@ class CodeSoftmaxObjective(_EmissionObjective):
         ss_prob = a.ss_prob
         assert ss_prob is not None  # Trainer resolves the None sentinel before any emit
         eff_ss = ss_prob if a.ss_warmup <= 0 else ss_prob * min(1.0, ep / a.ss_warmup)
-        dim_lg, stop_lg, _digits, recon = m.rollout_train_codebook(
+        code_logits, stop_lg, _digits, recon = m.rollout_train_state(
             se["input_ids"],
             se["attention_mask"],
             target_lat,
-            a.tau,
             train_hops=a.train_hops,
             ss_prob=eff_ss,
-            ss_sample=a.ss_sample,
             ss_mask=ss_mask,
             kv_cache=a.kv_cache,
         )
@@ -591,14 +426,9 @@ class CodeSoftmaxObjective(_EmissionObjective):
             w = F.relu(target_lat.float() @ code.t())  # [b, lmax, n_codes]
             w = w / w.sum(-1, keepdim=True).clamp_min(1e-9)
         # MEMBERSHIP: soft-target CE over the codes ALONE, at real emission slots.
-        cell_logp = F.log_softmax(dim_lg[:, :lmax, 0, :].float(), -1)  # [b, lmax, n_codes]
+        cell_logp = F.log_softmax(code_logits[:, :lmax, 0, :].float(), -1)  # [b, lmax, n_codes]
         loss_code = -(w * cell_logp).sum(-1)[valid].mean()
-        # TERMINATION: an INDEPENDENT sigmoid, not a class inside the membership softmax. Folding STOP in (the
-        # FSQ default) is fair when dim-0's target is itself one-hot, but a set-valued target is 1/k-diffuse and
-        # the two then share one normalizer: at a member position the target is 0 on STOP, so the gradient
-        # pushing the stop logit DOWN is proportional to P(STOP) -- which shrinks as the set widens, because the
-        # denominator carries k members. Wider sets suppress the terminator more weakly and it ratchets up.
-        # Factored out, "continue vs stop" is trained by its own signal and never rides on set width.
+        # Termination is independent of the member distribution, so set width cannot weaken its supervision.
         stop_lab = torch.zeros(b, lmax + 1, device=dev)
         keep = torch.zeros(b, lmax + 1, dtype=torch.bool, device=dev)
         for r, nl in enumerate(lens_l):
@@ -608,11 +438,13 @@ class CodeSoftmaxObjective(_EmissionObjective):
             stop_lg.squeeze(-1).float()[keep], stop_lab[keep]
         )
         # `recon` is the contract every loss term reads as "the model's emission, with gradient" (MultiNCETerm
-        # and HardNegTerm both build their query from it). The rollout's own recon is the TARGET here -- this
+        # and the emitter both build their query from it). The rollout's own recon is the TARGET here -- this
         # path is lossless, so it carries no gradient at all, and a term querying it would compare each target
         # against itself: near-zero loss, exactly zero gradient, silently inert. Hand back the DIFFERENTIABLE
         # committed mixture instead, which is both the true emission and the vector fed back each tick.
-        mix = F.normalize(dim_lg[:, :lmax, 0, :].float().softmax(-1) @ code, dim=-1)  # [b, lmax, d]
+        mix = F.normalize(
+            code_logits[:, :lmax, 0, :].float().softmax(-1) @ code, dim=-1
+        )  # [b, lmax, d]
         with (
             torch.no_grad()
         ):  # diagnostic: how close the emitted mixture lands to the target latent
@@ -622,21 +454,20 @@ class CodeSoftmaxObjective(_EmissionObjective):
             recon=mix,
             base_loss=loss_code + loss_stop,
             logs={"loss_code": loss_code, "loss_stop": loss_stop, "emit_cos": emit_cos},
-            dim_lg=dim_lg,
-            lab_label=None,  # the FSQ label subspace has no analogue here: one softmax, no dims to reserve
+            code_logits=code_logits,
         )
 
     def z_for_reg(
         self, em: EmissionOut, target_lat: torch.Tensor, valid: torch.Tensor, lmax: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Regularize the DISTRIBUTIONS, the codebook analogue of FSQ's pre-quantization z: predicted law vs target
+        # Regularize the DISTRIBUTIONS, the codebook analogue of codebook's pre-quantization z: predicted law vs target
         # law over codes, so a penalty spreads usage across the alphabet instead of collapsing onto a few codes.
-        dim_lg = em.dim_lg
-        assert dim_lg is not None
+        code_logits = em.code_logits
+        assert code_logits is not None
         code = self.m.head.code
         z_tgt = F.relu(target_lat[valid].float() @ code.t())
         z_tgt = z_tgt / z_tgt.sum(-1, keepdim=True).clamp_min(1e-9)
-        return dim_lg[:, :lmax, 0, :].float().softmax(-1)[valid], z_tgt
+        return code_logits[:, :lmax, 0, :].float().softmax(-1)[valid], z_tgt
 
 
 class ConceptObjective(_EmissionObjective):
@@ -734,19 +565,17 @@ class ConceptObjective(_EmissionObjective):
         ss_prob = a.ss_prob
         assert ss_prob is not None
         eff_ss = ss_prob if a.ss_warmup <= 0 else ss_prob * min(1.0, ep / a.ss_warmup)
-        dim_lg, stop_lg, _d, _r, emit_hid = m.rollout_train_codebook(
+        code_logits, stop_lg, _d, _r, emit_hid = m.rollout_train_state(
             se["input_ids"],
             se["attention_mask"],
             target_lat,
-            a.tau,
             train_hops=a.train_hops,
             ss_prob=eff_ss,
-            ss_sample=a.ss_sample,
             ss_mask=ss_mask,
             kv_cache=a.kv_cache,
             return_emit_hidden=True,
         )
-        flat = dim_lg[:, :lmax, 0, :].float()  # [b, lmax, n_codes]
+        flat = code_logits[:, :lmax, 0, :].float()  # [b, lmax, n_codes]
         tgt, seen = self._target_law(b, lmax, lens_l, bidx)
 
         # one soft-target CE PER FACET, over that facet's members only
@@ -771,7 +600,7 @@ class ConceptObjective(_EmissionObjective):
         )
 
         # the emission the rest of the trainer sees — WITH gradient, or every aux term silently idles
-        p = m.head.concept_probs(dim_lg[:, :lmax])
+        p = m.head.concept_probs(code_logits[:, :lmax])
         state = F.normalize(p @ m.head.code, dim=-1)
         emission = (
             torch.cat([state, m.head.residual(emit_hid[:, :lmax])], -1) * (0.5**0.5)
@@ -789,8 +618,6 @@ class ConceptObjective(_EmissionObjective):
                 "emit_cos": emit_cos,
                 **per_facet,
             },
-            dim_lg=dim_lg,
-            lab_label=None,
         )
 
 
@@ -867,14 +694,12 @@ class StateResidualObjective(_EmissionObjective):
         ss_prob = a.ss_prob
         assert ss_prob is not None
         eff_ss = ss_prob if a.ss_warmup <= 0 else ss_prob * min(1.0, ep / a.ss_warmup)
-        dim_lg, stop_lg, _digits, _recon, emit_hid = m.rollout_train_codebook(
+        code_logits, stop_lg, _digits, _recon, emit_hid = m.rollout_train_state(
             se["input_ids"],
             se["attention_mask"],
             target_lat,
-            a.tau,
             train_hops=a.train_hops,
             ss_prob=eff_ss,
-            ss_sample=a.ss_sample,
             ss_mask=ss_mask,
             kv_cache=a.kv_cache,
             return_emit_hidden=True,  # the residual is a function of the emit hidden, not of the logits
@@ -892,7 +717,7 @@ class StateResidualObjective(_EmissionObjective):
                 if members:
                     tgt[r, t, members] = 1.0 / len(members)
                     has[r, t] = True
-        cell_logp = F.log_softmax(dim_lg[:, :lmax, 0, :].float(), -1)
+        cell_logp = F.log_softmax(code_logits[:, :lmax, 0, :].float(), -1)
         sel = has & valid
         loss_state = (
             -(tgt * cell_logp).sum(-1)[sel].mean() if bool(sel.any()) else cell_logp.new_zeros(())
@@ -913,7 +738,7 @@ class StateResidualObjective(_EmissionObjective):
         # THE EMISSION the rest of the trainer sees: state mixture ++ residual, exactly what feeds back. It must
         # be the emission WITH gradient -- every aux term (in-batch NCE, hard negatives) builds its query from
         # `recon`, and handing back the stop-grad target instead leaves them running but training nothing.
-        p = dim_lg[:, :lmax, 0, :].float().softmax(-1)
+        p = code_logits[:, :lmax, 0, :].float().softmax(-1)
         state = F.normalize(p @ code, dim=-1)
         if self.res_dim:
             res = m.head.residual(emit_hid[:, :lmax])
@@ -927,8 +752,6 @@ class StateResidualObjective(_EmissionObjective):
             recon=emission,
             base_loss=loss_state + loss_stop,
             logs=logs,
-            dim_lg=dim_lg,
-            lab_label=None,
         )
 
 
@@ -1013,7 +836,7 @@ class CachedTarget(_TargetSource):
     """FROZEN-ENCODER target source with an encode-once cache — the two-stage (V-JEPA) split for the multi-latent
     world model. The target geometry is a FIXED encoder, so every text->latent map is CONSTANT for the whole run:
     encode each unique text ONCE, memoize, then serve lookups. The step loop stops re-encoding BOTH the per-step
-    targets (trainer flat_texts) and the batch-pooled hard-negative bank (HardNegTerm) — bringing the 'train only
+    targets (trainer flat_texts) and the batch-pooled hard-negative bank (the emitter) — bringing the 'train only
     the head on cached vectors, epochs in seconds' win that langset's single-latent frozen-pool path already has
     to the multi-latent rollout. It's the fix for re-encoding fixed data every epoch.
 
@@ -1074,7 +897,7 @@ class CachedTarget(_TargetSource):
 class SIGRegTarget(_TargetSource):
     """EMA-free anti-collapse (LeJEPA, arXiv:2511.08544). INJECT via `TrainingArguments(target_source=SIGRegTarget)`.
     Targets come from the LIVE model WITH gradient (no stop-grad twin); collapse is prevented by an isotropic-Gaussian
-    SIGReg penalty on the pre-quant z (via `regularizer`) instead of by a twin. So it drops the twin's VRAM + target
+    SIGReg penalty on the emitted representation (via `regularizer`) instead of by a twin. So it drops the twin's VRAM + target
     forward, the in-batch NCE is suppressed (the regularizer replaces it), and eval encodes with the live model itself.
     Reads scalar knobs off args: sigreg_lambda (loss weight, applied in the trainer), sigreg_knots, sigreg_slices."""
 
@@ -1103,8 +926,7 @@ class SIGRegTarget(_TargetSource):
         return F.normalize(z.float(), dim=-1)
 
     def regularizer(self, z_pred: torch.Tensor, z_tgt: torch.Tensor) -> Optional[torch.Tensor]:
-        # Two INDEPENDENT Gaussianity penalties (predicted E[digit] and target z), NOT a match between them —
-        # each is pushed toward isotropic Gaussian, spreading codes across the FSQ grid.
+        # Two independent Gaussianity penalties, not a match between predicted and target representations.
         return self.sig_reg(z_pred) + self.sig_reg(z_tgt)
 
 
@@ -1165,7 +987,7 @@ def discover_concept_alphabet(rows_concepts: "list[object]") -> "dict[str, list[
 # A `code_source` maps the alphabet's member NAMES to their vectors: (names, dim, model) -> [n_members, dim].
 # Called ONCE at setup, over the alphabet (hundreds to a few thousand short strings), never per batch. The
 # result is frozen into a buffer for the run — a codebook that re-embeds while the model trains is a learned
-# codebook in disguise, and re-opens the collapse problem the fixed FSQ grid was chosen to avoid.
+# codebook in disguise, and re-opens the collapse problem the fixed codebook was chosen to avoid.
 #
 # The choice is a real trade, not a default: an orthonormal codebook decodes losslessly by plain matmul (so a
 # recall number measures the EMISSION, with no probe as a confound) but its members carry no relation to each

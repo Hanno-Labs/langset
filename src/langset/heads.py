@@ -8,7 +8,7 @@ gradient into the backbone and/or (b) is itself a queryable readout. This module
 
 A `Head` declares the four axes the phase head implicitly hard-coded:
   1. READ SITE (`reads`):  "recon"  = one prediction per EMITTED latent, in the token stream (what the phase head
-                                       reads — grad flows into the FSQ up/down-proj + LoRA, shaping the geometry).
+                                       reads — grad flows into the emitter and backbone, shaping the geometry).
                             "hidden" = the pooled/final backbone hidden, ONE prediction per sequence (a value/time
                                        readout of the current state; grad flows into the backbone/LoRA).
   2. TARGET (`target`):    a per-item dataset column supplying the supervision (like the existing `sup_field`).
@@ -40,7 +40,7 @@ HeadLoss = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 _READS = ("recon", "hidden")
 _BUILTIN_LOSSES = ("ce", "mse")
-# label tokens treated as "no supervision" for this item (mirrors the phase-head / emb_slots filters exactly).
+# label tokens treated as "no supervision" for this item.
 _MISSING = ("", "unknown", "none", "nan")
 
 

@@ -8,7 +8,6 @@ from typing import Any, Callable, Optional
 from langset.heads import Head
 from langset.strategies import (
     EMATwinTarget,
-    FSQObjective,
     build_loss_terms,
     multi_epoch_order,
     multi_seed_texts,
@@ -41,19 +40,15 @@ class TrainingArguments:
     # these are light aux terms: recon grounds the latent in the target text, uniform keeps the space spread.
     lam_recon: float = 0.3  # aux: the latent must also DECODE target_text
     lam_uniform: float = 0.1  # aux: light uniformity (spread latents on the sphere)
-    lam_hard_neg: float = (
-        0.0  # MULTI-LATENT hard-neg InfoNCE weight (0 = off, byte-identical to before)
-    )
     # MULTI-LATENT in-batch-negative InfoNCE — the separation term the multi-latent path was MISSING. The base
     # multi-latent loss (loss_stop + loss_dims + recon) is pure reconstruction: it MATCHES each emitted latent to
     # its EMA target but never pushes DIFFERENT items apart, so the geometry is capped by the base embedding and
     # organizes by whatever dominates the target text (boilerplate). This ports single-latent's primary objective:
     # each emitted recon vs the batch's targets, own target = positive, others = in-batch negatives (identical target
     # text masked as false-neg). ON by default — this is the fix, not an opt-in. Set 0.0 for the old behavior.
-    # WEIGHT: unlike single-latent (where InfoNCE IS the whole loss, weight 1.0), here it COMPETES with the FSQ-recon
+    # WEIGHT: unlike single-latent (where InfoNCE IS the whole loss, weight 1.0), here it COMPETES with the state-emission
     # base (loss_stop+loss_dims+recon ~0.9); at 1.0 the InfoNCE (~ln(N_inbatch)≈4.85) overwhelms recon and SCRAMBLES
     # the geometry (retr_mrr stuck at chance, nce loss never descends). 0.3 balances the two → healthy geometry that
-    # organizes by real structure (FDA smol: disease decodes held-out, area_fsq +0.58 / indication_fsq +0.82, no labels).
     lam_multi_nce: float = 0.3
 
     # SPEED (big models): stop_grad_target forwards the target view under no_grad (BYOL/MoCo-style) so it anchors
@@ -78,10 +73,8 @@ class TrainingArguments:
 
     # hard negatives: name a dataset column of hard-negative text(s) per row (MINED near-miss targets the emitted
     # latent should be pushed AWAY from — e.g. a boilerplate-similar case, or the WRONG lifecycle outcome).
-    # SINGLE-latent: a scalar hard-neg text per row, appended as an EXTRA always-negative column to the in-batch
-    # contrastive logits. MULTI-latent: a LIST of hard-neg texts per row; the batch's hard-neg latents form a shared
-    # bank and each emitted item's reconstruction runs an InfoNCE (own target vs the bank) at weight `lam_hard_neg`.
-    # Encoded under no_grad (memory-safe: no extra backward). None = no hard negs (byte-identical to before).
+    # Single-latent training appends one scalar hard negative to its contrastive bank. QueryBridge accepts a
+    # per-row list and folds those vectors into its own denominator. Named-state objectives use concepts instead.
     hard_neg_field: Optional[str] = None
 
     # supervised-contrastive label shaping (Khosla et al.): name a dataset column of GROUP LABELS the emitted latents
@@ -114,39 +107,8 @@ class TrainingArguments:
     # shim when set. e.g. heads=[Head("value", reads="hidden", target="winprob", loss="mse", dim=1, transient=False)].
     heads: list[Head] = field(default_factory=list)
 
-    # FSQ LABEL SUBSPACE — a FORMAL label space inside the emitted code, with NO head per label. Map each facet to
-    # reserved FSQ digit indices (each >=1; dim 0 is STOP-coupled). Those dims' reconstruction targets are REPLACED
-    # by the label's codeword (one digit if n_classes<=fsq_levels, else little-endian base-fsq_levels across the
-    # group), so the emitter is FORCED to encode the label AS coordinates of the token: reading a label = argmax the
-    # reserved digit (no probe), writing = clamp it (controllable generation). Remaining dims reconstruct as usual.
-    # Needs per-item label columns (lists aligned 1:1 with target_texts) named by the dict keys. Unknown/""/"none"
-    # labels -> those dims ignored (-100) for that item. None = off (byte-identical). e.g. {"label_stage":[1],
-    # "label_area":[2,3], "label_indication":[4,5,6]}.
-    label_dims: Optional[dict[str, list[int]]] = None
-    # weight on the reserved-dim label CE. It's a SEPARATE term (not folded into loss_dims) so the ~9 label dims are
-    # not diluted among the ~1000 free reconstruction dims — at weight 1 it sits at parity with loss_dims/recon.
-    lam_label_dims: float = 1.0
-
-    # CONTINUOUS EMBEDDING SLOTS — the continuous analog of `label_dims` (which reserves FSQ *digit* indices). Reserve
-    # a CONTIGUOUS slice of dims of the single emitted embedding for a named facet and bind it with a small transient
-    # decoder head (CE for "classify", MSE for "regress") that reads ONLY those dims — so gradient forces the encoder
-    # to route the facet INTO that slice. The facet then lives AS a readable sub-vector (emb[lo:hi] decodes to it)
-    # instead of smeared across all d dims, and WITHOUT a persisted model: like the phase head the slot head is not
-    # saved — its only job is to inject gradient (eval re-fits its own probe on the now-informative slice). The slot
-    # dims still participate in the retrieval InfoNCE; they just ALSO carry a legible facet. Per-item labels come from
-    # a dataset column named by the dict key; unknown/""/"none"/"nan" -> that item ignored for the slot. Works on BOTH
-    # the single-latent path (slots the one emitted embedding) and the multi-latent path (MEAN-POOLS the emitted latent
-    # SET over its valid positions -> one per-row vector, then slots that — same per-row semantics).
-    # None = off (byte-identical). e.g. {"material_bucket": (0, 64, "classify"), "side": (64, 80, "classify")}.
-    emb_slots: Optional[dict[str, tuple[int, int, str]]] = None
-    lam_emb_slots: float = 1.0
-
-    # STATE + RESIDUAL emission (multi-latent, StateResidualObjective) — a THIRD way to shape the latent,
-    # alongside `fsq_dim` (how finely it is quantized) and `emb_slots` (which of its dims are made legible).
-    # Those two both DECODE meaning out of a latent the twin defined; this one CONSTITUTES the latent: its first
-    # `latent_dim - res_dim` dims are a mixture over a NAMED alphabet, and the remaining `res_dim` are a residual
-    # the alphabet cannot name (shaped by the twin/recon terms, so a self-supervised component survives).
-    # `state_field` names a per-row column of per-tick ACTIVE MEMBER index lists — the same sparse shape as
+    # STATE + RESIDUAL emission. The named state is constituted from a fixed alphabet while the
+    # residual carries information outside that alphabet. `state_field` names a per-row column of per-tick ACTIVE MEMBER index lists — the same sparse shape as
     # `concept_field` — and `state_classes` is the alphabet size. Pair with `code_emit=True, n_codes=<alphabet>,
     # res_dim=<width>` on the model. Off (None) = byte-identical.
     state_field: Optional[str] = None
@@ -161,7 +123,7 @@ class TrainingArguments:
     # WHERE each named member's vector comes from. A name from strategies.CODE_SOURCES ("random" | "model" |
     # "orthogonal" | "twin") or your own (names, dim, model) -> [n_members, dim] callable. Resolved ONCE at
     # setup over the alphabet, then frozen — a codebook that re-embeds during training is a learned codebook,
-    # with the drift/collapse problem the fixed FSQ grid exists to avoid. "random" is arbitrary but decodes
+    # which would let the geometry drift or collapse. "random" is arbitrary but decodes
     # losslessly (right for benchmarks: the readout cannot flatter the emission); "model"/"twin" put related
     # members near each other but give up exact recovery. `code_names` lists the member names in INDEX order,
     # so names[i] is the member whose index appears in the `state_field` column.
@@ -170,14 +132,13 @@ class TrainingArguments:
 
     # MULTI-HOP training (scheduled sampling). For the first `train_hops` emitted positions (None = ALL), feed the
     # model's OWN predicted latent back with probability ss_prob instead of ground truth — the exposure-bias fix that
-    # makes multi-hop rollout TRAINED rather than emergent. ss_sample samples the self-fed digits instead of argmax.
+    # makes multi-hop rollout TRAINED rather than emergent.
     # ss_prob SENTINEL: None = UNSET (resolved by the Trainer against the model). A multi_latent model rolls out
     # AUTOREGRESSIVELY at inference, so teacher-forced-only (ss_prob=0) is invalid — the Trainer defaults an unset
     # ss_prob to 0.25 and REJECTS an explicit ss_prob=0 ("you cannot roll out what you did not train"). Single-latent
     # never rolls, so None -> 0.0 there.
     train_hops: Optional[int] = None
     ss_prob: Optional[float] = None
-    ss_sample: bool = False
     # KV-CACHE rollout (multi-latent): forward the prompt ONCE, then each latent token alone against the cached
     # prefix K/V, instead of re-running the whole growing sequence every tick. Numerically identical (verified to
     # ~1e-7 in test_kv_cache), but activation memory is ~1 prompt forward + n single tokens rather than n
@@ -192,7 +153,7 @@ class TrainingArguments:
 
     # PARALLEL-QUERY emission (QueryBridgeEmission — the non-AR continuous family, langset.bridge_emission).
     # n_queries = number of query slots = MAX emitted items per doc (the validity head gates the actual count ≤ this).
-    # Unused by the default FSQ/AR emission, so byte-identical there.
+    # Unused by autoregressive concept/codebook emission, so byte-identical there.
     n_queries: int = 16
     bridge_lam_valid: float = 1.0  # weight on the validity/count BCE in the bridge's base loss
     bridge_pos_weight: float = (
@@ -215,10 +176,9 @@ class TrainingArguments:
     learn_field: Optional[str] = None
     learn_ratio: float = 0.0
 
-    # multi-latent (variable-length FSQ latent-set emission). Active only when the model is `multi_latent=True`:
+    # multi-latent (variable-length vector emission). Active only when the model is `multi_latent=True`:
     # the Trainer reads a `target_texts` (list[str] per row) column, emits an EMA-twin target for each item, and
-    # trains the token-native FSQ emitter (per-dim digits + a learned STOP). Ignored on the single-latent path.
-    # `fsq_dim`/`fsq_levels` are MODEL internals (read from `model.head`), NOT args.
+    # trains the selected emission strategy. Ignored on the single-latent path.
     ema_m: float = 0.99  # EMA-twin momentum supplying the (stop-grad) target latents
     max_target_items: int = 12  # cap on target latents emitted/supervised per row
     max_steps: int = 16  # free-rollout cap used in multi-latent eval
@@ -248,7 +208,7 @@ class TrainingArguments:
     # `seed_builder=cot_seed_texts` (see the injection block below) with a `cot_text` dataset column: the model is
     # co-trained to GENERATE each row's chain-of-thought (its own isolated backward, so the two autograd graphs never
     # coexist) and the latent forward is conditioned on seed+CoT. No injection / absent cot_text column = OFF
-    # (byte-identical FSQ path). Not a flag — inject the strategies; this scalar just weights the CoT next-token CE.
+    # . Not a flag — inject the strategies; this scalar just weights the CoT next-token CE.
     lam_cot: float = 1.0  # weight on the CoT next-token CE (used only with the CoT strategies)
 
     # SUPERPOSITION (multi-latent) — to make one emitted latent hold a calibrated MIXTURE of several possible next
@@ -264,11 +224,13 @@ class TrainingArguments:
     # ---- MULTI-LATENT STRATEGY INJECTION (dependency injection, not flags) --------------------------------------
     # The multi-latent step is assembled from swappable pieces (see langset/strategies.py). Each field below holds
     # the STRATEGY ITSELF — a class or callable — and the trainer just calls it; there is NO `if use_x:` selection.
-    # The defaults reproduce the historical behavior byte-for-byte (guarded by test_trainer_multi_characterization).
+    # There is deliberately no implicit multi-vector emission default; choose the geometry explicitly.
     # To change a behavior, INJECT a different implementation, e.g.
     #     TrainingArguments(target_source=SIGRegTarget)          # EMA-free anti-collapse
     # rather than toggling a boolean the trainer then branches on. See strategies.py for the interface each must meet.
-    emission: Callable = FSQObjective  # (model, args, dev, trainer) -> _EmissionObjective : seed->latents + base loss
+    emission: Optional[Callable] = (
+        None  # required for multi_latent: Concept/State/CodeSoftmax or QueryBridge
+    )
     target_source: Callable = EMATwinTarget  # (model, args, tok, dev) -> _TargetSource : the target latents + anti-collapse
     loss_terms: Callable = (
         build_loss_terms  # (args) -> list[_LossTerm] : the weighted aux separation/shaping terms

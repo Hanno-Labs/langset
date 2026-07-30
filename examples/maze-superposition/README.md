@@ -44,10 +44,8 @@ that's the whole reason (per LeCun / JEPA) you'd predict in latent space at all.
 concrete and *directly supervised*: the target for tick *t* literally **is** the set of active cells, so "the
 latent should hold a set of size *k*" is a ground-truth signal, not something we hope emerges.
 
-That direct supervision is what makes it work. An earlier attempt supervised superposition *indirectly* (hope a
-centroid emerges from K same-seed rows) and the discrete FSQ code came out high-entropy but **uncalibrated**.
-With the frontier as the literal target, the FSQ code's entropy **tracks the frontier size** — the property
-below.
+That direct supervision is what makes it work. The concept distribution is trained against the active frontier
+cells, and its entropy can therefore be compared directly with the true frontier size.
 
 ### The langset pieces
 
@@ -55,9 +53,9 @@ below.
 |---|---|
 | `multi_latent=True` | variable-length latent set — one latent per tick, the model decides how many via a learned STOP |
 | `selector=last_epoch_selector` | retrieval MRR rewards a **collapsed** one-cell-per-tick geometry — exactly the wrong signal here (it's *meant to fall* as the latent spreads over the set), so keep the last epoch instead of early-stopping on it |
-| `rollout(..., return_soft=True)` | at eval, read the **expected** latent and its per-dim **entropy** — the model's native uncertainty — instead of the argmax |
+| `rollout(..., return_soft=True)` | at eval, read the committed concept mixture and its entropy |
 | `target_source=SIGRegTarget` *(optional, `--sigreg`)* | EMA-free anti-collapse (LeJEPA) instead of the stop-grad twin — see [`langset/sigreg.py`](../../src/langset/sigreg.py) |
-| `emission=ConceptObjective` *(optional, `--concepts`)* | construct each tick's latent directly from a soft mixture over named frontier cells instead of encoding the state through FSQ digits |
+| `emission=ConceptObjective` | construct each tick's latent directly from a soft mixture over named frontier cells |
 | `langset.probes` | the world-model property tests themselves — `calibration_corr` (entropy ↔ frontier size) and `linear_decodability` (probe the emitted latent), reused by `eval.py` so this signal isn't maze-only |
 
 None of this is a monolithic config: `multi_latent` builds the set-emission head, `selector` and `target_source`
@@ -70,9 +68,7 @@ plain eval helper. See [`train.py`](train.py) and [`eval.py`](eval.py).
 pip install "langset[probes]"                    # eval uses langset.probes (pulls in scipy + sklearn)
 
 python gen_maze.py build 4000 maze.npz          # training corpus (mixed sizes, ~55% solvable)
-python train.py --data maze.npz --out maze_model --wandb
-# named-state alternative: one softmax over cells, no residual
-python train.py --data maze.npz --out maze_concepts --concepts --code-source random --res-dim 0 --wandb
+python train.py --data maze.npz --out maze_model --code-source random --res-dim 0 --wandb
 python gen_maze.py build 800 maze_eval.npz 999  # DISJOINT eval corpus (different seed → no leakage)
 python eval.py  --data maze_eval.npz --ckpt maze_model
 ```
@@ -83,7 +79,7 @@ A tiny CPU smoke of the whole loop (seconds, no GPU):
 ```bash
 python gen_maze.py build 40 maze.npz
 python train.py --data maze.npz --out /tmp/m --device cpu --epochs 2 --bs 4 \
-                --backbone hf-internal-testing/tiny-random-LlamaForCausalLM --fsq-dim 32 --max-fut 8
+                --backbone hf-internal-testing/tiny-random-LlamaForCausalLM --max-fut 8
 python gen_maze.py build 80 maze_eval.npz 999
 python eval.py --data maze_eval.npz --ckpt /tmp/m --device cpu --max-steps 8
 ```
@@ -96,7 +92,7 @@ python eval.py --data maze_eval.npz --ckpt /tmp/m --device cpu --max-steps 8
 "B_calibration": { "corr_entropy_nbranch": 0.35, "count_decodability": { "bal_acc": ..., "baseline_majority": ... } }
 ```
 
-**`corr(entropy, nbranch) > 0`** is the result: the emitted latent's FSQ entropy rises with the frontier size,
+**`corr(entropy, nbranch) > 0`** is the result: the emitted latent's concept entropy rises with the frontier size,
 so the single latent carries a *calibrated* superposition rather than one guess. On a real 135M run (SmolLM2,
 30 epochs) this lands around **+0.34–0.39** (EMA twin / SIGReg), with frontier recall staying flat across branch
 counts `k=1..5` — the opposite of discretization collapse.
