@@ -13,8 +13,9 @@ import pytest
 import torch
 from multi_state_helpers import _args, _build_model
 
-from langset import Trainer
-from langset.trainer import _replay_ce, _tokenize_replay
+from langset import Trainer, TrainingArguments
+from langset.loss import LearnLossContext, learn_loss
+from langset.trainer import _tokenize_replay
 
 
 def _row0_replay_loss(m, docs, tgts, doc_side):
@@ -22,7 +23,19 @@ def _row0_replay_loss(m, docs, tgts, doc_side):
     di, dm = _tokenize_replay(m.tokenizer, docs, 64, doc_side, m.device)
     ti, tm = _tokenize_replay(m.tokenizer, tgts, 32, "right", m.device)
     with torch.no_grad():
-        return float(_replay_ce(m, di[:1], dm[:1], ti[:1], tm[:1], m.vocab_size))
+        return float(
+            learn_loss(
+                LearnLossContext(
+                    model=m,
+                    args=TrainingArguments(),
+                    pos=torch.tensor([0], device=m.device),
+                    ln_doc_ids=di,
+                    ln_doc_mask=dm,
+                    ln_tgt_ids=ti,
+                    ln_tgt_mask=tm,
+                )
+            ).to_tensor()
+        )
 
 
 def test_replay_ce_is_padding_invariant():
@@ -50,7 +63,7 @@ def test_replay_ce_is_padding_invariant():
 
 def test_replay_training_runs_multi_latent():
     # integration: emit rows + a couple varying-length learn rows, replay firing every step -> the rewired
-    # multi-latent learn path must train end-to-end (exercises _tokenize_replay + _replay_ce on real batches).
+    # multi-latent learn path must train end-to-end (exercises _tokenize_replay + learn_loss on real batches).
     from multi_state_helpers import _flat_trainable
 
     m = _build_model()
