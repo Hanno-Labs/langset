@@ -19,6 +19,18 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from langset.loss import (
+    CoTLossContext,
+    InfoNCELossContext,
+    SoftTargetCrossEntropyContext,
+    StopLossContext,
+    SupervisedContrastiveLossContext,
+    cot_loss,
+    info_nce_loss,
+    soft_target_cross_entropy_loss,
+    stop_loss,
+    supervised_contrastive_loss,
+)
 from langset.modeling import LangSetModel
 from langset.sigreg import SIGReg
 
@@ -27,35 +39,6 @@ if TYPE_CHECKING:  # annotations only (from __future__ import annotations -> str
 
     from langset.trainer import Trainer  # avoids a runtime import cycle trainer <-> strategies
     from langset.training_args import TrainingArguments
-
-
-def supcon_loss(z: torch.Tensor, labels: list[str], tau: float) -> torch.Tensor:
-    """Supervised-contrastive (Khosla et al.) over emitted latents: same-label items are positives (pulled together),
-    all others negatives (pushed apart) — a few group labels SHAPE the geometry into SEPARATE REGIONS. Being a proper
-    contrastive loss (each anchor has both positives and negatives) it separates without collapsing. Items whose label
-    is ''/'unknown'/'none'/'nan' are dropped. Returns 0 if fewer than two labelled items or no positive pair exists."""
-    dev = z.device
-    keep = [
-        k
-        for k, l in enumerate(labels)
-        if str(l).strip().lower() not in ("", "unknown", "none", "nan")
-    ]
-    if len(keep) < 2:
-        return z.new_zeros(())
-    zz = F.normalize(z[keep], p=2, dim=-1)
-    lab = [labels[k] for k in keep]
-    b = len(keep)
-    sim = (zz @ zz.t() / tau).masked_fill(torch.eye(b, device=dev, dtype=torch.bool), -1e9)
-    logp = sim - torch.logsumexp(sim, dim=1, keepdim=True)
-    pos = torch.tensor(
-        [[1.0 if (i != j and lab[i] == lab[j]) else 0.0 for j in range(b)] for i in range(b)],
-        device=dev,
-    )
-    npos = pos.sum(1)
-    has = npos > 0
-    if not bool(has.any()):
-        return z.new_zeros(())
-    return (-(pos * logp).sum(1)[has] / npos[has]).mean()
 
 
 # ---- per-step context handed to the aux loss terms ----------------------------------------------
@@ -150,17 +133,22 @@ class MultiNCETerm(_LossTerm):
             return None
         if not (a.lam_multi_nce > 0 and int(c.valid.sum()) > 1):
             return None
-        rvn = F.normalize(c.recon[c.valid], dim=-1)  # [N, d] emitted (gradient flows here)
-        tvn = F.normalize(c.target_lat[c.valid], dim=-1)  # [N, d] EMA targets (already stop-grad)
-        nce_logits = (rvn @ tvn.t()) / a.tau  # [N, N] query x key cosine / temp
-        n_nce = rvn.size(0)
-        fn_mask = torch.zeros(n_nce, n_nce, dtype=torch.bool, device=c.dev)
+        emitted = c.recon[c.valid]
+        targets = c.target_lat[c.valid]
+        emission_count = emitted.size(0)
+        fn_mask = torch.zeros(emission_count, emission_count, dtype=torch.bool, device=c.dev)
         for masker in self.maskers:
             masker(c, fn_mask)
-        nce_logits = nce_logits.masked_fill(
-            fn_mask, float("-inf")
-        )  # diagonal (positive) never masked
-        loss_nce = F.cross_entropy(nce_logits, torch.arange(n_nce, device=c.dev))
+        loss_nce = info_nce_loss(
+            InfoNCELossContext(
+                anchors=emitted,
+                candidates=targets,
+                positive_indices=torch.arange(emission_count, device=c.dev),
+                temperature=a.tau,
+                logit_mask=fn_mask,
+                normalize_embeddings=True,
+            )
+        ).to_tensor()
         return (self.key, loss_nce, a.lam_multi_nce)
 
 
@@ -178,9 +166,11 @@ class SupConTerm(_LossTerm):
             for r, k in enumerate(c.bidx)
             for j in range(c.lens_l[r])
         ]
-        loss_sup = supcon_loss(
-            c.recon[c.valid], sup_flat, a.sup_tau
-        )  # pull same-stage, push different-stage
+        loss_sup = supervised_contrastive_loss(
+            SupervisedContrastiveLossContext(
+                embeddings=c.recon[c.valid], labels=sup_flat, temperature=a.sup_tau
+            )
+        ).to_tensor()  # pull same-stage, push different-stage
         return (self.key, loss_sup, a.lam_sup)
 
 
@@ -233,7 +223,7 @@ class CoTGenTerm(_LossTerm):
             self_.cot_texts[k] for k in c.bidx
         ):  # no reasoning in this batch -> nothing to learn
             return None
-        tok, vsz = m.tokenizer, m.vocab_size
+        tok = m.tokenizer
 
         def _tokm(texts: list[str], mx: int, side: str) -> tuple[torch.Tensor, torch.Tensor]:
             e = tok(
@@ -254,17 +244,16 @@ class CoTGenTerm(_LossTerm):
         # silently condition short seeds' CoT on padding.)
         di, dm = _tokm([self_.input_text[k] for k in c.bidx], a.max_len, "left")
         ti, tm = _tokm([self_.cot_texts[k] or " " for k in c.bidx], a.max_len, "right")
-        seq = torch.cat([di, ti], dim=1)
-        am = torch.cat([dm, tm], dim=1)
-        hid = m._last_hidden(m._run_backbone(m.embed(seq), am, seq, 0))
-        sd = di.size(1)
-        ph = hid[:, sd - 1 : sd - 1 + ti.size(1), :]  # hidden that predicts each CoT token
-        # bf16 vocab projection (NOT .float()): the fp32 [b, T, |V|] logits were the OOM driver on the 80GB A100;
-        # CE reduces the softmax in fp32 internally, so bf16 logits are a numerically fine training signal.
-        lg = F.linear(ph, m.embed.weight)
-        loss_cot = F.cross_entropy(
-            lg.reshape(-1, vsz), ti.masked_fill(tm == 0, -100).reshape(-1), ignore_index=-100
-        )
+        loss_cot = cot_loss(
+            CoTLossContext(
+                model=m,
+                args=a,
+                seed_ids=di,
+                seed_mask=dm,
+                cot_ids=ti,
+                cot_mask=tm,
+            )
+        ).to_tensor()
         return (self.key, loss_cot, a.lam_cot)
 
 
@@ -408,7 +397,7 @@ class CodeSoftmaxObjective(_EmissionObjective):
         ep: int,
         ss_mask: Optional[torch.Tensor] = None,
     ) -> EmissionOut:
-        m, a, dev = self.m, self.a, self.dev
+        m, a = self.m, self.a
         ss_prob = a.ss_prob
         assert ss_prob is not None  # Trainer resolves the None sentinel before any emit
         eff_ss = ss_prob if a.ss_warmup <= 0 else ss_prob * min(1.0, ep / a.ss_warmup)
@@ -426,17 +415,15 @@ class CodeSoftmaxObjective(_EmissionObjective):
             w = F.relu(target_lat.float() @ code.t())  # [b, lmax, n_codes]
             w = w / w.sum(-1, keepdim=True).clamp_min(1e-9)
         # MEMBERSHIP: soft-target CE over the codes ALONE, at real emission slots.
-        cell_logp = F.log_softmax(code_logits[:, :lmax, 0, :].float(), -1)  # [b, lmax, n_codes]
-        loss_code = -(w * cell_logp).sum(-1)[valid].mean()
+        loss_code = soft_target_cross_entropy_loss(
+            SoftTargetCrossEntropyContext(
+                logits=code_logits[:, :lmax, 0, :].float(),
+                target_probabilities=w,
+                selection=valid,
+            )
+        ).to_tensor()
         # Termination is independent of the member distribution, so set width cannot weaken its supervision.
-        stop_lab = torch.zeros(b, lmax + 1, device=dev)
-        keep = torch.zeros(b, lmax + 1, dtype=torch.bool, device=dev)
-        for r, nl in enumerate(lens_l):
-            stop_lab[r, nl] = 1.0  # continue through the tick's members, then stop after the last
-            keep[r, : nl + 1] = True
-        loss_stop = F.binary_cross_entropy_with_logits(
-            stop_lg.squeeze(-1).float()[keep], stop_lab[keep]
-        )
+        loss_stop = stop_loss(StopLossContext(logits=stop_lg, lengths=lens_l)).to_tensor()
         # `recon` is the contract every loss term reads as "the model's emission, with gradient" (MultiNCETerm
         # and the emitter both build their query from it). The rollout's own recon is the TARGET here -- this
         # path is lossless, so it carries no gradient at all, and a term querying it would compare each target
@@ -561,7 +548,7 @@ class ConceptObjective(_EmissionObjective):
         ep: int,
         ss_mask: Optional[torch.Tensor] = None,
     ) -> EmissionOut:
-        m, a, dev = self.m, self.a, self.dev
+        m, a = self.m, self.a
         ss_prob = a.ss_prob
         assert ss_prob is not None
         eff_ss = ss_prob if a.ss_warmup <= 0 else ss_prob * min(1.0, ep / a.ss_warmup)
@@ -584,20 +571,18 @@ class ConceptObjective(_EmissionObjective):
             sel = seen[:, :, fi] & valid
             if not bool(sel.any()):
                 continue
-            logp = F.log_softmax(flat[..., m_lo:m_hi], -1)
-            li = -(tgt[..., m_lo:m_hi] * logp).sum(-1)[sel].mean()
+            li = soft_target_cross_entropy_loss(
+                SoftTargetCrossEntropyContext(
+                    logits=flat[..., m_lo:m_hi],
+                    target_probabilities=tgt[..., m_lo:m_hi],
+                    selection=sel,
+                )
+            ).to_tensor()
             losses.append(li)
             per_facet[f"c_{self.facets[fi]}"] = li
         loss_concept = torch.stack(losses).sum() if losses else flat.new_zeros(())
 
-        stop_lab = torch.zeros(b, lmax + 1, device=dev)
-        keep = torch.zeros(b, lmax + 1, dtype=torch.bool, device=dev)
-        for r, nl in enumerate(lens_l):
-            stop_lab[r, nl] = 1.0
-            keep[r, : nl + 1] = True
-        loss_stop = F.binary_cross_entropy_with_logits(
-            stop_lg.squeeze(-1).float()[keep], stop_lab[keep]
-        )
+        loss_stop = stop_loss(StopLossContext(logits=stop_lg, lengths=lens_l)).to_tensor()
 
         # the emission the rest of the trainer sees — WITH gradient, or every aux term silently idles
         p = m.head.concept_probs(code_logits[:, :lmax])
@@ -717,23 +702,18 @@ class StateResidualObjective(_EmissionObjective):
                 if members:
                     tgt[r, t, members] = 1.0 / len(members)
                     has[r, t] = True
-        cell_logp = F.log_softmax(code_logits[:, :lmax, 0, :].float(), -1)
-        sel = has & valid
-        loss_state = (
-            -(tgt * cell_logp).sum(-1)[sel].mean() if bool(sel.any()) else cell_logp.new_zeros(())
-        )
+        loss_state = soft_target_cross_entropy_loss(
+            SoftTargetCrossEntropyContext(
+                logits=code_logits[:, :lmax, 0, :].float(),
+                target_probabilities=tgt,
+                selection=has & valid,
+            )
+        ).to_tensor()
 
         # TERMINATION: its own sigmoid, never folded into the member softmax. Folding is only fair when the
         # member target is one-hot; against a 1/k-diffuse target the gradient suppressing STOP scales with
         # P(STOP), which weakens as the set widens, so the rollout truncates exactly where sets get wide.
-        stop_lab = torch.zeros(b, lmax + 1, device=dev)
-        keep = torch.zeros(b, lmax + 1, dtype=torch.bool, device=dev)
-        for r, nl in enumerate(lens_l):
-            stop_lab[r, nl] = 1.0
-            keep[r, : nl + 1] = True
-        loss_stop = F.binary_cross_entropy_with_logits(
-            stop_lg.squeeze(-1).float()[keep], stop_lab[keep]
-        )
+        loss_stop = stop_loss(StopLossContext(logits=stop_lg, lengths=lens_l)).to_tensor()
 
         # THE EMISSION the rest of the trainer sees: state mixture ++ residual, exactly what feeds back. It must
         # be the emission WITH gradient -- every aux term (in-batch NCE, hard negatives) builds its query from

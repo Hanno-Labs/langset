@@ -28,6 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from langset.loss import BridgeLossContext, bridge_loss
 from langset.strategies import EmissionOut, _EmissionObjective, _TargetSource
 
 if TYPE_CHECKING:
@@ -196,18 +197,23 @@ class QueryBridgeEmission(_EmissionObjective):
                 vlab[r, p] = 1.0
             off += mi
 
-        if matched_pred:
-            mp = torch.stack(matched_pred)  # [K, d]
-            pos_t = torch.tensor(pos, device=dev)
-            nce = F.cross_entropy(
-                mp @ bank.T / self.temp, pos_t
-            )  # each emission retrieves its own target
-        else:
-            nce = target_lat.new_zeros(())
-        vloss = F.binary_cross_entropy_with_logits(
-            vlog, vlab, pos_weight=torch.tensor(self.pos_weight, device=dev)
+        matched_predictions = torch.stack(matched_pred) if matched_pred else vecs.new_empty((0, d))
+        positive_indices = torch.tensor(pos, device=dev)
+        losses = bridge_loss(
+            BridgeLossContext(
+                matched_predictions=matched_predictions,
+                target_bank=bank,
+                positive_indices=positive_indices,
+                validity_logits=vlog,
+                validity_labels=vlab,
+                temperature=self.temp,
+                validity_weight=self.lam_valid,
+                positive_weight=self.pos_weight,
+            )
         )
-        base = nce + self.lam_valid * vloss
+        nce = losses.info_nce.to_tensor()
+        vloss = losses.validity.to_tensor()
+        base = losses.to_tensor()
         zero = target_lat.new_zeros(())
         return EmissionOut(
             recon=recon,

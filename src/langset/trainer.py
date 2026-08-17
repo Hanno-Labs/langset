@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import random
 from contextlib import AbstractContextManager
+from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional, cast
 
@@ -19,6 +20,14 @@ import torch.nn.functional as F
 
 from langset import selection
 from langset.heads import Head, RtHead, resolve_head
+from langset.loss import (
+    LearnLossContext,
+    ReconstructionLossContext,
+    SLContext,
+    learn_loss,
+    recon_loss,
+    sl_loss,
+)
 from langset.modeling import LangSetModel
 from langset.strategies import (
     MultiStepCtx,
@@ -113,7 +122,7 @@ def _tokenize_replay(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Tokenize replay text with an EXPLICIT padding side. The doc (the conditioning context) MUST be left-padded
     so every row's last real token lands in the final column — that's the position whose hidden predicts the first
-    target token in `_replay_ce`. The target is right-padded (its pad is masked out of the CE). Defaulting the side
+    target token in `learn_loss`. The target is right-padded (its pad is masked out of the CE). Defaulting the side
     (right-pad the doc) silently conditions the replay loss on padding for any row shorter than the batch max."""
     e = tok(
         texts,
@@ -163,33 +172,6 @@ def _restore_best(m: LangSetModel, best_state: dict[str, Any]) -> None:
         m.aux_heads[name].load_state_dict(sd)
 
 
-def _replay_ce(
-    model: LangSetModel,
-    doc_ids: torch.Tensor,
-    doc_mask: torch.Tensor,
-    tgt_ids: torch.Tensor,
-    tgt_mask: torch.Tensor,
-    vocab_size: int,
-) -> torch.Tensor:
-    """Teacher-forced next-token CE for a text-replay (rehearsal) row: condition on the doc, score CE on the target
-    tokens only, projected through the tied input embedding (no lm_head, no full-vocab OOM). REQUIRES the doc to be
-    left-padded (see `_tokenize_replay`) so column `sd-1` is the last REAL doc token for every row regardless of its
-    length; the target is right-padded and its pad positions are ignored. Shared by both learn paths."""
-    seq = torch.cat([doc_ids, tgt_ids], dim=1)
-    am = torch.cat([doc_mask, tgt_mask], dim=1)
-    hid = model._last_hidden(
-        model._run_backbone(model.embed(seq), am, seq, 0)
-    )  # all real tokens -> real_start=0
-    sd = doc_ids.size(1)
-    ph = hid[:, sd - 1 : sd - 1 + tgt_ids.size(1), :]  # the hidden that predicts each target token
-    lg = F.linear(ph.float(), model.embed.weight.float())  # [B, St, vocab] via the tied embedding
-    return F.cross_entropy(
-        lg.reshape(-1, vocab_size),
-        tgt_ids.masked_fill(tgt_mask == 0, -100).reshape(-1),
-        ignore_index=-100,
-    )
-
-
 # ---- single-latent step engines -----------------------------------------------------------------
 # The real axis of the single-latent path is "where do pred/target/hard-neg features come from, and how is the
 # step run": the LIVE backbone (default) vs. FROZEN-POOL cached vectors (pool_mode="last" + frozen backbone). Both
@@ -209,10 +191,6 @@ class _StepEngine:
         self, idx: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """-> (pred [B,d] grad flows, target [B,d] honoring stop_grad_target, hard_neg [Hn,d] or None)."""
-        raise NotImplementedError
-
-    def recon(self, pred: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-        """Recon aux scalar. Only defined/called when supports_recon."""
         raise NotImplementedError
 
     def val_embeddings(self, val_idx: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -237,14 +215,12 @@ class BackboneStepEngine(_StepEngine):
         t2_mask: torch.Tensor,
         hn_ids: Optional[torch.Tensor],
         hn_mask: Optional[torch.Tensor],
-        recon_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         input_text: list[str],
         target_text: list[str],
     ) -> None:
         self.m, self.a, self.tok = model, args, tok
         self.ids, self.mask, self.t2_ids, self.t2_mask = ids, mask, t2_ids, t2_mask
         self.hn_ids, self.hn_mask = hn_ids, hn_mask
-        self._recon_fn = recon_fn
         self.input_text, self.target_text = input_text, target_text
 
     def featurize(
@@ -283,9 +259,6 @@ class BackboneStepEngine(_StepEngine):
                 assert self.hn_mask is not None  # populated alongside hn_ids
                 hn = m(*_dyn_trim(self.hn_ids[idx], self.hn_mask[idx]))
         return pred, target, hn
-
-    def recon(self, pred: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-        return self._recon_fn(pred, idx)
 
     def val_embeddings(self, val_idx: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         emit_in = np.asarray(
@@ -644,7 +617,9 @@ class Trainer:
         rng = np.random.default_rng(a.seed)
         tok = m.tokenizer
 
+        # Convert all text to tokenized tensors
         def tok_to(texts: list[str], mx: int) -> tuple[torch.Tensor, torch.Tensor]:
+            """Tokenize text to input_ids and attention_mask tensors"""
             e = tok(texts, padding=True, truncation=True, max_length=mx, return_tensors="pt")
             return e["input_ids"].to(dev), e["attention_mask"].to(dev)
 
@@ -659,7 +634,7 @@ class Trainer:
         ):  # hard-neg view (empty "" rows tokenize fine, masked below)
             hn_ids, hn_mask = tok_to([t or " " for t in self.hard_neg_text], a.max_len)
 
-        # knowledge-injection: learn rows go to a SEPARATE next-token-CE pool; the contrastive split is embed-only.
+        # texts associated with knowledge injection
         learn_pool = [i for i in range(len(self.input_text)) if self.is_learn[i]]
         ln_doc_ids = ln_doc_mask = ln_tgt_ids = ln_tgt_mask = None
         if learn_pool:
@@ -670,54 +645,14 @@ class Trainer:
                 tok, [self.target_text[i] for i in learn_pool], _LEARN_TGT, "right", dev
             )  # target RIGHT-pad
 
+        # shuffle indices for training/validation split
         n = len(self.input_text)
         embed_all = np.array([i for i in range(n) if not self.is_learn[i]])
         embed_perm = embed_all[rng.permutation(len(embed_all))]
         n_val = max(4, int(len(embed_perm) * a.val_frac))
         val_idx, tr_idx = embed_perm[:n_val], embed_perm[n_val:]
 
-        # recon aux: latent -> K soft tokens -> backbone decodes target_text (token CE). Grounds the latent in the
-        # text. `connector` is TRAINING-ONLY scaffolding (not saved; inference just emits the latent).
-        hsz, vsz = m.h, m.vocab_size
-        connector = torch.nn.Linear(m.latent_dim, _RECON_K * hsz).to(dev)
-
-        def recon_loss(latent: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
-            ti, tm = tr_ids[rows], tr_mask[rows]
-            temb = m.embed(ti)
-            soft = connector(latent).view(latent.size(0), _RECON_K, hsz).to(temb.dtype)
-            seq = torch.cat([soft, temb], dim=1)
-            am = torch.cat(
-                [torch.ones(latent.size(0), _RECON_K, device=dev, dtype=tm.dtype), tm], dim=1
-            )
-            out = m._run_backbone(
-                seq, am, ti, _RECON_K
-            )  # soft tokens synthetic; real target tokens at [K:]
-            sl = slice(_RECON_K - 1, _RECON_K - 1 + ti.size(1))
-            lg = getattr(out, "logits", None)
-            if lg is not None:  # model exposes an lm_head
-                pred_lg = lg[:, sl, :].float()
-            else:  # text tower (no lm_head): project only the recon positions
-                hid = m._last_hidden(out)[
-                    :, sl, :
-                ]  # via the tied input embedding -> avoids full-seq 262k OOM
-                pred_lg = F.linear(hid.float(), m.embed.weight.float())
-            return F.cross_entropy(
-                pred_lg.reshape(-1, vsz),
-                ti.masked_fill(tm == 0, -100).reshape(-1),
-                ignore_index=-100,
-            )
-
-        def learn_loss(pos: torch.Tensor) -> torch.Tensor:
-            # [LEARN] rows: teacher-forced causal LM. Condition on the LEFT-padded case, CE ONLY on the substance
-            # tokens -> forces the backbone's hidden states to REPRESENT the substance (builds the axis the probe
-            # found missing). Shared _replay_ce (tied-embedding projection on the target span only, no lm_head/OOM).
-            assert (
-                ln_doc_ids is not None and ln_doc_mask is not None
-            )  # learn_loss runs only when learn_pool set them
-            assert ln_tgt_ids is not None and ln_tgt_mask is not None
-            return _replay_ce(
-                m, ln_doc_ids[pos], ln_doc_mask[pos], ln_tgt_ids[pos], ln_tgt_mask[pos], vsz
-            )
+        connector = torch.nn.Linear(m.latent_dim, _RECON_K * m.h).to(dev)
 
         opt = torch.optim.AdamW(
             [p for p in m.parameters() if p.requires_grad] + list(connector.parameters()),
@@ -725,8 +660,7 @@ class Trainer:
         )
         run = None
         if a.report_to == "wandb":
-            import wandb  # type: ignore[import-untyped]  # ty: ignore[unresolved-import]  # optional dep, not installed
-
+            wandb = import_module("wandb")
             run = wandb.init(project=a.wandb_project, config=_wandb_config(a))
 
         best_score, best_state, no_improve = -1e9, None, 0
@@ -746,6 +680,8 @@ class Trainer:
                 flush=True,
             )  # a DIFFERENT model/data/config can never resume us
             ck = None
+
+        # code associated with resuming from a checkpoint
         if ck is not None:
             _params = dict(m.named_parameters())
             for nm, t in ck["trainable"].items():
@@ -820,7 +756,6 @@ class Trainer:
                 t2_mask,
                 hn_ids,
                 hn_mask,
-                recon_loss,
                 self.input_text,
                 self.target_text,
             )
@@ -858,51 +793,6 @@ class Trainer:
                 flush=True,
             )
 
-        def _sl_loss(
-            pred: torch.Tensor,
-            target: torch.Tensor,
-            hn: Optional[torch.Tensor],
-            idx: torch.Tensor,
-        ) -> torch.Tensor:
-            """Single-latent contrastive loss as a PURE FUNCTION OF THE EMBEDDINGS (pred/target/hn) — the
-            GradCache-compatible factoring of the inline step below. Contains every term that reads only the
-            pooled embeddings (in-batch-negative InfoNCE + false-neg / hard-neg masking facets +
-            uniformity); the recon aux is NOT here (it needs the per-token backbone graph, so it stays on the
-            direct path and grad_cache asserts lam_recon==0). Byte-identical math to the inline step, so
-            grad_cache=False is unchanged."""
-            tmat = target if hn is None else torch.cat([target, hn], dim=0)
-            logits = (pred @ tmat.t()) / a.tau  # in-batch negatives force separation (no collapse)
-            B = len(idx)
-            neg_mask = torch.zeros(B, logits.size(1), dtype=torch.bool, device=dev)
-            if self.mask_keys is not None:  # in-batch block: drop same-issue false negatives
-                bkeys = [self.mask_keys[j] for j in idx.tolist()]
-                for r in range(B):
-                    kr = bkeys[r]
-                    if not kr:
-                        continue
-                    for c in range(B):
-                        if r != c and (kr & bkeys[c]):
-                            neg_mask[r, c] = True
-            if (
-                hn_ids is not None
-            ):  # PER-ANCHOR-ONLY hard neg: anchor i sees ONLY its own mined hard neg (col B+i)
-                hnt = self.hard_neg_text
-                assert hnt is not None
-                valid = [bool(hnt[j]) for j in idx.tolist()]
-                for r in range(B):
-                    for c in range(B):
-                        if not (r == c and valid[c]):
-                            neg_mask[r, B + c] = True
-            if bool(neg_mask.any()):
-                logits = logits.masked_fill(
-                    neg_mask, float("-inf")
-                )  # diagonal (positive) always kept
-            loss = F.cross_entropy(logits, torch.arange(B, device=dev))  # primary
-            if a.lam_uniform > 0 and B > 1:  # aux: uniformity
-                sq = torch.pdist(F.normalize(pred, p=2, dim=-1), p=2).pow(2)
-                loss = loss + a.lam_uniform * sq.mul(-2.0).exp().mean().log()
-            return loss
-
         def _grad_cache_step(idx: torch.Tensor) -> float:
             """GradCache: EXACT full-batch contrastive gradient with peak activation = one gc_chunk (Gao et al.
             2021). Lets `batch_size` (in-batch negatives) grow far past what one graph fits. Phase 1 encodes the
@@ -929,9 +819,18 @@ class Trainer:
             if not a.stop_grad_target:
                 tf.requires_grad_(True)
             hf = torch.cat(hns) if hns else None  # hard negs stay no_grad (as in featurize)
-            loss = _sl_loss(
-                pf, tf, hf, idx
-            )  # full-batch loss -> cached rep grads (+ emb_slot head grads)
+            loss = sl_loss(
+                SLContext(
+                    model=m,
+                    args=a,
+                    pred=pf,
+                    target=tf,
+                    hn=hf,
+                    idx=idx,
+                    mask_keys=self.mask_keys,
+                    hard_neg_text=self.hard_neg_text,
+                )
+            ).to_tensor()  # full-batch loss -> cached rep grads (+ emb_slot head grads)
             opt.zero_grad()
             loss.backward()  # fills pf.grad (+ tf.grad unless stop-grad, + slot-head params); backbone NOT in this graph
             gp = pf.grad
@@ -995,7 +894,19 @@ class Trainer:
                         ),
                         device=dev,
                     )
-                    lloss = learn_loss(lp)
+                    assert ln_doc_ids is not None and ln_doc_mask is not None
+                    assert ln_tgt_ids is not None and ln_tgt_mask is not None
+                    lloss = learn_loss(
+                        LearnLossContext(
+                            model=m,
+                            args=a,
+                            pos=lp,
+                            ln_doc_ids=ln_doc_ids,
+                            ln_doc_mask=ln_doc_mask,
+                            ln_tgt_ids=ln_tgt_ids,
+                            ln_tgt_mask=ln_tgt_mask,
+                        )
+                    ).to_tensor()
                     opt.zero_grad()
                     lloss.backward()
                     opt.step()
@@ -1009,15 +920,36 @@ class Trainer:
                     pred, target, hn = engine.featurize(
                         idx
                     )  # engine owns WHERE features come from (backbone vs cached)
-                    # HARD NEGATIVES flow through _sl_loss as extra negative columns; grad still reaches only `pred`.
-                    loss = _sl_loss(
-                        pred, target, hn, idx
-                    )  # InfoNCE + false-neg/hard-neg masking + uniformity (factored above)
+                    # Hard negatives are extra contrastive columns; gradients reach only ``pred``.
+                    loss = sl_loss(
+                        SLContext(
+                            model=m,
+                            args=a,
+                            pred=pred,
+                            target=target,
+                            hn=hn,
+                            idx=idx,
+                            mask_keys=self.mask_keys,
+                            hard_neg_text=self.hard_neg_text,
+                        )
+                    ).to_tensor()
                     if (
                         engine.supports_recon and a.lam_recon > 0
                     ):  # aux: grounding. At 0 the term is zero anyway;
                         loss = (
-                            loss + a.lam_recon * engine.recon(pred, idx)
+                            loss
+                            + a.lam_recon
+                            * recon_loss(
+                                ReconstructionLossContext(
+                                    model=m,
+                                    args=a,
+                                    latent=pred,
+                                    rows=idx,
+                                    tr_ids=tr_ids,
+                                    tr_mask=tr_mask,
+                                    connector=connector,
+                                )
+                            ).to_tensor()
                         )  # SKIP so recon's fp32 full-vocab ([B,S,vocab]) projection graph is NOT built every step
                         #  (that graph, not the stripped lm_head, OOM'd a 0.6B at 84GB without grad_ckpt). Also lets
                         #  frozen-pool run. Direct path only: grad_cache asserts lam_recon==0 (embedding-only caching
@@ -1081,7 +1013,19 @@ class Trainer:
                     rv, tot_v = 0.0, 0
                     for s in range(0, len(val_idx), a.batch_size):
                         vb = torch.tensor(val_idx[s : s + a.batch_size], device=dev)
-                        rv += float(recon_loss(m(ids[vb], mask[vb]), vb)) * len(vb)
+                        rv += float(
+                            recon_loss(
+                                ReconstructionLossContext(
+                                    model=m,
+                                    args=a,
+                                    latent=m(ids[vb], mask[vb]),
+                                    rows=vb,
+                                    tr_ids=tr_ids,
+                                    tr_mask=tr_mask,
+                                    connector=connector,
+                                )
+                            ).to_tensor()
+                        ) * len(vb)
                         tot_v += len(vb)
                     recon_val = rv / tot_v
                 # recon_val is teacher-forced -> blind to collapse; hard-penalize high collapse so a collapsed epoch
@@ -1250,8 +1194,7 @@ class Trainer:
         opt = torch.optim.AdamW(params + transient_head_params, lr=a.lr)
         run = None
         if a.report_to == "wandb":
-            import wandb  # type: ignore[import-untyped]  # ty: ignore[unresolved-import]  # optional dep, not installed
-
+            wandb = import_module("wandb")
             run = wandb.init(project=a.wandb_project, config=_wandb_config(a))
 
         @torch.no_grad()
@@ -1455,7 +1398,6 @@ class Trainer:
             i for i in range(len(seeds)) if getattr(self, "is_learn", [False] * len(seeds))[i]
         ]
         ln_doc_ids = ln_doc_mask = ln_tgt_ids = ln_tgt_mask = None
-        vsz = m.vocab_size
 
         if learn_pool:
             ln_doc_ids, ln_doc_mask = _tokenize_replay(
@@ -1468,15 +1410,6 @@ class Trainer:
                 "right",
                 dev,
             )  # target RIGHT-pad
-
-        def learn_loss(pos: torch.Tensor) -> torch.Tensor:  # shared teacher-forced replay CE
-            assert (
-                ln_doc_ids is not None and ln_doc_mask is not None
-            )  # runs only when learn_pool set them
-            assert ln_tgt_ids is not None and ln_tgt_mask is not None
-            return _replay_ce(
-                m, ln_doc_ids[pos], ln_doc_mask[pos], ln_tgt_ids[pos], ln_tgt_mask[pos], vsz
-            )
 
         if a.grad_cache:  # multi-latent GradCache: reject the configs it cannot keep exact for the cross-batch term
             assert float(m.head.drop.p) == 0.0, (
@@ -1623,8 +1556,20 @@ class Trainer:
                         device=dev,
                         dtype=torch.long,
                     )
+                    assert ln_doc_ids is not None and ln_doc_mask is not None
+                    assert ln_tgt_ids is not None and ln_tgt_mask is not None
                     opt.zero_grad()
-                    lloss = learn_loss(lp)
+                    lloss = learn_loss(
+                        LearnLossContext(
+                            model=m,
+                            args=a,
+                            pos=lp,
+                            ln_doc_ids=ln_doc_ids,
+                            ln_doc_mask=ln_doc_mask,
+                            ln_tgt_ids=ln_tgt_ids,
+                            ln_tgt_mask=ln_tgt_mask,
+                        )
+                    ).to_tensor()
                     lloss.backward()
                     opt.step()
                     agg["learn_loss"] = agg.get("learn_loss", 0.0) + float(lloss.detach())
