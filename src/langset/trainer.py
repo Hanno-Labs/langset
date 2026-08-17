@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import random
 from contextlib import AbstractContextManager
+from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional, cast
 
@@ -659,8 +660,7 @@ class Trainer:
         )
         run = None
         if a.report_to == "wandb":
-            import wandb  # type: ignore[import-untyped]  # optional dep, not installed
-
+            wandb = import_module("wandb")
             run = wandb.init(project=a.wandb_project, config=_wandb_config(a))
 
         best_score, best_state, no_improve = -1e9, None, 0
@@ -1194,8 +1194,7 @@ class Trainer:
         opt = torch.optim.AdamW(params + transient_head_params, lr=a.lr)
         run = None
         if a.report_to == "wandb":
-            import wandb  # type: ignore[import-untyped]  # optional dep, not installed
-
+            wandb = import_module("wandb")
             run = wandb.init(project=a.wandb_project, config=_wandb_config(a))
 
         @torch.no_grad()
