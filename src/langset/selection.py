@@ -1,6 +1,12 @@
-"""Validation metrics for early-stop. The hard-won rule: NEVER select on training loss — a contrastive objective
-can minimize it by COLLAPSING the geometry. Selection scores held-out input-view <-> target-view retrieval and
-held-out reconstruction, with a hard collapse penalty (see Trainer)."""
+"""Collapse-aware validation metrics for checkpoint selection.
+
+Training loss is deliberately not used to select the best model: a contrastive
+objective can reduce its loss by collapsing the representation geometry. These
+metrics instead evaluate held-out input-to-target retrieval and reconstruction,
+then apply a hard penalty when the embedding geometry collapses. The trainer
+uses them for early stopping and checkpoint selection so optimization and model
+selection measure different things.
+"""
 
 from __future__ import annotations
 

@@ -1,4 +1,31 @@
-"""Loss functions."""
+"""Composable loss objectives used by langset's training strategies.
+
+This module separates the mathematical objectives from the training loop.
+Each loss function accepts a typed context dataclass containing the tensors
+and configuration it needs, and returns a :class:`Loss`. The trainer can then
+combine the result with other objectives and call ``to_tensor()`` for the
+scalar used in backpropagation.
+
+The objectives fall into four groups:
+
+- **Latent grounding:** :func:`recon_loss` teaches an emitted latent to
+  reconstruct its target text.
+- **Representation alignment:** :func:`sl_loss` and :func:`info_nce_loss`
+  align paired embeddings and contrastive candidates. The supervised
+  contrastive objective groups emitted embeddings by labels.
+- **Multi-latent supervision:** :func:`soft_target_cross_entropy_loss`
+  trains distributions over concepts or states, while :func:`stop_loss`
+  teaches autoregressive emissions when to terminate.
+- **Text-generation support:** :func:`learn_loss` rehearses document-to-target
+  associations, and :func:`cot_loss` trains optional chain-of-thought
+  generation.
+
+The context classes are intentionally explicit: they document tensor shapes,
+make each objective independently testable, and keep loss implementations
+decoupled from batch construction and optimization orchestration. Most users
+will select these objectives through a strategy or ``TrainingArguments``
+configuration rather than call them directly.
+"""
 
 from __future__ import annotations
 

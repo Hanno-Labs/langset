@@ -1,13 +1,8 @@
-"""Swappable training strategies for the multi-latent trainer (GoF Strategy pattern).
+"""Interchangeable strategies for multi-latent training.
 
-The multi-latent step is assembled from a few interchangeable pieces — the emission objective, the target
-source, the aux loss terms, plus small function-strategies (epoch ordering, checkpoint selection, seed
-building). Each is a class or callable with a fixed interface and a DEFAULT implementation here that reproduces
-the historical behavior byte-for-byte (guarded by tests/test_trainer_multi_characterization.py).
-
-`TrainingArguments` holds these as INJECTABLE fields (defaults below), so selecting a different behavior is
-passing a different implementation — `TrainingArguments(target_source=SIGRegTarget)` — not toggling a flag that
-the trainer then branches on. The trainer builds each once and uses it with no per-feature `if`.
+A training step combines an emission objective, a target source, optional loss terms, and small callables for
+epoch ordering, checkpoint selection, and seed construction. :class:`TrainingArguments` stores the selected
+implementations, which are instantiated once and used through shared interfaces.
 """
 
 from __future__ import annotations
@@ -44,13 +39,11 @@ if TYPE_CHECKING:  # annotations only (from __future__ import annotations -> str
 # ---- per-step context handed to the aux loss terms ----------------------------------------------
 @dataclass
 class MultiStepCtx:
-    """Read-only snapshot of ONE multi-latent training step, handed to every aux `_LossTerm`. Assembled right
-    after the emission forward; a term pulls the few fields it needs and returns its contribution (or None).
+    """Inputs shared by auxiliary loss terms for one multi-latent step.
 
-    Shape legend used below: B = rows in this batch · L = `lmax` (max emitted items across the batch's rows,
-    the padded time dim) · N = number of VALID emissions in the batch (= Σ lens_l, since rows differ in length)
-    · d = latent dim. The canonical flattened view a term works in is `recon[valid]` -> [N, d],
-    and `flat_texts` / `lens_l` / `bidx` are all aligned to that same row-major order.
+    ``recon`` and ``target_lat`` have shape ``[B, L, d]`` and ``valid`` marks the ``N`` real emission slots.
+    Indexing either latent tensor with ``valid`` produces the canonical flattened ``[N, d]`` view.
+    ``flat_texts``, ``lens_l``, and ``bidx`` follow the same row-major ordering.
     """
 
     trainer: Trainer  # the owning Trainer; read its PER-ROW data (indexed by dataset row id):
@@ -84,16 +77,15 @@ class MultiStepCtx:
 
 # ---- aux loss terms -----------------------------------------------------------------------------
 class _LossTerm:
-    """Strategy for one weighted, optional term added on top of the base emission loss (one per historical
-    `if a.lam_x > 0:` block). Terms are built once and iterated each step; each self-skips when inapplicable."""
+    """Interface for an optional weighted term added to the base emission loss.
+
+    Terms are built once, evaluated each step, and return ``None`` when their required inputs or weights are absent.
+    """
 
     key: str = ""  # this term's log/agg name (e.g. "loss_multi_nce"); set by each subclass
-    isolated_backward: bool = (
-        False  # if True the term is NOT summed into the shared loss; instead the trainer runs
-    )
-    #                                     its forward+backward SEPARATELY, AFTER the main loss.backward() has freed its
-    #                                     graph, so the two graphs never coexist (peak activation = max, not sum). Grads
-    #                                     accumulate into .grad before the single opt.step() -> same step, batch unchanged.
+    # Isolated terms run after the shared loss backward pass, so their graph does not coexist with the main graph.
+    # Their gradients accumulate before the same optimizer step.
+    isolated_backward: bool = False
 
     def contribute(self, c: MultiStepCtx) -> Optional[tuple[str, torch.Tensor, float]]:
         """Compute this term for the step described by `c`. Return `(key, raw_unweighted_loss, weight)` — the
@@ -103,9 +95,10 @@ class _LossTerm:
 
 
 def identical_text_mask(c: MultiStepCtx, fn_mask: torch.Tensor) -> None:
-    """A negative-mask: MUTATES `fn_mask` ([N, N] bool, N = valid emissions) in place, setting [i, j] = True for
-    pairs that must NOT be treated as negatives of each other. Default policy: two emissions with IDENTICAL
-    target text share the same true geometry, so they aren't negatives (mirrors the single-latent mask_keys path)."""
+    """Mask pairs with identical target text from the in-batch negative set.
+
+    Mutates the ``[N, N]`` boolean ``fn_mask`` in place by setting excluded pairs to ``True``.
+    """
     grp: dict[str, list[int]] = {}
     for ii, tx in enumerate(c.flat_texts):  # flat_texts is row-major aligned with recon[valid]
         grp.setdefault(tx, []).append(ii)
@@ -118,9 +111,11 @@ def identical_text_mask(c: MultiStepCtx, fn_mask: torch.Tensor) -> None:
 
 
 class MultiNCETerm(_LossTerm):
-    """IN-BATCH-NEGATIVE InfoNCE: each emitted recon vs the batch's EMA targets, own target = positive, others
-    = negatives, minus the `maskers`' false-negatives. On by default (lam_multi_nce). Ported from the
-    single-latent self-contrastive loss."""
+    """Apply in-batch InfoNCE between emitted latents and target-source latents.
+
+    Each emission is paired with its aligned target. Other targets act as negatives unless excluded by a configured
+    masker. The term is controlled by ``lam_multi_nce`` and is skipped when the target source suppresses NCE.
+    """
 
     key = "loss_multi_nce"
 
@@ -198,21 +193,21 @@ class PhaseTerm(_LossTerm):
 
 
 def build_loss_terms(args: TrainingArguments) -> list[_LossTerm]:
-    """DEFAULT loss-term set, built once from the args. Fixed order (label -> multi_nce -> hard_neg -> sup) so the
-    float summation is byte-identical; each term self-skips when its weight/column is absent. Inject
-    `TrainingArguments(loss_terms=...)` with your own builder (or add terms like CoTGenTerm) to change the set.
-    NOTE: the phase head is no longer a term here — it is the `phase` instance of the generic AUXILIARY-HEAD plug
-    (langset.heads), applied inline in `_train_multi` right after this loop (the same summation position the old
-    `PhaseTerm` held, so lam_phase>0 stays byte-identical). `PhaseTerm` is kept for back-compat injection."""
+    """Build the default auxiliary loss terms.
+
+    Returns an in-batch InfoNCE term with identical-text false-negative masking, followed by the
+    supervised-contrastive term. Each term skips itself when its required weight or dataset labels are absent.
+    """
     return [MultiNCETerm(maskers=[identical_text_mask]), SupConTerm()]
 
 
 class CoTGenTerm(_LossTerm):
-    """Exp-B: teach the model to GENERATE the row's chain-of-thought from the clean seed (doc=seed -> target=
-    cot_text) via the tied embedding — the SAME CE machinery the latents use, co-trained in the same step.
-    `isolated_backward` so its (long) CoT graph never coexists with the latent graph. Pairs with the seed+CoT
-    conditioning that `cot_seed_texts` applies to the emission forward — inject BOTH (see build_cot_loss_terms).
-    Self-skips when the batch's rows carry no CoT text (so it's inert if injected without a `cot_text` column)."""
+    """Train next-token generation of each row's ``cot_text`` from its input seed.
+
+    The term uses an isolated backward pass so its long generation graph does not coexist with the latent-emission
+    graph. Pair it with :func:`cot_seed_texts` when emissions should also condition on the provided reasoning.
+    Batches without reasoning text are skipped.
+    """
 
     key = "loss_cot"
     isolated_backward = True
@@ -236,12 +231,9 @@ class CoTGenTerm(_LossTerm):
             )
             return e["input_ids"].to(dev), e["attention_mask"].to(dev)
 
-        # CoT blocks are long (p50~726, p90~1541 tok) -> keep full a.max_len, don't truncate hard. Pin padding sides
-        # EXPLICITLY (not the tokenizer's mutable default): the SEED is LEFT-padded so its last real token lands at
-        # index sd-1 (the position that predicts the first CoT token), and the CoT is RIGHT-padded so its real tokens
-        # sit adjacent to the seed with pads trailing -> no padding between seed and CoT, and the CE never conditions
-        # on a pad hidden. (Mirrors the emission forward's left-pad; a right-defaulting tokenizer would otherwise
-        # silently condition short seeds' CoT on padding.)
+        # Keep reasoning blocks up to the configured sequence limit. Seeds are left-padded so their final real token
+        # predicts the first reasoning token; reasoning targets are right-padded so no padding separates seed and
+        # target tokens, and padding remains excluded from cross-entropy.
         di, dm = _tokm([self_.input_text[k] for k in c.bidx], a.max_len, "left")
         ti, tm = _tokm([self_.cot_texts[k] or " " for k in c.bidx], a.max_len, "right")
         loss_cot = cot_loss(
@@ -258,9 +250,10 @@ class CoTGenTerm(_LossTerm):
 
 
 def build_cot_loss_terms(args: TrainingArguments) -> list[_LossTerm]:
-    """Exp-B loss set — INJECT via `TrainingArguments(loss_terms=build_cot_loss_terms)` (pair with
-    `seed_builder=cot_seed_texts`). The DEFAULT terms plus CoTGenTerm (isolated-backward), so the model is
-    co-trained to generate the row's reasoning while it emits the latents. Needs a `cot_text` dataset column."""
+    """Build the default auxiliary terms plus :class:`CoTGenTerm`.
+
+    Use with ``seed_builder=cot_seed_texts`` and a dataset containing ``cot_text``.
+    """
     return [*build_loss_terms(args), CoTGenTerm()]
 
 
@@ -278,10 +271,12 @@ class EmissionOut:
 
 
 class _EmissionObjective:
-    """Strategy for turning the seeded forward into emitted latents + the base emission loss. Selected ONCE per run so the step loop has no
-    emission `if`s. `codebook` is a class flag the free-run rollout reads to pick which emission head to use
-    (True = autoregressive codebook, False = strategy-owned continuous vectors). All objectives share the __init__ signature
-    (model, args, dev, trainer) so they are interchangeable as an injected `TrainingArguments.emission`."""
+    """Interface for multi-latent emission objectives.
+
+    An objective converts seeded inputs and target latents into gradient-bearing emitted latents and a base loss.
+    ``codebook`` indicates whether inference uses the model's autoregressive codebook rollout. Implementations share
+    a common constructor and can be selected through ``TrainingArguments.emission``.
+    """
 
     codebook: bool = True
 
@@ -322,11 +317,12 @@ class _EmissionObjective:
         d: int,
         dev: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, list[int], int]:
-        """Shape the per-row target item lists + their encoded latents into the emission's teacher-forcing tensors
-        `(target_lat [B,L,d], valid [B,L], lens_l, lmax)`. EXTRACTED verbatim from the trainer's inline block so the
-        STRATEGY owns target↔slot shaping: the autoregressive default is positional teacher forcing (item i -> slot i); a
-        future matching family (DETR/parallel-query) overrides this (e.g. all-valid, assignment deferred to its own
-        Hungarian match inside emit()). Pure tensor assembly — no model forward."""
+        """Arrange encoded target items into padded teacher-forcing tensors.
+
+        Returns ``(target_lat, valid, lens_l, lmax)``. ``target_lat`` has shape ``[B, L, d]``, ``valid`` marks real
+        target slots, ``lens_l`` contains per-row lengths, and ``lmax`` is the padded sequence length. The default
+        implementation preserves target-item order and performs no model forward.
+        """
         lmax = max(len(x) for x in ent_lists)
         b = len(ent_lists)
         target_lat = torch.zeros(b, lmax, d, device=dev)
@@ -342,9 +338,11 @@ class _EmissionObjective:
         return target_lat, valid, lens_l, lmax
 
     def emit_infer(self, texts: list[str], max_steps: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Inference emission: texts -> (lat [B, Lmax, d], lens [B]), zero-padding halted rows. The eval and
-        `model.rollout` route through here so a non-AR family (parallel-query) can emit in one pass. Default
-        delegates to the model's autoregressive concept/codebook rollout."""
+        """Emit latent sequences for inference.
+
+        Returns zero-padded latents with shape ``[B, L, d]`` and per-row lengths. The default implementation
+        delegates to the model's autoregressive codebook rollout; non-autoregressive objectives may override it.
+        """
         lat, lens = self.m.rollout(  # ty: ignore[invalid-assignment]  # return_lengths=True -> (lat, lens)
             texts, max_steps=max_steps, return_lengths=True
         )
@@ -353,8 +351,7 @@ class _EmissionObjective:
     def z_for_reg(
         self, em: EmissionOut, target_lat: torch.Tensor, valid: torch.Tensor, lmax: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """The (predicted, target) latents a TargetSource.regularizer (e.g. SIGReg) constrains. Default =
-        the emitted vs target latents directly ([N, d])."""
+        """Return the ``[N, d]`` predicted and target representations passed to target regularization."""
         return em.recon[valid], target_lat[valid]
 
 
@@ -414,7 +411,7 @@ class CodeSoftmaxObjective(_EmissionObjective):
         with torch.no_grad():  # the target's law over codes, recovered from the target latent
             w = F.relu(target_lat.float() @ code.t())  # [b, lmax, n_codes]
             w = w / w.sum(-1, keepdim=True).clamp_min(1e-9)
-        # MEMBERSHIP: soft-target CE over the codes ALONE, at real emission slots.
+        # Apply soft-target cross-entropy over code membership at real emission slots.
         loss_code = soft_target_cross_entropy_loss(
             SoftTargetCrossEntropyContext(
                 logits=code_logits[:, :lmax, 0, :].float(),
@@ -424,11 +421,8 @@ class CodeSoftmaxObjective(_EmissionObjective):
         ).to_tensor()
         # Termination is independent of the member distribution, so set width cannot weaken its supervision.
         loss_stop = stop_loss(StopLossContext(logits=stop_lg, lengths=lens_l)).to_tensor()
-        # `recon` is the contract every loss term reads as "the model's emission, with gradient" (MultiNCETerm
-        # and the emitter both build their query from it). The rollout's own recon is the TARGET here -- this
-        # path is lossless, so it carries no gradient at all, and a term querying it would compare each target
-        # against itself: near-zero loss, exactly zero gradient, silently inert. Hand back the DIFFERENTIABLE
-        # committed mixture instead, which is both the true emission and the vector fed back each tick.
+        # Auxiliary terms consume `recon` as the gradient-bearing model emission. Return the differentiable committed
+        # mixture rather than the teacher-forcing target, which carries no emitter gradient on this path.
         mix = F.normalize(
             code_logits[:, :lmax, 0, :].float().softmax(-1) @ code, dim=-1
         )  # [b, lmax, d]
@@ -447,8 +441,8 @@ class CodeSoftmaxObjective(_EmissionObjective):
     def z_for_reg(
         self, em: EmissionOut, target_lat: torch.Tensor, valid: torch.Tensor, lmax: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Regularize the DISTRIBUTIONS, the codebook analogue of codebook's pre-quantization z: predicted law vs target
-        # law over codes, so a penalty spreads usage across the alphabet instead of collapsing onto a few codes.
+        # Regularize predicted and target laws over codes so the penalty acts on codebook usage rather than only on
+        # committed latent vectors.
         code_logits = em.code_logits
         assert code_logits is not None
         code = self.m.head.code
@@ -458,22 +452,24 @@ class CodeSoftmaxObjective(_EmissionObjective):
 
 
 class ConceptObjective(_EmissionObjective):
-    """Emit a state as a superposition over NAMED CONCEPTS, per facet, with a residual for the unnamed.
+    """Emit a latent with independently normalized named-concept facets.
 
-    The row format is text the whole way down:
+    The dataset column selected by ``concept_field`` contains one concept mapping per target step. For example::
 
-        {"input_text": …, "target_text": …,
-         "concepts": {"vocals": ["yell-singing", "gang-vocals"], "mood": ["angry-but-vulnerable"]}}
+        {
+            "input_text": "...",
+            "target_texts": ["..."],
+            "concepts": [
+                {
+                    "vocals": ["yell-singing", "gang-vocals"],
+                    "mood": ["angry-but-vulnerable"],
+                }
+            ],
+        }
 
-    langset discovers each facet's alphabet by scanning the column, so no index is ever written by hand, and
-    the emission's leading dims are CONSTITUTED from those concepts — project them back on the codebook and you
-    get what the latent is made of, in your own vocabulary, with no probe. Each facet is normalized separately,
-    so a wide `vocals` mixture does not make `tempo` look uncertain.
-
-    Reach for this when the twin's geometry is good but WRONG SOMEWHERE. The twin gives a usable space for free
-    and in-batch negatives separate it, but neither lets you say along WHICH axis. Naming one facet overwrites
-    that neighbourhood and leaves the rest to the residual — so the normal configuration is a narrow state half
-    and a wide residual, not the reverse. You are patching a geometry, not adopting an ontology.
+    LangSet discovers each facet's alphabet from the dataset and builds a fixed codebook using ``code_source``.
+    Only facets present in a row are supervised. Each facet is normalized independently, and ``res_dim`` optionally
+    reserves dimensions for an unnamed residual representation.
     """
 
     codebook = True
@@ -492,8 +488,7 @@ class ConceptObjective(_EmissionObjective):
         assert self.laws is not None, (
             "ConceptObjective needs a parsed concepts column — set TrainingArguments.concept_field"
         )
-        # Build the codebook from the DISCOVERED alphabet: every concept becomes a vector via `code_source`,
-        # laid out per facet. Once, at setup, over the concept names — then frozen for the run.
+        # Build a fixed code vector for every discovered concept, grouped into facet spans.
         alpha = getattr(trainer, "concept_alphabet", None)
         if alpha and not bool(model.head.code.abs().sum()):
             names_per_facet = [(f, alpha[f]) for f in alpha]
@@ -565,7 +560,7 @@ class ConceptObjective(_EmissionObjective):
         flat = code_logits[:, :lmax, 0, :].float()  # [b, lmax, n_codes]
         tgt, seen = self._target_law(b, lmax, lens_l, bidx)
 
-        # one soft-target CE PER FACET, over that facet's members only
+        # Normalize and supervise each stated facet independently.
         losses, per_facet = [], {}
         for fi, (m_lo, m_hi, _, _) in enumerate(self.spans):
             sel = seen[:, :, fi] & valid
@@ -584,7 +579,7 @@ class ConceptObjective(_EmissionObjective):
 
         loss_stop = stop_loss(StopLossContext(logits=stop_lg, lengths=lens_l)).to_tensor()
 
-        # the emission the rest of the trainer sees — WITH gradient, or every aux term silently idles
+        # Auxiliary terms require the gradient-bearing committed emission rather than teacher-forcing targets.
         p = m.head.concept_probs(code_logits[:, :lmax])
         state = F.normalize(p @ m.head.code, dim=-1)
         emission = (
@@ -607,28 +602,15 @@ class ConceptObjective(_EmissionObjective):
 
 
 class StateResidualObjective(_EmissionObjective):
-    """STATE + RESIDUAL emission: a named half and an unnamed half, in one latent.
+    """Emit a latent composed of a named codebook state and an unnamed residual.
 
-    The latent splits at `head.res_dim`. The STATE half is a mixture over a fixed alphabet of members you can
-    name, trained by soft-target cross-entropy against the members that are actually live this tick. The
-    RESIDUAL half is trained by whatever the surrounding terms already do (recon to the target, in-batch NCE),
-    so it carries what the alphabet cannot say.
+    The leading ``latent_dim - res_dim`` dimensions contain a normalized mixture over the fixed state codebook.
+    The trailing ``res_dim`` dimensions contain a learned residual. State labels come from the dataset column
+    selected by ``state_field`` and are represented as a per-step list of active member indices. Target probability
+    mass is divided evenly among the active members at each step.
 
-    Why both. A named alphabet is the strongest signal available -- the emission is CONSTITUTED from the members
-    rather than having them decoded out of it -- but it is also a ceiling: anything the alphabet cannot name,
-    the emission cannot hold, and a world model whose ontology has gaps will silently refuse to represent them.
-    The residual is where the unnamed goes, and how much it carries is measurable: ablate it at eval and the
-    drop is how incomplete the alphabet was.
-
-    It also keeps a self-supervised component in the design. The state half's meaning is externally specified
-    (you chose the members); the residual half's is not, so the latent is not wholly hand-defined.
-
-    Labels come from a per-row column named by `state_field`: a per-tick list of ACTIVE member indices (sparse,
-    e.g. `[[3, 47], [12], ...]`). Mass is split evenly over each tick's live members, so a tick holding four
-    members asks the emission to spread over four -- the superposition, written as the target.
-
-      TrainingArguments(emission=StateResidualObjective, state_field="frontier", state_classes=256)
-      LangSetModel.from_pretrained(..., code_emit=True, n_codes=256, res_dim=64)
+    Construct the model with ``code_emit=True``, set ``n_codes`` to the state alphabet size, and choose a positive
+    ``res_dim`` when an unnamed residual is required.
     """
 
     codebook = True
@@ -642,8 +624,7 @@ class StateResidualObjective(_EmissionObjective):
         )
         self.n_codes = int(model.head.n_codes)
         self.res_dim = int(model.head.res_dim)
-        # Build the codebook ONCE, here, from the injected `code_source` — over the alphabet's NAMES, not over
-        # the training data. Skipped when a codebook was already installed by hand (head.set_code before train).
+        # Build the fixed codebook from member names unless the caller installed one before training.
         names = getattr(args, "code_names", None)
         if names is not None and not bool(model.head.code.abs().sum()):
             codes = build_codebook(
@@ -691,7 +672,7 @@ class StateResidualObjective(_EmissionObjective):
         )
         code = m.head.code
 
-        # STATE: soft-target CE over the alphabet, mass split evenly across each tick's live members.
+        # Split target probability mass evenly across each step's active members.
         tgt = torch.zeros(b, lmax, self.n_codes, device=dev)
         has = torch.zeros(b, lmax, dtype=torch.bool, device=dev)
         assert self.labels is not None
@@ -710,14 +691,12 @@ class StateResidualObjective(_EmissionObjective):
             )
         ).to_tensor()
 
-        # TERMINATION: its own sigmoid, never folded into the member softmax. Folding is only fair when the
-        # member target is one-hot; against a 1/k-diffuse target the gradient suppressing STOP scales with
-        # P(STOP), which weakens as the set widens, so the rollout truncates exactly where sets get wide.
+        # Termination uses an independent sigmoid. Folding it into a diffuse member distribution would make stop
+        # supervision depend on the number of active members.
         loss_stop = stop_loss(StopLossContext(logits=stop_lg, lengths=lens_l)).to_tensor()
 
-        # THE EMISSION the rest of the trainer sees: state mixture ++ residual, exactly what feeds back. It must
-        # be the emission WITH gradient -- every aux term (in-batch NCE, hard negatives) builds its query from
-        # `recon`, and handing back the stop-grad target instead leaves them running but training nothing.
+        # Return the same gradient-bearing state-plus-residual emission that is fed back. Auxiliary losses use this
+        # value as their query and must not receive the detached teacher-forcing target.
         p = code_logits[:, :lmax, 0, :].float().softmax(-1)
         state = F.normalize(p @ code, dim=-1)
         if self.res_dim:
@@ -737,41 +716,37 @@ class StateResidualObjective(_EmissionObjective):
 
 # ---- target source ------------------------------------------------------------------------------
 class _TargetSource:
-    """Strategy for the TARGET latents the emission trains toward, plus any anti-collapse regularization.
-    Default = stop-grad EMA twin. Selected ONCE per run. All sources share the __init__ signature
-    (model, args, tok, dev) so they are interchangeable as an injected `TrainingArguments.target_source`."""
+    """Interface for target-latent providers and optional anti-collapse regularization.
 
-    suppresses_nce: bool = (
-        False  # if True the trainer skips the in-batch NCE term (a live-target source that
-    )
-    #                                     already prevents collapse via `regularizer` doesn't need — and fights — it)
-    wants_regularizer: bool = (
-        False  # if True the trainer computes objective.z_for_reg and adds `regularizer` to the
-    )
-    #                                     loss; keeps that (non-trivial) work off the default path when False
-    twin: Optional[LangSetModel] = (
-        None  # the model the EVAL block encodes its retrieval bank with (the EMA copy for the
-    )
-    #                                      default; the online model itself for a live-target source). Set by subclasses.
+    Sources share a common constructor and can be selected through ``TrainingArguments.target_source``.
+    """
+
+    suppresses_nce: bool = False  # skip in-batch NCE when the target source replaces it
+    wants_regularizer: bool = False  # request objective representations for `regularizer`
+    twin: Optional[LangSetModel] = None  # encoder used to build the evaluation retrieval bank
 
     def encode(self, texts: list[str]) -> torch.Tensor:
-        """Emit each text -> [n, d] L2-normalized target latents (no grad for the EMA default). Used both for the
-        per-step targets and, via MultiStepCtx.target_source, for the hard-negative bank."""
+        """Encode texts as ``[n, d]`` L2-normalized target latents.
+
+        The gradient policy is defined by the target source. The trainer uses these values for per-step targets and
+        for the hard-negative bank.
+        """
         raise NotImplementedError
 
     def update(self) -> None:
-        """Called once AFTER each opt.step(). The EMA default nudges the twin toward the online weights; a
-        live-target source has nothing to track, so this is a no-op."""
+        """Update source state after an optimizer step; the base implementation is a no-op."""
 
     def regularizer(self, z_pred: torch.Tensor, z_tgt: torch.Tensor) -> Optional[torch.Tensor]:
-        """Optional extra anti-collapse loss on the emitted (`z_pred`) and target (`z_tgt`) latents, added to the
-        step loss. None for the EMA default (the stop-grad twin is what prevents collapse there)."""
+        """Return an optional regularization loss for predicted and target representations."""
         return None
 
 
 class EMATwinTarget(_TargetSource):
-    """DEFAULT: a stop-grad EMA copy of the online model supplies the target latents (BYOL/JEPA) so both sides
-    don't move together and collapse. Byte-identical to the historical inline twin + emit_texts + ema_update."""
+    """Produce stop-gradient targets from an exponential-moving-average copy of the online model.
+
+    After each optimizer step, :meth:`update` moves the target model toward the trainable online parameters using
+    ``ema_m``. The lagged target provides a more stable comparison geometry than using the online model on both sides.
+    """
 
     suppresses_nce = False
 
@@ -793,9 +768,8 @@ class EMATwinTarget(_TargetSource):
         ]
 
     def encode(self, texts: list[str]) -> torch.Tensor:
-        # Single-latent emission of each text -> [N, d] normalized, no_grad. Truncated to target_max_len
-        # (default 64: targets are short descriptors; raise it when a target is a DOCUMENT, e.g. emit_seed's
-        # phase-0 target is a full abstract). Short future strings are already < 64 so unaffected.
+        # Encode each text as one normalized target latent without gradients. Inputs are truncated to
+        # `target_max_len`, which callers should increase for document-length targets.
         a, tok, dev = self.a, self.tok, self.dev
         e = tok(
             texts, padding=True, truncation=True, max_length=a.target_max_len, return_tensors="pt"
@@ -813,19 +787,12 @@ class EMATwinTarget(_TargetSource):
 
 
 class CachedTarget(_TargetSource):
-    """FROZEN-ENCODER target source with an encode-once cache — the two-stage (V-JEPA) split for the multi-latent
-    world model. The target geometry is a FIXED encoder, so every text->latent map is CONSTANT for the whole run:
-    encode each unique text ONCE, memoize, then serve lookups. The step loop stops re-encoding BOTH the per-step
-    targets (trainer flat_texts) and the batch-pooled hard-negative bank (the emitter) — bringing the 'train only
-    the head on cached vectors, epochs in seconds' win that langset's single-latent frozen-pool path already has
-    to the multi-latent rollout. It's the fix for re-encoding fixed data every epoch.
+    """Produce targets with a frozen encoder and cache embeddings by input text.
 
-    Encoder source: `args.target_encoder_ckpt` (a saved LangSetModel dir) when set — the intended use, a SEPARATE
-    already-good geometry (e.g. a trained affordance/embedding model) that the emitter learns to roll FORWARD in,
-    so no encoder is co-trained at all. Otherwise a frozen snapshot of the online model at init (only meaningful
-    when it already starts from a good encoder). INJECT via
-    `TrainingArguments(target_source=CachedTarget, target_encoder_ckpt="path/to/encoder")`. `update()` is a no-op
-    (the geometry is fixed) and the eval retrieval bank encodes through the same frozen geometry (`twin = enc`)."""
+    If ``target_encoder_ckpt`` is configured, the encoder is loaded from that LangSet checkpoint. Otherwise, the
+    source is a frozen copy of the online model taken at initialization. Each unique text is encoded once and
+    subsequent calls reuse the cached latent. :meth:`update` is a no-op because the target geometry is fixed.
+    """
 
     suppresses_nce = False
 
@@ -875,11 +842,12 @@ class CachedTarget(_TargetSource):
 
 
 class SIGRegTarget(_TargetSource):
-    """EMA-free anti-collapse (LeJEPA, arXiv:2511.08544). INJECT via `TrainingArguments(target_source=SIGRegTarget)`.
-    Targets come from the LIVE model WITH gradient (no stop-grad twin); collapse is prevented by an isotropic-Gaussian
-    SIGReg penalty on the emitted representation (via `regularizer`) instead of by a twin. So it drops the twin's VRAM + target
-    forward, the in-batch NCE is suppressed (the regularizer replaces it), and eval encodes with the live model itself.
-    Reads scalar knobs off args: sigreg_lambda (loss weight, applied in the trainer), sigreg_knots, sigreg_slices."""
+    """Use the online model for gradient-bearing targets and apply SIGReg regularization.
+
+    This target source does not maintain an EMA copy. Both predicted and target representations remain connected to
+    the online model, and independent SIGReg penalties are applied to them. The default in-batch NCE term is
+    suppressed. Configure the regularizer with ``sigreg_lambda``, ``sigreg_knots``, and ``sigreg_slices``.
+    """
 
     suppresses_nce = True
     wants_regularizer = True
@@ -896,8 +864,7 @@ class SIGRegTarget(_TargetSource):
         self.sig_reg = SIGReg(knots=args.sigreg_knots, slices=args.sigreg_slices).to(dev)
 
     def encode(self, texts: list[str]) -> torch.Tensor:
-        # LIVE target WITH gradient (no no_grad, no twin): both the emitted and target latents move, and SIGReg —
-        # not a stop-grad twin — is what stops them collapsing together.
+        # Keep live target embeddings connected to the online model; SIGReg supplies the configured regularization.
         a, tok, dev = self.a, self.tok, self.dev
         e = tok(
             texts, padding=True, truncation=True, max_length=a.target_max_len, return_tensors="pt"
@@ -911,7 +878,7 @@ class SIGRegTarget(_TargetSource):
 
 
 # ---- concepts (the text-in format for a named, superposed state) ---------------------------------
-# A row carries a `concepts` column of NAMED FACETS, each holding the concepts that are true of it:
+# A row's `concepts` column maps facet names to the concepts that are active:
 #
 #     "concepts": {"vocals": ["yell-singing", "gang-vocals"], "tempo": {"7": 0.1, "8": 0.9}}
 #
@@ -919,11 +886,10 @@ class SIGRegTarget(_TargetSource):
 # weights, which also encodes a CONTINUOUS value as a mixture over ordered concepts: 7.9 is 0.1 of "7" and 0.9
 # of "8", interpolation included, and unlike a regressed scalar you can still read what it says.
 #
-# Everything is text. The alphabet is not configured — it is DISCOVERED by scanning the column, the way a
-# tokenizer's vocabulary is, so nobody writes or maintains an index. Multi-latent rows pass a LIST of these
-# dicts, one per tick, aligned with `target_texts`.
+# The alphabet is discovered by scanning the column. Multi-latent rows provide one mapping per step, aligned with
+# `target_texts`.
 def parse_concepts(raw: object) -> "dict[str, dict[str, float]]":
-    """One row's (or tick's) concepts -> {facet: {concept: weight}}, weights normalized within each facet."""
+    """Parse one concept mapping and normalize positive weights within each facet."""
     if raw is None:
         return {}
     if not isinstance(raw, dict):
@@ -952,8 +918,10 @@ def parse_concepts(raw: object) -> "dict[str, dict[str, float]]":
 
 
 def discover_concept_alphabet(rows_concepts: "list[object]") -> "dict[str, list[str]]":
-    """Scan the corpus's concept column -> {facet: sorted concept names}. Sorted for determinism, so the same
-    corpus always yields the same layout and a checkpoint stays readable."""
+    """Return sorted concept names for each facet discovered in the dataset.
+
+    Sorting facets and members makes the resulting codebook layout deterministic.
+    """
     seen: dict[str, set[str]] = {}
     for raw in rows_concepts:
         ticks = raw if isinstance(raw, (list, tuple)) else [raw]
@@ -964,20 +932,14 @@ def discover_concept_alphabet(rows_concepts: "list[object]") -> "dict[str, list[
 
 
 # ---- code sources (where a named member's vector comes from) -------------------------------------
-# A `code_source` maps the alphabet's member NAMES to their vectors: (names, dim, model) -> [n_members, dim].
-# Called ONCE at setup, over the alphabet (hundreds to a few thousand short strings), never per batch. The
-# result is frozen into a buffer for the run — a codebook that re-embeds while the model trains is a learned
-# codebook in disguise, and re-opens the collapse problem the fixed codebook was chosen to avoid.
-#
-# The choice is a real trade, not a default: an orthonormal codebook decodes losslessly by plain matmul (so a
-# recall number measures the EMISSION, with no probe as a confound) but its members carry no relation to each
-# other; embedded codes put `ph2` near `ph3` and `melanoma` near `breast_neoplasms`, at the cost of exact
-# recovery. Benchmarks want the first, real domains usually want the second.
+# A `code_source` maps member names to a `[n_members, dim]` tensor during setup. The result is frozen for the run.
+# Orthonormal codes support exact linear recovery but encode no member relationships; model-derived codes may
+# preserve information from token embeddings but are not orthogonal or exactly invertible.
 def random_orthonormal_codes(names: list[str], dim: int, model: LangSetModel) -> torch.Tensor:
-    """Arbitrary but perfectly decodable: a seeded orthonormal frame, one row per member (`C Cᵀ = I`).
+    """Return a deterministic random orthonormal codebook with one row per member.
 
-    Member vectors are unrelated by construction — cell 10 and cell 11 are as orthogonal as cell 10 and cell
-    200 — so nothing about the geometry can flatter a result. That is exactly why it belongs on a benchmark."""
+    Requires ``len(names) <= dim`` and produces rows satisfying ``C Cᵀ = I``.
+    """
     assert len(names) <= dim, (
         f"random_orthonormal_codes needs dim >= n_members for an orthonormal frame; got dim={dim}, "
         f"n_members={len(names)}. Use model_embedded_codes (no such limit) or widen the state half."
@@ -988,12 +950,11 @@ def random_orthonormal_codes(names: list[str], dim: int, model: LangSetModel) ->
 
 
 def model_embedded_codes(names: list[str], dim: int, model: LangSetModel) -> torch.Tensor:
-    """The base model's own reading of each member's NAME, mean-pooled over its tokens.
+    """Build code vectors by mean-pooling input embeddings for each member name.
 
-    Semantically related members land near each other, which is information the random frame throws away, and
-    the codebook becomes model-derived rather than hand-designed. Not orthonormal, so a mixture no longer
-    recovers its members exactly — read out with top-k over member scores rather than expecting a clean inverse.
-    Unlimited alphabet size (no dim >= n_members constraint)."""
+    Each vector is truncated or padded to ``dim`` and normalized. The resulting rows are not guaranteed to be
+    orthogonal or exactly invertible, and the alphabet size is not limited by ``dim``.
+    """
     emb = model.embed.weight  # [V, h]; tied to the LM head on most small models
     out = []
     for nm in names:
@@ -1006,21 +967,21 @@ def model_embedded_codes(names: list[str], dim: int, model: LangSetModel) -> tor
 
 
 def orthogonalized_codes(names: list[str], dim: int, model: LangSetModel) -> torch.Tensor:
-    """Embed the names, then orthogonalize — keeps a lossless readout and as much of the semantic arrangement
-    as an orthonormal frame can hold. The distortion is the price; the members are no longer purely the model's
-    own vectors."""
+    """Embed member names and apply QR decomposition to produce orthonormal rows.
+
+    This enables an orthogonal readout but generally changes pairwise relationships between the name embeddings.
+    """
     e = model_embedded_codes(names, dim, model)
     q = torch.linalg.qr(e.t().float()).Q[:, : len(names)]
     return q.t().contiguous()
 
 
 def twin_encoded_codes(names: list[str], dim: int, model: LangSetModel) -> torch.Tensor:
-    """Encode each member name with the model's own emit path, so the codebook lands in the SAME space as the
-    training targets.
+    """Encode member names through the model's emission path and normalize the resulting code vectors.
 
-    This is the coherent option: the state mixture and the twin's target then share one geometry, so the state
-    loss and the recon loss are talking about the same thing, and the residual is precisely the part of the
-    target the named members cannot span. Requires the emit path to be usable at setup."""
+    This places the codebook in the same output space as model-produced target latents. The emission path must be
+    usable during setup.
+    """
     with torch.no_grad():
         z = model.emit(list(names))  # [n_members, latent_dim], the target space itself
     z = z.float()[:, :dim] if z.size(-1) >= dim else F.pad(z.float(), (0, dim - z.size(-1)))
@@ -1056,22 +1017,20 @@ def build_codebook(
 def multi_epoch_order(
     tr_idx: list[int], rng_t: torch.Generator, args: TrainingArguments, seeds: list[str]
 ) -> list[int]:
-    """DEFAULT epoch ordering: a plain shuffle of the training positions. Inject a different `epoch_order` to
-    change it."""
+    """Return a random permutation of the training positions for one epoch."""
     return torch.randperm(len(tr_idx), generator=rng_t).tolist()
 
 
 def multi_select_metric(mode: str, mrr: float, pur: float, ep: int) -> float:
-    """DEFAULT checkpoint-selection signal from the epoch's metrics. retr_mrr (default) / purity / blend. Inject
-    a different `selector` to change it (e.g. one that keeps the last epoch)."""
+    """Return the configured retrieval, purity, or blended checkpoint-selection score."""
     return pur if mode == "purity" else (mrr + pur) if mode == "blend" else mrr
 
 
 def last_epoch_selector(mode: str, mrr: float, pur: float, ep: int) -> float:
-    """SUPERPOSITION selector — INJECT via `TrainingArguments(selector=last_epoch_selector)`. No early-stop signal;
-    keeps the LAST epoch (returns float(ep)). Under superposition training retr_mrr selects for a collapsed
-    one-future-per-seed geometry — exactly the wrong target when you WANT the latent to spread over a seed's
-    alternative futures, so retr_mrr is meant to fall and must not gate selection."""
+    """Return the epoch index so each evaluated epoch supersedes earlier checkpoints.
+
+    The attached ``needs_final_epoch`` flag ensures the final epoch is evaluated even when ``eval_every > 1``.
+    """
     return float(ep)
 
 
@@ -1082,14 +1041,14 @@ last_epoch_selector.needs_final_epoch = True  # type: ignore[attr-defined]  # ty
 
 
 def multi_seed_texts(trainer: Trainer, seeds: list[str], args: TrainingArguments) -> list[str]:
-    """DEFAULT texts fed to the EMISSION forward — what the model reads before emitting its latents = the raw
-    input seeds. Inject a different `seed_builder` to change it (e.g. append per-row CoT); targets/eval keep raw seeds."""
+    """Return the raw input seeds used by the default emission forward."""
     return seeds
 
 
 def cot_seed_texts(trainer: Trainer, seeds: list[str], args: TrainingArguments) -> list[str]:
-    """Exp-B seed-builder — INJECT via `TrainingArguments(seed_builder=cot_seed_texts)` (pair with
-    `loss_terms=build_cot_loss_terms`). Conditions the emission forward on each row's teacher-forced reasoning
-    (seed + CoT) so the latents are emitted AFTER the reasoning; targets and eval keep the raw seeds, and
-    CoTGenTerm trains the model to produce that reasoning itself."""
+    """Append each row's reasoning text to its seed before emission.
+
+    Pair with :func:`build_cot_loss_terms` so the same reasoning is trained autoregressively. Targets and evaluation
+    continue to use the raw seeds.
+    """
     return [f"{s}\n\nReasoning:\n{trainer.cot_texts[i]}" for i, s in enumerate(seeds)]

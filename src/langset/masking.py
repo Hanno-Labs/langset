@@ -1,30 +1,21 @@
-"""Masked self-prediction (JEPA-style) data construction — langset's generic JEPA mode.
+"""Utilities for masked self-prediction datasets and training views.
 
-langset already trains the JEPA way on the *target* side: the default `EMATwinTarget` is a stop-grad EMA copy
-of the model that supplies the target latents (BYOL/JEPA teacher, no collapse). What made a langset encoder
-JEPA-vs-not was never a flag — it was WHAT you put in `target_text`:
+A masker is a callable with the following interface:
 
-  * target_text = an external LABEL (e.g. "the legal moves here")  -> contrastive-to-label; the encoder keeps
-    only label-relevant structure and DISCARDS the rest (this is how our chess affordance encoder collapsed
-    near-identical positions — one move barely changes the label).
-  * target_text = a HELD-OUT PART of the SAME text, predicted from the VISIBLE part -> real JEPA: no label,
-    the encoder is FORCED to represent what it can't see, so fine detail survives.
+    (text: str, rng: random.Random) -> (visible_text, hidden_text)
 
-This module gives you the second one GENERICALLY. You hand it whole texts and a `Masker` (the algorithm that
-decides what to hide); it returns langset rows `{input_text: visible, target_text: full-or-hidden}`. Train
-those with the normal (single-latent, default EMATwinTarget) `Trainer` and you have a JEPA encoder for ANY
-text domain — prose, structured records, board renders, code — by swapping the masker.
+The built-in maskers hide contiguous spans, scattered tokens, or fields in a delimited record. `Trainer` can
+apply a masker to a raw `text` column at the start of each epoch while using the original text as the target:
 
-    # PREFERRED: hand the Trainer RAW text; it masks fresh every epoch. No pre-built masked data.
-    Trainer(model, TrainingArguments(), [{"text": t} for t in texts]).train()   # auto-masks (word @0.15)
-    # pick the algorithm / ratio: TrainingArguments(masker="span", mask_ratio=0.2)
-    # custom masker (e.g. protect chess move-numbers): TrainingArguments(masker=TokenMasker(0.15, protect=...))
+    rows = [{"text": text} for text in texts]
+    args = TrainingArguments(masker="span", mask_ratio=0.2)
+    Trainer(model, args, rows).train()
 
-The Trainer path re-masks EVERY epoch (unlimited diversity from a small corpus) — you never enumerate masked
-copies. `build_masked` / `build_masked_pairs` below still exist for materializing a fixed masked dataset when
-you want one, but for training just give `text`.
+When no masker is specified for raw-text training, scattered-token masking is used with the configured mask
+ratio.
 
-A Masker is any callable `(text: str, rng: random.Random) -> (visible_text, hidden_text)`.
+`build_masked()` and `build_masked_pairs()` materialize deterministic masked datasets for callers that need fixed
+views instead of per-epoch masking.
 """
 
 from __future__ import annotations
@@ -40,8 +31,11 @@ class _MaskerBase(Protocol):
 
 
 class SpanMasker:
-    """Hide a CONTIGUOUS run of whitespace tokens — the general-text default (a phrase, a clause). The encoder
-    must infer the missing span from both sides, so it has to represent surrounding meaning, not just keywords."""
+    """Replace one contiguous span of whitespace-delimited tokens with a sentinel.
+
+    At least one token is hidden and at least one original token remains visible. Texts containing fewer than two
+    tokens are returned unchanged with an empty hidden string.
+    """
 
     def __init__(self, ratio: float = 0.15, sentinel: str = "[MASK]") -> None:
         self.ratio, self.sentinel = ratio, sentinel
@@ -58,12 +52,14 @@ class SpanMasker:
 
 
 class TokenMasker:
-    """Hide RANDOM scattered tokens (BERT/data2vec flavor). More diffuse pressure than a single span.
+    """Replace randomly selected whitespace-delimited tokens with a sentinel.
 
-    `protect` — an optional predicate `(token) -> bool`; a protected token is NEVER masked and never
-    counts toward the maskable pool. Use it to keep scaffolding visible while hiding only content, e.g.
-    for chess movetext `protect=lambda t: t.endswith(".")` masks moves but keeps the `1.`/`2.` numbering
-    so positions stay anchored (mask a random % of the actual MOVES, both players)."""
+    `ratio` is applied to the tokens eligible for masking. When `protect` is provided, tokens for which
+    `protect(token)` returns true remain visible and are excluded from the maskable population.
+
+    The hidden text contains the selected original tokens in source order. Texts with no maskable tokens, or fewer
+    than two total tokens, are returned unchanged with an empty hidden string.
+    """
 
     def __init__(
         self,
@@ -86,10 +82,15 @@ class TokenMasker:
 
 
 class FieldMasker:
-    """Hide whole FIELDS of a delimited record (structured text / tabular / board renders). Splits on `sep`;
-    hides a fraction of fields. With `kv_sep` set, keeps each field's KEY and hides only its VALUE
-    (e.g. cells `e1:K` -> `e1:[MASK]`), so the model must infer WHAT is at a KNOWN slot — the sharp form of
-    "represent the fine detail." This is the masker for a chess board render (cells) or any key:value record."""
+    """Mask randomly selected fields in a delimited record.
+
+    Fields are split with `sep`, and `ratio` determines how many are selected. Without `kv_sep`, each selected field
+    is replaced by `sentinel`. With `kv_sep`, a selected key/value field keeps its key and replaces its value; for
+    example, `e1:K` becomes `e1:[MASK]`.
+
+    The hidden text contains each selected field in its original form. Inputs with fewer than two fields are returned
+    unchanged with an empty hidden string.
+    """
 
     def __init__(
         self,
@@ -122,9 +123,19 @@ class FieldMasker:
 
 
 def resolve_masker(spec: Masker | str | None, ratio: float = 0.15) -> Masker:
-    """Turn a masker SPEC into a Masker. A callable passes through; a string picks a default algorithm; None
-    is the reasonable default ('word' = scattered-word masking). Used by the Trainer so callers can write
-    `masker="span"` / `masker=None` and never build a masker by hand."""
+    """Resolve a masker specification.
+
+    Args:
+        spec: A masker callable, `"word"`, `"token"`, `"span"`, `"field"`, or `None`. `None`, `"word"`, and
+            `"token"` select `TokenMasker`.
+        ratio: Masking ratio passed to a built-in masker.
+
+    Returns:
+        The supplied callable or a newly constructed built-in masker.
+
+    Raises:
+        ValueError: If `spec` is an unrecognized string.
+    """
     if callable(spec):
         return cast("Masker", spec)
     if spec in (None, "word", "token"):
@@ -139,10 +150,18 @@ def resolve_masker(spec: Masker | str | None, ratio: float = 0.15) -> Masker:
 
 
 def mask_view(texts: list[str], masker: Masker, rng: random.Random) -> list[str]:
-    """One FRESH masked view per text — the VISIBLE side; the target is the full text itself. This is what the
-    Trainer calls at the start of EVERY epoch so masks are never reused (unlimited diversity from raw text).
-    A text where the masker hides nothing (too short) passes through unmasked (that row just carries no signal
-    this epoch)."""
+    """Generate one masked visible view for each text.
+
+    If a masker returns an empty or whitespace-only hidden string, the original text is preserved in the result.
+
+    Args:
+        texts: Source texts to mask.
+        masker: Masking callable.
+        rng: Random generator controlling mask selection.
+
+    Returns:
+        One visible text for each source text, in the same order.
+    """
     out: list[str] = []
     for t in texts:
         visible, hidden = masker(t, rng)
@@ -153,9 +172,25 @@ def mask_view(texts: list[str], masker: Masker, rng: random.Random) -> list[str]
 def build_masked(
     texts: list[str], masker: Masker, views: int = 1, seed: int = 0, target_mode: str = "full"
 ) -> list[dict[str, str]]:
-    """Whole texts -> langset JEPA rows. Each text yields `views` masked pairs with different random masks
-    (mask diversity, like JEPA re-masking). target_mode: 'full' = predict the WHOLE text's latent from the
-    masked view (masked-view -> full-view alignment); 'hidden' = predict only the withheld content's latent."""
+    """Build fixed masked input/target rows from whole texts.
+
+    Each source text is masked `views` times using a deterministic random generator initialized from `seed`.
+    Degenerate views that hide no content are omitted.
+
+    Args:
+        texts: Source texts.
+        masker: Masking callable.
+        views: Number of masking attempts per source text.
+        seed: Seed for deterministic mask selection.
+        target_mode: `"full"` uses the original text as `target_text`; `"hidden"` uses only the text returned as
+            hidden by the masker.
+
+    Returns:
+        Dictionaries containing `input_text` and `target_text`.
+
+    Raises:
+        ValueError: If `target_mode` is not `"full"` or `"hidden"`.
+    """
     if target_mode not in ("full", "hidden"):
         raise ValueError("target_mode must be 'full' or 'hidden'")
     rng = random.Random(seed)
@@ -164,7 +199,7 @@ def build_masked(
         for _ in range(views):
             visible, hidden = masker(t, rng)
             if not visible.strip() or not hidden.strip() or visible.strip() == t.strip():
-                continue  # skip degenerate (nothing hidden)
+                continue  # Skip views that hide no usable content.
             out.append(
                 {"input_text": visible, "target_text": t if target_mode == "full" else hidden}
             )
@@ -180,20 +215,28 @@ def build_masked_pairs(
     mask_region: str = "target",
     target_mode: str = "full",
 ) -> list[dict[str, str]]:
-    """FUSE (input, target) then mask — the "state + facets you want to predict" JEPA.
+    """Build fixed masked rows from `(input, target)` text pairs.
 
-    Each pair is `(input, target)`: `input` is the state of the world you ALWAYS have; `target` is the
-    ADDITIONAL facets you want the latent to be able to recover. We MERGE them (`input + sep + target`),
-    run the masker on the merged text, and predict the masked content — so one encoder is forced to hold
-    BOTH the state and the extra facets, with no external label.
+    The two parts are joined as `input + sep + target`. With `mask_region="target"`, only the target part is passed
+    to the masker and the input part remains visible. With `mask_region="all"`, the masker is applied to the joined
+    text.
 
-    mask_region:
-      * 'target' (default) — mask ONLY inside the target span; the whole input stays visible. This is the
-        pointed form: "given the full state, reconstruct the withheld facets." (The encoder learns to
-        predict the facets FROM the state.)
-      * 'all' — mask anywhere across the merged text (symmetric masked self-prediction over state+facets).
-    target_mode: 'full' = predict the whole merged (input+sep+target) latent; 'hidden' = predict only the
-    withheld content's latent.
+    Args:
+        pairs: Source `(input, target)` pairs.
+        masker: Masking callable.
+        views: Number of masking attempts per pair.
+        seed: Seed for deterministic mask selection.
+        sep: Separator inserted between the two parts.
+        mask_region: `"target"` to mask only the target part, or `"all"` to mask the joined text.
+        target_mode: `"full"` uses the unmasked joined text as `target_text`; `"hidden"` uses only the content
+            returned as hidden by the masker.
+
+    Returns:
+        Dictionaries containing `input_text` and `target_text`. Degenerate views that hide no usable content are
+        omitted.
+
+    Raises:
+        ValueError: If `mask_region` or `target_mode` is invalid.
     """
     if mask_region not in ("target", "all"):
         raise ValueError("mask_region must be 'target' or 'all'")
@@ -206,11 +249,11 @@ def build_masked_pairs(
         for _ in range(views):
             if mask_region == "all":
                 visible, hidden = masker(merged, rng)
-            else:  # mask only the target span; keep input whole
+            else:  # Mask only the target part.
                 vis_t, hidden = masker(tgt, rng)
                 visible = f"{inp}{sep}{vis_t}"
             if not visible.strip() or not hidden.strip() or visible.strip() == merged.strip():
-                continue  # skip degenerate (nothing hidden)
+                continue  # Skip views that hide no usable content.
             out.append(
                 {"input_text": visible, "target_text": merged if target_mode == "full" else hidden}
             )

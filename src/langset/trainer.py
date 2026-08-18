@@ -1,9 +1,11 @@
-"""Trainer: fit the LLM emitter so `emit(input_text)` lands where `emit(target_text)` does — a native
-self-contrastive objective (both views in the model's own space, in-batch negatives). The target text DEFINES
-the geometry. Two light aux terms keep it grounded and spread; selection is collapse-aware.
+"""Training loops for single- and multi-latent LangSet models.
 
-Dataset rows: `input_text` (what you have at inference) + `target_text` (a description of the same item that
-defines where it should land). Pass a `datasets.Dataset` or `list[dict]`; use `column_mapping` to rename.
+Single-latent training aligns ``input_text`` embeddings with corresponding ``target_text`` embeddings using a
+self-contrastive objective. Multi-latent training consumes ``target_texts`` lists and delegates emission and
+target construction to the configured strategy classes.
+
+Datasets may be ``datasets.Dataset`` instances or lists of dictionaries. Use ``column_mapping`` to map custom
+column names to LangSet's canonical fields.
 """
 
 from __future__ import annotations
@@ -50,8 +52,7 @@ _COLLAPSE_FLOOR = 0.4  # collapse below this isn't penalized; above it, selectio
 
 
 def _wandb_config(a: TrainingArguments) -> dict[str, Any]:
-    """`vars(a)` for wandb, with the injected strategy fields (classes/callables — not JSON-serializable) rendered
-    as their names, so the config still LOGS which strategy each run used (e.g. target_source="SIGRegTarget")."""
+    """Return a wandb-safe argument mapping with strategy classes and callables rendered by name."""
     cfg = dict(vars(a))
     for k, v in cfg.items():
         if callable(v):
@@ -74,9 +75,12 @@ def _fuse_views(
     mask_b: torch.Tensor,
     pad_id: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """FUSE two views for ONE forward: pad both to the batch's common real max-len, stack on the batch dim.
-    RIGHT-padded -> real tokens lead; the padded columns are masked so each row's emit is IDENTICAL to a separate
-    per-view forward. Halves kernel launches and grad-ckpt recomputes. Split the output back at row B."""
+    """Combine two right-padded views into one backbone forward.
+
+    Both views are resized to the batch's common maximum real length and stacked along the batch dimension. Only
+    masked padding columns are added or removed, so each row has the same retained-token output as a separate
+    per-view forward. The caller splits the output at the original batch size.
+    """
     L = int(max(mask_a.sum(dim=1).max().item(), mask_b.sum(dim=1).max().item()))
 
     def _fit(x: torch.Tensor, mk: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -95,10 +99,10 @@ def _fuse_views(
 
 
 def _dyn_trim(ids: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """DYNAMIC PADDING: sequences are pre-tokenized/padded to the DATASET max, so short batches still forward at
-    full width. Trim each batch to its own real max length (RIGHT-padded, so real tokens are the leading columns).
-    The dropped columns are pure padding the attention mask already zeros -> forward output on the kept tokens is
-    IDENTICAL. Big saving when doc lengths vary (legal corpora do). Guarded by test_train_identity."""
+    """Trim a right-padded batch to its longest non-padding sequence.
+
+    Because only masked padding columns are removed, outputs for retained positions are unchanged.
+    """
     n = int(mask.sum(dim=1).max().item())
     if n <= 0 or n >= ids.size(1):
         return ids, mask
@@ -107,9 +111,7 @@ def _dyn_trim(ids: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torc
 
 # ---- text replay (rehearsal) — shared by the single- and multi-latent learn paths ---------------
 def _require_emit_rows(is_learn: list[bool], learn_field: Optional[str]) -> None:
-    """Text replay pulls `learn`-tagged rows OUT of the emit/latent split (they only rehearse text). If EVERY row
-    is tagged, that split is empty — training would silently no-op (no emit steps) or crash deep in eval. Fail
-    loudly and early instead."""
+    """Require at least one emission row when text-replay rows are separated from the training split."""
     if is_learn and all(is_learn):
         raise ValueError(
             f"learn_field '{learn_field}' tagged all {len(is_learn)} rows as 'learn' — no rows left for the emit "
@@ -120,10 +122,11 @@ def _require_emit_rows(is_learn: list[bool], learn_field: Optional[str]) -> None
 def _tokenize_replay(
     tok: PreTrainedTokenizerBase, texts: list[str], max_len: int, side: str, dev: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Tokenize replay text with an EXPLICIT padding side. The doc (the conditioning context) MUST be left-padded
-    so every row's last real token lands in the final column — that's the position whose hidden predicts the first
-    target token in `learn_loss`. The target is right-padded (its pad is masked out of the CE). Defaulting the side
-    (right-pad the doc) silently conditions the replay loss on padding for any row shorter than the batch max."""
+    """Tokenize replay text with an explicit padding side.
+
+    Conditioning documents must be left-padded so their final real token predicts the first target token in
+    ``learn_loss``. Targets are right-padded, and their padding is excluded from cross-entropy.
+    """
     e = tok(
         texts,
         padding=True,
@@ -136,12 +139,11 @@ def _tokenize_replay(
 
 
 def _snapshot_best(m: LangSetModel) -> dict[str, Any]:
-    """Snapshot best-so-far weights to restore at the end of training. MIRRORS LangSetModel.save_pretrained's
-    branch: a PRETRAINED + frozen-base model rebuilds its backbone from `llm_model`, so LoRA-only is enough; a
-    RANDOM-INIT model (from_scratch) OR a train_base=True full-finetune has no source to rebuild from, so we must
-    snapshot the FULL backbone — otherwise the best-so-far restore silently keeps the LAST-epoch backbone (a
-    random-init net has no 'lora' keys, so the old lora-only snapshot restored nothing into it; a full-FT run
-    trains base weights the lora-only snapshot never captured). Applies to single-latent, multi-latent, and masked."""
+    """Snapshot all state required to restore the best epoch.
+
+    Pretrained models whose base weights can be reconstructed store the head and LoRA parameters. Randomly
+    initialized and fully fine-tuned models store the complete backbone. Persisted auxiliary heads are included.
+    """
     snap: dict[str, Any] = {
         "head": {k: v.detach().cpu().clone() for k, v in m.head.state_dict().items()}
     }
@@ -162,7 +164,7 @@ def _snapshot_best(m: LangSetModel) -> dict[str, Any]:
 
 
 def _restore_best(m: LangSetModel, best_state: dict[str, Any]) -> None:
-    """Restore a _snapshot_best() payload. Back-compat: a legacy resume checkpoint carries only 'lora'."""
+    """Restore a snapshot created by :func:`_snapshot_best`, including legacy LoRA-only snapshots."""
     m.head.load_state_dict(best_state["head"])
     if "backbone" in best_state:  # random-init: full backbone
         m.backbone.load_state_dict(best_state["backbone"], strict=False)
@@ -173,34 +175,45 @@ def _restore_best(m: LangSetModel, best_state: dict[str, Any]) -> None:
 
 
 # ---- single-latent step engines -----------------------------------------------------------------
-# The real axis of the single-latent path is "where do pred/target/hard-neg features come from, and how is the
-# step run": the LIVE backbone (default) vs. FROZEN-POOL cached vectors (pool_mode="last" + frozen backbone). Both
-# obey ONE interface; train() picks the engine ONCE, so the epoch loop and eval block have no per-feature `if`s.
+# Single-latent steps obtain prediction, target, and hard-negative features either from the trainable backbone or
+# from cached vectors produced by a frozen backbone. Both implementations expose the same step interface.
 
 
 class _StepEngine:
-    """Strategy for producing the contrastive features of one step. `supports_recon` gates the recon aux — the
-    frozen-pool engine has no backbone in the loop, so recon (which decodes via the backbone) is unavailable there."""
+    """Interface for producing contrastive features for one single-latent step.
+
+    ``supports_recon`` indicates whether the backbone is available for reconstruction loss.
+    """
 
     supports_recon: bool = True
 
     def precompute(self) -> None:
-        """Called ONCE before the epoch loop (frozen-pool caches all view features here; backbone impl = no-op)."""
+        """Prepare reusable features before the epoch loop; the live-backbone implementation is a no-op."""
 
     def featurize(
         self, idx: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """-> (pred [B,d] grad flows, target [B,d] honoring stop_grad_target, hard_neg [Hn,d] or None)."""
+        """Build the input, target, and optional hard-negative features for a batch.
+
+        Returns ``(prediction, target, hard_negatives)``. Prediction and target have shape
+        ``[batch, latent_dim]``. Hard negatives are either ``None`` or a tensor of negative features. Whether
+        gradients flow through the target is controlled by ``stop_grad_target``.
+        """
         raise NotImplementedError
 
     def val_embeddings(self, val_idx: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """-> (emit_in, emit_tg) numpy for the eval MRR/retrieval block."""
+        """Return NumPy input and target embeddings for retrieval evaluation."""
         raise NotImplementedError
 
 
 class BackboneStepEngine(_StepEngine):
-    """DEFAULT: runs the LIVE backbone. Owns the fuse_views / stop_grad_target / _dyn_trim variations internally
-    (they are "how to run the backbone", cohesive here). Byte-identical to the historical default path."""
+    """Produce contrastive features by running the trainable backbone for each step.
+
+    This is the default single-latent engine. It computes input, target, and
+    optional hard-negative features and supports reconstruction auxiliaries;
+    runtime options such as view fusion and target stop-gradient are handled
+    inside :meth:`featurize`.
+    """
 
     supports_recon = True
 
@@ -271,9 +284,12 @@ class BackboneStepEngine(_StepEngine):
 
 
 class FrozenPoolStepEngine(_StepEngine):
-    """FROZEN-POOL: backbone frozen + pool_mode="last" -> features are STATIC. Encode every view ONCE in precompute()
-    and train only the head on the cached vectors (no backbone in the step loop) => epochs run in seconds. No recon
-    (it needs the frozen-out backbone), so select by retrieval MRR."""
+    """Cache frozen-backbone features and train only the projection head.
+
+    This engine is used when ``pool_mode="last"`` and the backbone is frozen. It precomputes input, target, and
+    optional hard-negative features before the epoch loop. Reconstruction loss is unavailable because the
+    backbone does not participate in training.
+    """
 
     supports_recon = False
 
@@ -362,6 +378,17 @@ class FrozenPoolStepEngine(_StepEngine):
 
 
 class Trainer:
+    """Train a :class:`LangSetModel` on text-to-latent alignment data.
+
+    The trainer selects the single- or multi-latent path from the model configuration. Single-latent rows require
+    ``input_text`` and ``target_text``; multi-latent rows require ``input_text`` and a non-empty ``target_texts``
+    list. Optional columns configure hard negatives, false-negative masks, concepts, states, auxiliary heads, and
+    text replay according to :class:`TrainingArguments`.
+
+    ``eval_dataset`` is currently reserved and ignored; validation rows are split from ``train_dataset``.
+    ``on_checkpoint``, when provided, is called after a durable checkpoint is written.
+    """
+
     def __init__(
         self,
         model: LangSetModel,
@@ -373,17 +400,14 @@ class Trainer:
     ) -> None:
         self.model = model
         self.args = args
-        # if set, the best-so-far model is written to output_dir on every improvement and this is called after
-        # (e.g. modal Volume.commit) so another process can eval the live best checkpoint mid-training.
+        # When set, this callback runs after a best-so-far checkpoint is written, allowing an external system to
+        # publish or evaluate the durable checkpoint.
         self.on_checkpoint = on_checkpoint
-        # ONE switch routes the whole trainer: a multi_latent model emits a VARIABLE-LENGTH latent set, so it reads
-        # a `target_texts` (list[str] per row) column and runs the selected emission strategy; otherwise the single-latent
-        # self-contrastive path (byte-for-byte unchanged) reads a scalar `target_text` column.
+        # A multi-latent model reads a per-row `target_texts` list and uses the selected emission strategy. The
+        # single-latent path reads one `target_text` value per row.
         self.multi_latent = bool(model.head.multi_latent)
-        # ROLLOUT MUST BE TRAINED. A multi_latent model emits its latent set AUTOREGRESSIVELY at inference (rollout()
-        # feeds each emitted latent back), so training PURELY teacher-forced (ss_prob=0) is exposure-biased and the
-        # rollout is never actually trained — you cannot roll out what you did not train. Enforce it against the
-        # ss_prob sentinel: unset (None) -> 0.25 (scheduled sampling on); an EXPLICIT ss_prob=0 -> hard error.
+        # Multi-latent inference feeds emitted states back autoregressively. Require positive scheduled sampling so
+        # training exposes the model to its own prior emissions. An unspecified probability defaults to 0.25.
         if self.multi_latent:
             if args.emission is None:
                 raise ValueError(
@@ -456,10 +480,8 @@ class Trainer:
                         f"multi_latent Trainer needs a 'target_texts' column of non-empty lists; row {i} = {v!r}"
                     )
                 self.target_texts.append([str(x) for x in v])
-            # optional Exp-B CoT: a per-row reasoning STRING the model learns to GENERATE before the latents and
-            # conditions the emission on (via seed_builder=cot_seed_texts + loss_terms=build_cot_loss_terms). Absent
-            # column -> empty strings, so the default (non-CoT) strategies stay byte-identical: multi_seed_texts uses
-            # raw seeds and CoTGenTerm — even if injected — self-skips on all-empty reasoning.
+            # Optional per-row reasoning text used by the CoT loss and seed strategies. Missing values become empty
+            # strings; the default strategies ignore them, and CoTGenTerm skips batches without reasoning text.
             cot_key = inv.get(
                 "cot_text", "cot_text"
             )  # honor column_mapping (a renamed reasoning column)
@@ -486,8 +508,7 @@ class Trainer:
                     ]
                     for v in raw_hn
                 ]
-            # optional MULTI-latent supervised-contrastive: a per-row LIST of group labels aligned 1:1 with
-            # target_texts (each emitted item's stage/group). Shapes emissions into separate regions (weight lam_sup).
+            # Optional supervised-contrastive labels, aligned one-to-one with each row's target texts.
             self.sup_labels: Optional[list[list[str]]] = None
             sup_field = getattr(args, "sup_field", None)
             if sup_field is not None:
@@ -495,10 +516,8 @@ class Trainer:
                 self.sup_labels = [
                     [str(x) for x in (v if isinstance(v, (list, tuple)) else [v])] for v in raw_sup
                 ]
-            # CONCEPTS (ConceptObjective): a per-row dict of named facets -> the concepts true of each, e.g.
-            # {"vocals": ["yell-singing", "gang-vocals"], "tempo": {"7": 0.1, "8": 0.9}}. Multi-latent rows pass
-            # a LIST of those dicts, one per tick. The alphabet is DISCOVERED here by scanning the column — no
-            # index is ever authored — then frozen into the head's codebook by the injected `code_source`.
+            # ConceptObjective accepts one facet mapping per target step. Discover a deterministic alphabet from
+            # those mappings, then let the configured code source construct the fixed codebook.
             self.concept_alphabet: Optional[dict[str, list[str]]] = None
             self.concept_laws: Optional[list[list[dict[int, dict[int, float]]]]] = None
             concept_field = getattr(args, "concept_field", None)
@@ -528,9 +547,7 @@ class Trainer:
                     f"{sizes}",
                     flush=True,
                 )
-            # STATE MEMBER labels (StateResidualObjective): same sparse per-tick shape as the frontier column, but
-            # these are not decoded OUT of the emission by an aux head — they CONSTITUTE its named half, so the
-            # objective reads them directly rather than through a probe.
+            # StateResidualObjective reads per-step member indices directly as supervision for its named component.
             self.state_labels: Optional[list[list[list[int]]]] = None
             state_field = getattr(args, "state_field", None)
             if state_field is not None:
@@ -539,17 +556,12 @@ class Trainer:
                     [[int(i) for i in tick] for tick in row[: args.max_target_items]]
                     for row in raw_st
                 ]
-            # optional PLUGGABLE AUXILIARY HEADS (langset.heads): each user Head names a `target` dataset column. Read
-            # the RAW per-row values here (a list per row for reads="recon", a scalar for reads="hidden"); resolution
-            # to class maps / float tensors happens per-loss-kind in _train_multi. The phase shim reuses sup_labels,
-            # so it is NOT read here. [] = off (byte-identical). Reject on the single-latent path (heads are
-            # multi-latent only — the phase-head lineage they generalize lives only here).
+            # Read each auxiliary head's target column. Runtime resolution later converts these raw row values into
+            # class IDs or numeric tensors according to the configured loss.
             self.head_cols: dict[str, list[object]] = {}
             for h in getattr(args, "heads", []):
                 self.head_cols[h.name] = list(cols[inv.get(h.target, h.target)])
-            # TEXT REPLAY tag (multi-latent): rows marked "learn" rehearse the backbone's plain next-token ability
-            # (interleaved at `learn_ratio` in _train_multi). Must be set HERE — this branch returns before the
-            # single-latent is_learn setup below. learn_field unset / learn_ratio=0 -> all-False (feature off).
+            # Mark rows used for multi-latent text replay. This branch returns before the single-latent replay setup.
             self.is_learn: list[bool] = [False] * len(self.input_text)
             learn_field = getattr(args, "learn_field", None)
             if learn_field is not None and args.learn_ratio > 0:
@@ -609,6 +621,12 @@ class Trainer:
             print(f"[langset] {len(self.input_text)} rows{jepa}{masked}{hn}{lr}", flush=True)
 
     def train(self) -> LangSetModel:
+        """Train the configured model and return the best restored model.
+
+        Dispatches to the multi-latent strategy loop when the model uses a multi-latent head; otherwise runs
+        single-latent contrastive training. Checkpointing, early stopping, text replay, and auxiliary losses are
+        controlled by :class:`TrainingArguments`.
+        """
         if self.multi_latent:
             return self._train_multi()
         a, m = self.args, self.model
@@ -617,9 +635,8 @@ class Trainer:
         rng = np.random.default_rng(a.seed)
         tok = m.tokenizer
 
-        # Convert all text to tokenized tensors
         def tok_to(texts: list[str], mx: int) -> tuple[torch.Tensor, torch.Tensor]:
-            """Tokenize text to input_ids and attention_mask tensors"""
+            """Tokenize text into input-ID and attention-mask tensors on the model device."""
             e = tok(texts, padding=True, truncation=True, max_length=mx, return_tensors="pt")
             return e["input_ids"].to(dev), e["attention_mask"].to(dev)
 
@@ -710,8 +727,7 @@ class Trainer:
             )
 
         def save_resume(next_ep: int) -> None:
-            """Atomically persist FULL training state (weights+opt+connector+epoch+best+rng) so a preempt/retry resumes
-            from the last epoch boundary instead of ep0. tmp+rename => a mid-write preempt cannot corrupt the good file."""
+            """Save model, optimizer, selection, and RNG state through an atomic file replacement."""
             if not a.resume_dir:
                 return
             d = Path(a.resume_dir)
@@ -736,11 +752,10 @@ class Trainer:
             )
             tmp.replace(d / "resume.pt")
             if self.on_checkpoint is not None:
-                self.on_checkpoint()  # e.g. Volume.commit() -> durable across preempt
+                self.on_checkpoint()  # Notify the caller after the checkpoint becomes durable.
 
-        # ---- pick the step engine ONCE (see the _StepEngine classes above): FROZEN-POOL (backbone frozen +
-        # pool_mode="last" -> features static, cached once, head-only training in seconds) vs the LIVE backbone
-        # (default). The epoch loop + eval below then run ONE path with no per-feature `if`s. ----
+        # Select the feature engine once. Frozen last-token pooling caches backbone features; other configurations
+        # compute features through the backbone during each step.
         if getattr(m, "pool_mode", "") == "last" and getattr(m, "_frozen_bb", False):
             engine: _StepEngine = FrozenPoolStepEngine(
                 m, a, ids, mask, t2_ids, t2_mask, hn_ids, hn_mask
@@ -759,12 +774,10 @@ class Trainer:
                 self.input_text,
                 self.target_text,
             )
-        engine.precompute()  # no-op for the backbone; frozen-pool encodes+caches every view here
+        engine.precompute()  # The frozen-pool engine caches all view features here.
 
-        # OPTIONAL step-level diagnostics (env-gated, OFF by default = byte-identical). Mirrors the multi-latent path's
-        # profiler harness for the single-latent trainer: LANGSET_PROFILE_STEPS=N captures a torch profiler over the
-        # first N steps then dumps a CUDA-time table and EXITS; LANGSET_MEM_PRINT=N prints the MEASURED VRAM peak for
-        # the first N steps (for right-sizing batch/seq-len instead of guessing at OOMs).
+        # Environment-gated diagnostics. LANGSET_PROFILE_STEPS profiles the requested number of steps and exits;
+        # LANGSET_MEM_PRINT reports CUDA memory usage for the requested number of steps.
         import os as _os
         import time as _time
 
@@ -794,12 +807,13 @@ class Trainer:
             )
 
         def _grad_cache_step(idx: torch.Tensor) -> float:
-            """GradCache: EXACT full-batch contrastive gradient with peak activation = one gc_chunk (Gao et al.
-            2021). Lets `batch_size` (in-batch negatives) grow far past what one graph fits. Phase 1 encodes the
-            whole batch in no_grad chunks (only [B,d] embeddings survive), builds the loss on the full batch and
-            caches d(loss)/d(embedding); Phase 2 re-forwards each chunk WITH grad and injects the cached grads via
-            autograd.backward -> exact param grad. emb_slot heads get their grad in phase 1 (they read only the
-            cached embeddings); the backbone gets its grad in phase 2. Requires dropout==0."""
+            """Compute a full-batch contrastive gradient with chunk-sized backbone activation memory.
+
+            The first pass computes detached batch embeddings and their loss gradients. Each chunk is then
+            recomputed with autograd enabled, and the cached embedding gradients are propagated through the
+            backbone. Embedding-slot heads receive gradients from the first pass. Deterministic forwards, including
+            zero dropout, are required.
+            """
             ch = a.gc_chunk or a.batch_size
             chunks = [idx[j : j + ch] for j in range(0, len(idx), ch)]
             preds: list[torch.Tensor] = []
@@ -950,10 +964,9 @@ class Trainer:
                                     connector=connector,
                                 )
                             ).to_tensor()
-                        )  # SKIP so recon's fp32 full-vocab ([B,S,vocab]) projection graph is NOT built every step
-                        #  (that graph, not the stripped lm_head, OOM'd a 0.6B at 84GB without grad_ckpt). Also lets
-                        #  frozen-pool run. Direct path only: grad_cache asserts lam_recon==0 (embedding-only caching
-                        #  cannot hold the per-token backbone graph recon needs). Default 0.3 -> unchanged.
+                        )
+                        # Building reconstruction only when enabled avoids its full-vocabulary projection graph.
+                        # GradCache does not support this per-token backbone graph and requires `lam_recon == 0`.
                     opt.zero_grad()
                     loss.backward()
                     opt.step()
@@ -1001,10 +1014,9 @@ class Trainer:
             )  # engine owns HOW val embeddings are produced
             mrr = selection.retrieval_mrr(emit_in, emit_tg)["mrr"]
             collapse = selection.collapse_score(emit_in)
-            if (
-                not engine.supports_recon or a.lam_recon == 0.0
-            ):  # recon not the objective (frozen-pool OR lam_recon=0) ->
-                recon_val = 0.0  # select by retrieval MRR, and skip the wasteful recon-val
+            if not engine.supports_recon or a.lam_recon == 0.0:
+                # Without a reconstruction objective, select by collapse-penalized retrieval and skip reconstruction.
+                recon_val = 0.0
                 sel_score = mrr - _COLLAPSE_PENALTY * max(
                     0.0, collapse - _COLLAPSE_FLOOR
                 )  # fp32 vocab projection
@@ -1123,22 +1135,12 @@ class Trainer:
             perm[cut:].tolist() or perm[:1].tolist()
         )  # never-empty val (a tiny smoke can fill train)
 
-        # Target source (stop-grad EMA twin by default): supplies the target latents so both sides don't move
-        # together and collapse. Selected ONCE (see the _TargetSource seam).
-        target_source: _TargetSource = a.target_source(
-            m, a, tok, dev
-        )  # target strategy (INJECTED), built ONCE
+        # Build the configured target source once for the training run.
+        target_source: _TargetSource = a.target_source(m, a, tok, dev)
 
-        # PLUGGABLE AUXILIARY HEADS (langset.heads) — the generalization of the phase head. Each Head hangs a small
-        # supervised head off the model at a chosen READ SITE ("recon" = per emitted latent, like the phase head |
-        # "hidden" = pooled per-sequence backbone hidden) with a chosen LOSS ("ce"/"mse"/custom callable) and
-        # LIFECYCLE (transient shaping-gradient, or PERSISTED + queryable at inference). `lam_phase` is folded in as
-        # the `phase` SHIM (a transient recon+CE head over sup_labels), built FIRST so its nn.Linear draws RNG at the
-        # exact point the old inline phase head did -> lam_phase>0 is byte-identical (guarded by the multi-latent
-        # golden). User heads follow. Each RtHead owns its nn.Linear (trainer-owned, added to the optimizer below);
-        # a PERSISTED head is ALSO registered on the model (shared module) so save_pretrained serializes it and
-        # `head_output()` can query it at inference. phase_head/phase_ids stay None/{} for MultiStepCtx back-compat
-        # (PhaseTerm was dropped from the default loss terms; phase is applied inline like the other heads).
+        # Resolve auxiliary heads before constructing the optimizer. The phase compatibility option becomes a
+        # transient classification head; user-configured heads follow. Persisted heads share their module with the
+        # model so save_pretrained() and head_output() can retain and query them.
         phase_head: Optional[torch.nn.Module] = None
         phase_ids: dict[str, int] = {}
         _spec_values: list[tuple[Head, list[object]]] = []
@@ -1199,9 +1201,10 @@ class Trainer:
 
         @torch.no_grad()
         def evaluate() -> dict[str, float]:
-            """Free-roll each val seed -> emitted latents; decode each by nearest-neighbor against an EMA-emitted bank
-            of the val `target_texts`. Reports (a) retrieval MRR vs the chain's OWN targets and (b) a NON-COLLAPSE
-            diversity count = distinct nearest-bank items produced (state must not mean-collapse to one mode)."""
+            """Evaluate free-running validation emissions against the target-source retrieval bank.
+
+            Reports retrieval MRR against each row's targets and the number of distinct nearest-bank items emitted.
+            """
             m.eval()
             import time as _et
 
@@ -1320,8 +1323,7 @@ class Trainer:
             )
 
         def save_resume(next_ep: int) -> None:
-            """Atomically persist FULL multi-latent training state so a preempt/retry resumes from the last epoch
-            boundary instead of ep0. tmp+rename => a mid-write preempt cannot corrupt the good file."""
+            """Save multi-latent training and RNG state through an atomic file replacement."""
             if not a.resume_dir:
                 return
             d = Path(a.resume_dir)
@@ -1388,12 +1390,10 @@ class Trainer:
                 return _rfn(name)
             return _nullctx()
 
-        loss_terms = a.loss_terms(a)  # aux separation/shaping terms (INJECTED), built ONCE
+        loss_terms = a.loss_terms(a)  # Build the configured auxiliary loss terms once.
 
-        # optional TEXT REPLAY (multi-latent). Rows tagged `learn` (via `learn_field`) rehearse the backbone's plain
-        # text ability with a next-token CE on (input_text -> target_texts[0]), interleaved with the latent objective
-        # so multi-latent co-training doesn't erode the LM. Ported from the single-latent learn path; projection via
-        # the tied input embedding (no lm_head). learn_ratio=0 / no learn rows = off (byte-identical to before).
+        # Rows marked for text replay rehearse next-token prediction from input_text to the first target text. The
+        # replay loss uses the tied input embedding because the language-model output head is not retained.
         learn_pool = [
             i for i in range(len(seeds)) if getattr(self, "is_learn", [False] * len(seeds))[i]
         ]
@@ -1442,11 +1442,13 @@ class Trainer:
             flat_texts: list[str],
             agg: dict[str, float],
         ) -> float:
-            """Multi-latent GradCache. Phase 1 rolls out the FULL batch under no_grad (a SHARED ss_mask makes the
-            scheduled-sampling rollout deterministic), runs the cross-batch recon-pure terms on the full-batch
-            recon, and caches d(loss)/d(recon). Phase 2 re-rolls each gc_chunk WITH grad, backprops the (row-weighted)
-            base loss, and injects the cached recon-grads -> the cross-batch term is EXACT full-batch; the per-row
-            base loss is accumulated (pragmatic, see grad_cache docs). Peak activation = one chunk."""
+            """Compute multi-latent cross-batch gradients with chunk-sized activation memory.
+
+            The detached full-batch rollout uses a shared scheduled-sampling mask, evaluates cross-batch terms, and
+            caches gradients with respect to emitted latents. Each chunk is then rolled out again with autograd
+            enabled to propagate the cached gradients and its row-weighted base loss. Cross-batch terms retain their
+            full-batch semantics; base losses are accumulated per row.
+            """
             ss_prob = a.ss_prob
             assert (
                 ss_prob is not None
@@ -1629,9 +1631,8 @@ class Trainer:
                         _k, _raw, _w = contrib
                         loss = loss + _w * _raw
                         agg[_k] = agg.get(_k, 0.0) + float(_raw.detach())
-                for h in rt_heads:  # PLUGGABLE AUX HEADS (langset.heads): phase shim + user heads. Applied HERE (right
-                    # after the loss terms, before sigreg) — the exact summation slot the old PhaseTerm held, so a
-                    # phase-only run is byte-identical. Each self-skips (loss_on -> None) when nothing supervises it.
+                # Apply resolved auxiliary heads after the general loss terms and before target regularization.
+                for h in rt_heads:
                     if (
                         h.spec.reads == "recon"
                     ):  # per emitted latent (grad shapes the emission geometry, like the phase head)
