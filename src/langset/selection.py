@@ -1,6 +1,10 @@
-"""Validation metrics for early-stop. The hard-won rule: NEVER select on training loss — a contrastive objective
-can minimize it by COLLAPSING the geometry. Selection scores held-out input-view <-> target-view retrieval and
-held-out reconstruction, with a hard collapse penalty (see Trainer)."""
+"""Validation metrics for retrieval quality and representation collapse.
+
+This module provides held-out retrieval MRR, mean-cosine collapse scoring, and
+k-nearest-neighbor purity. The trainer combines these metrics with
+reconstruction evaluation and a collapse penalty when selecting checkpoints;
+the metric functions here do not apply that policy themselves.
+"""
 
 from __future__ import annotations
 

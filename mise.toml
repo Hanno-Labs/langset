@@ -23,3 +23,8 @@ run = "uv run ruff format --check src tests"
 description = "Run the test suite"
 sources = ["src/**/*.py", "tests/**/*.py", "pyproject.toml"]
 run = "uv run pytest tests/"
+
+[tasks.docs]
+description = "Generate API documentation with pdoc"
+sources = ["src/**/*.py", "README.md", "pyproject.toml"]
+run = "uv run --extra docs pdoc -o docs src/langset/*.py"

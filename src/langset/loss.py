@@ -1,4 +1,31 @@
-"""Loss functions."""
+"""Composable loss objectives used by langset's training strategies.
+
+This module separates the mathematical objectives from the training loop.
+Each loss function accepts a typed context dataclass containing the tensors
+and configuration it needs, and returns a `Loss`. The trainer can then
+combine the result with other objectives and call ``to_tensor()`` for the
+scalar used in backpropagation.
+
+The objectives fall into four groups:
+
+- **Latent grounding:** `recon_loss` teaches an emitted latent to
+  reconstruct its target text.
+- **Representation alignment:** `sl_loss` and `info_nce_loss`
+  align paired embeddings and contrastive candidates. The supervised
+  contrastive objective groups emitted embeddings by labels.
+- **Multi-latent supervision:** `soft_target_cross_entropy_loss`
+  trains distributions over concepts or states, while `stop_loss`
+  teaches autoregressive emissions when to terminate.
+- **Text-generation support:** `learn_loss` rehearses document-to-target
+  associations, and `cot_loss` trains optional chain-of-thought
+  generation.
+
+The context classes are intentionally explicit: they document tensor shapes,
+make each objective independently testable, and keep loss implementations
+decoupled from batch construction and optimization orchestration. Most users
+will select these objectives through a strategy or ``TrainingArguments``
+configuration rather than call them directly.
+"""
 
 from __future__ import annotations
 
@@ -53,7 +80,7 @@ class TrainingContext:
 
 @dataclass
 class ReconstructionLossContext(TrainingContext):
-    """Inputs to :func:`recon_loss`.
+    """Inputs to `recon_loss`.
 
     ``latent`` contains one latent vector per selected row. ``tr_ids`` and
     ``tr_mask`` contain tokenized target text for every dataset row; ``rows``
@@ -139,7 +166,7 @@ recon_loss_fn: LossFn[ReconstructionLossContext] = recon_loss
 
 @dataclass
 class LearnLossContext(TrainingContext):
-    """Inputs to :func:`learn_loss` for a batch from the replay pool."""
+    """Inputs to `learn_loss` for a batch from the replay pool."""
 
     pos: torch.Tensor
     """Indices selecting replay examples from the tokenized replay pool."""
@@ -245,7 +272,7 @@ def sl_loss(
     ``mask_keys`` exclude known false negatives from that anchor's denominator.
     This function prepares those single-latent candidates, positive indices, and
     exclusion mask, then delegates the primary contrastive calculation to
-    :func:`info_nce_loss`.
+    `info_nce_loss`.
 
     The contrastive term has an implicit weight of ``1.0``. When
     ``args.lam_uniform > 0`` and the batch contains multiple rows, the returned
@@ -310,7 +337,7 @@ sl_loss_fn: LossFn[SLContext] = sl_loss
 # ---- multi-latent loss kernels ------------------------------------------------------------------
 @dataclass
 class InfoNCELossContext:
-    """Inputs to :func:`info_nce_loss`.
+    """Inputs to `info_nce_loss`.
 
     The candidate at ``positive_indices[row]`` is the positive for
     ``anchors[row]``. All other unmasked candidates are negatives.
@@ -362,7 +389,7 @@ info_nce_loss_fn: LossFn[InfoNCELossContext] = info_nce_loss
 
 @dataclass
 class SoftTargetCrossEntropyContext:
-    """Inputs to :func:`soft_target_cross_entropy_loss`."""
+    """Inputs to `soft_target_cross_entropy_loss`."""
 
     logits: torch.Tensor
     """Unnormalized class scores, shaped ``[..., class_count]``."""
@@ -403,7 +430,7 @@ soft_target_cross_entropy_loss_fn: LossFn[SoftTargetCrossEntropyContext] = (
 
 @dataclass
 class StopLossContext:
-    """Inputs to :func:`stop_loss` for an autoregressive multi-latent emission."""
+    """Inputs to `stop_loss` for an autoregressive multi-latent emission."""
 
     logits: torch.Tensor
     """One stop logit per row and emission position, shaped ``[batch_size, max_items + 1]``."""
@@ -438,7 +465,7 @@ stop_loss_fn: LossFn[StopLossContext] = stop_loss
 
 @dataclass
 class SupervisedContrastiveLossContext:
-    """Inputs to :func:`supervised_contrastive_loss`."""
+    """Inputs to `supervised_contrastive_loss`."""
 
     embeddings: torch.Tensor
     """Emitted embeddings, shaped ``[item_count, embedding_dim]``."""
@@ -511,7 +538,7 @@ supervised_contrastive_loss_fn: LossFn[SupervisedContrastiveLossContext] = (
 
 @dataclass
 class CoTLossContext(TrainingContext):
-    """Inputs to :func:`cot_loss` after the strategy tokenizes seed and reasoning text."""
+    """Inputs to `cot_loss` after the strategy tokenizes seed and reasoning text."""
 
     seed_ids: torch.Tensor
     """Left-padded seed token IDs, shaped ``[batch_size, seed_length]``."""
@@ -563,7 +590,7 @@ cot_loss_fn: LossFn[CoTLossContext] = cot_loss
 
 @dataclass
 class BridgeLossContext:
-    """Inputs to :func:`bridge_loss` after Hungarian matching prepares bridge targets."""
+    """Inputs to `bridge_loss` after Hungarian matching prepares bridge targets."""
 
     matched_predictions: torch.Tensor
     """Hungarian-matched query embeddings, shaped ``[match_count, embedding_dim]``."""

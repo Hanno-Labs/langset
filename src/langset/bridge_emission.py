@@ -1,23 +1,20 @@
-"""QueryBridgeEmission — a NON-autoregressive, continuous, parallel-query emission family, ported from the
-validated proof (ii3 `bridge_lightning.py`) into langset's `_EmissionObjective` seam.
+"""Parallel-query continuous emission for multi-latent models.
 
-One forward: N learned query tokens cross-attend the (frozen) backbone's per-token hidden states → N vectors +
-a validity/count logit each. Trained by DETR Hungarian matching to the row's target latents, then per-fact
-InfoNCE (cross-row negatives) + validity BCE. It reuses the widened seams: `build_targets` (default positional
-teacher-forcing supplies the target latents), the objective-before-optimizer order (its module registers on the
-model, so `m.parameters()` trains it), and the canonical `EmissionOut` log keys.
+`QueryBridgeEmission` uses learned query vectors to cross-attend the backbone's token-level hidden states. Each
+query produces an L2-normalized latent vector and a validity logit. During training, Hungarian matching assigns
+query slots to target latents, and the objective combines an InfoNCE loss over matched vectors with binary
+cross-entropy over validity logits.
 
-Inject with `TrainingArguments(emission=QueryBridgeEmission, freeze_backbone=True)`. Pair with a query/frozen
-`_TargetSource` and set `lam_multi_nce=0` (its base loss already does the contrastive term). `n_queries` (default
-16) is read off args via getattr — no TrainingArguments change required.
+A typical configuration uses `QueryBridgeEmission` with `FrozenEncoderTarget`, `freeze_backbone=True`, and
+`lam_multi_nce=0`. The separate multi-latent NCE term should be disabled because this objective already includes
+a contrastive loss. `n_queries` controls the maximum number of vectors emitted per input.
 
-HARD NEGATIVES: set `hard_neg_field="<col>"` (a per-row list of confusable texts, e.g. adjacent-quarter queries) and
-the family folds them into its OWN InfoNCE denominator — one softmax over [in-batch targets ++ hard-negs], the exact
-mechanism that lets the emitted vector separate same-entity/wrong-time near-misses. Absent `hard_neg_field`, the bank is plain in-batch (byte-identical).
+When `hard_neg_field` is configured, the corresponding texts are encoded and added to the InfoNCE target bank as
+additional negatives. At inference time, the bridge emits query slots whose validity probability exceeds 0.5,
+subject to `max_steps`, with a one-slot fallback when none pass the threshold.
 
-Retrieval is preserved BY CONSTRUCTION: the backbone is frozen, so the base embedder's geometry is untouched;
-the bridge is a pure add-on. Eval routes through `emit_infer` (one pass, validity-gated) instead of the AR
-rollout.
+Freezing the backbone keeps its existing embedding parameters unchanged; this emission strategy does not freeze
+the backbone automatically.
 """
 
 from __future__ import annotations
@@ -40,10 +37,14 @@ if TYPE_CHECKING:
 
 
 class FrozenEncoderTarget(_TargetSource):
-    """Targets = the FROZEN encoder's OWN embedding of the target texts, i.e. E(text). Pair with
-    `target_texts = queries` to reproduce the 'query-target' objective (emitted vectors trained to match E(query),
-    which is exactly what the bench scores). No EMA twin and no self-distillation — the frozen model IS the target,
-    so `twin = model` and `update` is a no-op. Retrieval geometry preserved by construction."""
+    """Use the model's normalized text embeddings as target latents.
+
+    `encode()` evaluates target texts with the same `LangSetModel` used for training and does not track gradients.
+    The target source has no EMA copy: `twin` refers to the model itself and `update()` is a no-op.
+
+    Use `freeze_backbone=True` when the target embedding space must remain fixed. This target source does not freeze
+    model parameters itself.
+    """
 
     suppresses_nce = False
 
@@ -55,14 +56,14 @@ class FrozenEncoderTarget(_TargetSource):
         dev: torch.device,
     ) -> None:
         self.m, self.a, self.tok, self.dev = model, args, tok, dev
-        self.twin = model  # eval encodes its retrieval bank with the frozen model itself
+        self.twin = model  # Evaluation encodes the retrieval bank with the same model.
 
     def encode(self, texts: list[str]) -> torch.Tensor:
         with torch.no_grad():
             z = self.m.encode(texts, convert_to_numpy=False, normalize_embeddings=True)
-        return z.to(self.dev).float()  # ty: ignore[unresolved-attribute]  # encode(convert_to_numpy=False) -> Tensor
+        return z.to(self.dev).float()  # ty: ignore[unresolved-attribute]  # Tensor when convert_to_numpy=False
 
-    def update(self) -> None:  # nothing to track — the target model is frozen
+    def update(self) -> None:  # This target source has no EMA state to update.
         pass
 
 
@@ -74,7 +75,10 @@ def _heads_for(d: int) -> int:
 
 
 class QueryBridge(nn.Module):
-    """N learned queries cross-attend the frozen substrate -> N L2-normalized vectors + per-query validity logit."""
+    """Decode learned queries against token-level hidden states.
+
+    The module returns one L2-normalized vector and one validity logit for each query slot.
+    """
 
     def __init__(self, d: int, n_queries: int, n_layers: int = 2) -> None:
         super().__init__()
@@ -93,7 +97,10 @@ class QueryBridge(nn.Module):
 
 
 class QueryBridgeEmission(_EmissionObjective):
-    """Parallel-query continuous emission (see module docstring). `codebook=False`: no codebook and no AR rollout."""
+    """Train and infer a set of continuous latent vectors in one decoder pass.
+
+    This objective uses no discrete codebook and implements non-autoregressive inference through `emit_infer()`.
+    """
 
     codebook = False
 
@@ -105,7 +112,7 @@ class QueryBridgeEmission(_EmissionObjective):
         trainer: "Trainer",
     ) -> None:
         super().__init__(model, args, dev, trainer)
-        try:  # SciPy is an optional dep — only this emission family needs it (Hungarian matching)
+        try:  # SciPy is required only for Hungarian matching in this emission strategy.
             from scipy.optimize import linear_sum_assignment
         except ModuleNotFoundError as e:  # pragma: no cover - trivial guard
             raise ModuleNotFoundError(
@@ -120,13 +127,12 @@ class QueryBridgeEmission(_EmissionObjective):
         self.lam_valid = float(getattr(args, "bridge_lam_valid", 1.0))
         self.pos_weight = float(getattr(args, "bridge_pos_weight", 2.0))
         bridge = QueryBridge(d, self.n_queries).to(dev)
-        # Register on the model so `m.parameters()` (built AFTER the objective now) trains it. Persistence via the
-        # aux-head plug is a follow-up; for now this makes the module optimizer-visible.
+        # Register the bridge on the model so optimization and checkpoint persistence include it.
         model.add_module("emission_bridge", bridge)
         pending = getattr(model, "_emission_bridge_state", None)
         if (
             pending is not None
-        ):  # restore weights persisted by save_pretrained (serve-time / resumed run)
+        ):  # `LangSetModel.load()` stages persisted weights until this strategy is attached.
             bridge.load_state_dict(pending)
         self.bridge = bridge
 
@@ -134,8 +140,10 @@ class QueryBridgeEmission(_EmissionObjective):
         return self.bridge.parameters()
 
     def _hard_negs(self, bidx: list[int]) -> list[str]:
-        """Flatten this batch's per-row hard-negative texts (from the trainer's `hard_neg_field` column) into one
-        pooled list. Empty when no `hard_neg_field` is configured (or a serve-time attach without a trainer)."""
+        """Collect nonblank hard-negative texts for the selected dataset rows.
+
+        Returns an empty list when no trainer hard-negative column is available.
+        """
         hn = getattr(self.trainer, "hard_neg_texts", None)
         if not hn:
             return []
@@ -156,28 +164,27 @@ class QueryBridgeEmission(_EmissionObjective):
         m, dev = self.m, self.dev
         d = target_lat.size(-1)
         ids, mask = se["input_ids"], se["attention_mask"]
-        # per-token substrate from the (frozen when freeze_backbone) backbone — same read seed_hidden does, un-pooled
+        # Read unpooled token-level hidden states from the backbone.
         substrate = m._last_hidden(m._run_backbone(m.embed(ids), mask, ids, 0)).float()  # [B, T, d]
         vecs, vlog = self.bridge(substrate, mask.bool())  # [B, nq, d], [B, nq]
 
         tgt = F.normalize(target_lat.float(), dim=-1)  # [B, lmax, d]
         bank = tgt[
             valid
-        ]  # [Ntot, d] — cross-row (in-batch) InfoNCE negatives; positives index into THIS prefix
-        # HARD-NEG bank: adjacent-quarter (same-entity / wrong-time) confusables from `hard_neg_field`, encoded in the
-        # SAME (query) space as the targets and folded into the SAME InfoNCE denominator — the mechanism the standalone
-        # used to beat entity×time. Absent hard_neg_field -> no-op, byte-identical to the plain in-batch bank.
+        ]  # Valid targets lead the InfoNCE bank; positive indices use this ordering.
+        # Encode configured hard negatives in the target embedding space and append them to the InfoNCE denominator.
+        # They are negatives only, so positive indices remain valid.
         hn_texts = self._hard_negs(bidx)
         if hn_texts:
             with torch.no_grad():
                 hn = self.m.encode(hn_texts, convert_to_numpy=False, normalize_embeddings=True)
-            bank = torch.cat([bank, hn.to(dev).float()], dim=0)  # ty: ignore[unresolved-attribute]  # -> Tensor
+            bank = torch.cat([bank, hn.to(dev).float()], dim=0)  # ty: ignore[unresolved-attribute]  # encode returns a Tensor
         recon = torch.zeros(b, lmax, d, device=dev)
         vlab = torch.zeros_like(vlog)
         matched_pred: list[torch.Tensor] = []
         pos: list[int] = []
-        nq = vecs.size(1)  # number of query slots = MAX matchable emissions per row
-        # ONE device sync for the whole batch: query×target cosine, then Hungarian per row on CPU (SciPy is CPU-only).
+        nq = vecs.size(1)  # Maximum number of targets that can be matched in each row.
+        # Transfer all query-target similarities to CPU once, then run SciPy matching per row.
         sims = torch.bmm(vecs, tgt.transpose(1, 2)).detach().float().cpu().numpy()  # [B, nq, lmax]
         off = 0
         for r in range(b):
@@ -186,12 +193,10 @@ class QueryBridgeEmission(_EmissionObjective):
                 continue
             mi_eff = min(
                 mi, nq
-            )  # guard: SciPy returns min(nq, mi) pairs — extra targets stay in the bank as negs
-            pr, tc = self._match(-sims[r, :, :mi_eff])  # cost = -cos over [nq, mi_eff]
+            )  # At most `nq` targets can be matched; additional targets remain negatives.
+            pr, tc = self._match(-sims[r, :, :mi_eff])  # Maximize cosine similarity.
             for p, c in zip(pr, tc):
-                recon[r, c] = vecs[
-                    r, p
-                ]  # matched emission -> its target's slot (aligns recon with `valid`)
+                recon[r, c] = vecs[r, p]  # Place the matched prediction in its target-aligned slot.
                 matched_pred.append(vecs[r, p])
                 pos.append(off + int(c))
                 vlab[r, p] = 1.0
@@ -218,21 +223,28 @@ class QueryBridgeEmission(_EmissionObjective):
         return EmissionOut(
             recon=recon,
             base_loss=base,
-            # reuse the canonical log keys (semantic map: recon_loss<-InfoNCE, loss_stop<-validity BCE, loss_dims<-0)
+            # Preserve canonical fields: `recon_loss` is InfoNCE, `loss_stop` is validity BCE, and `loss_dims` is unused.
             logs={"loss_stop": vloss.detach(), "loss_dims": zero, "recon_loss": nce.detach()},
             code_logits=None,
         )
 
     @torch.no_grad()
     def emit_infer(self, texts: list[str], max_steps: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """One-pass inference: text -> a validity-gated fact-vector SET per row (NO autoregression). Returns
-        (lat [B, Lmax, d], lens [B]) padded — the same shape the AR rollout yields, so eval/retrieval is unchanged."""
+        """Emit validity-gated latent vectors for a batch of texts.
+
+        The bridge runs once per batch and keeps query slots whose validity probability exceeds 0.5. If no slot
+        passes the threshold, the highest-logit slot is retained. At most `max_steps` vectors are returned per input.
+
+        Returns:
+            A pair `(latents, lengths)`. `latents` has shape `[batch, max_emitted, latent_dim]` and is zero-padded;
+            `lengths` contains the number of retained vectors for each input.
+        """
         m, dev = self.m, self.dev
         e = m.tokenizer(
             texts,
             padding=True,
             truncation=True,
-            max_length=self.a.max_len,  # honor the run's TrainingArguments.max_len (== training truncation)
+            max_length=self.a.max_len,  # Match the truncation length used during training.
             padding_side="left",
             return_tensors="pt",
         ).to(dev)
@@ -244,7 +256,7 @@ class QueryBridgeEmission(_EmissionObjective):
         lens: list[int] = []
         for r in range(vecs.size(0)):
             idx = keep[r].nonzero(as_tuple=True)[0]
-            if idx.numel() == 0:  # fallback: never emit zero — keep the single most-confident query
+            if idx.numel() == 0:  # Always retain the most confident slot.
                 idx = vlog[r].argmax().unsqueeze(0)
             idx = idx[:max_steps]
             rows.append(vecs[r, idx])

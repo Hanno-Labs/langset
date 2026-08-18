@@ -50,6 +50,18 @@ trajectory and the uncertainty inside each step — no hand-built simulator. Wha
 pip install langset
 ```
 
+## API documentation
+
+Generate the API reference locally with [pdoc](https://pdoc.dev/):
+
+```bash
+uv sync --extra docs
+mise run docs
+open docs/langset.html
+```
+
+The generated `docs/` directory is local build output and is intentionally not committed. The reference includes the public package plus its implementation modules, including `langset.loss`.
+
 ## Quickstart — a world model
 
 Rows are `input_text` (the current state) → `target_texts` (the **ordered ticks** to emit). A matching `concepts`

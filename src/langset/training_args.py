@@ -1,4 +1,16 @@
-"""Training configuration for langset."""
+"""Declarative training configuration for langset's trainer and strategies.
+
+`TrainingArguments` collects the knobs that control tokenization,
+optimization, latent emission, auxiliary objectives, validation, checkpointing,
+and strategy injection. It is intentionally configuration-only: the trainer
+consumes these values, while the interchangeable strategy classes and loss
+functions implement the behavior.
+
+Single-latent and multi-latent runs share the same configuration object. For
+multi-latent training, fields such as ``emission``, ``target_source``,
+``loss_terms``, and ``seed_builder`` select implementations rather than adding
+feature-specific branches to the trainer.
+"""
 
 from __future__ import annotations
 

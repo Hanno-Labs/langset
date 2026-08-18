@@ -1,13 +1,17 @@
-"""Dataset contract for langset.
+"""Dataset contracts and small helpers for preparing langset training data.
 
-A training example is a row with:
-  - `input_text`   : the text you'll have at inference (e.g. a name, a query, a review)
-  - `target_text`  : a description of the SAME item that DEFINES where it should land. The geometry is whatever
-                     these descriptions describe — point them at the axis you care about. Point them at something
-                     `input_text` can't trivially regenerate, or you're just distilling a text encoder.
+The core training contract is a row with two views of the same item:
 
-Pass a `datasets.Dataset` or a `list[dict]` to `Trainer`; use `column_mapping` to rename your columns onto
-`input_text` / `target_text`.
+- ``input_text`` is the text available at inference time, such as a name,
+  query, or review.
+- ``target_text`` is a description of that same item that defines the geometry
+  the model should learn. Choose a target that exposes the property of
+  interest and cannot be trivially regenerated from ``input_text``; otherwise
+  the objective mostly distills a text encoder.
+
+Pass a ``datasets.Dataset`` or ``list[dict]`` to `langset.Trainer`. Use
+``column_mapping`` when an existing dataset uses different column names, or
+use `from_records` to project arbitrary records onto the basic contract.
 """
 
 from __future__ import annotations

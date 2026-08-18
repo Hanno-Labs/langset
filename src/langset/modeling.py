@@ -1,8 +1,12 @@
-"""LangSetModel: an LLM (LoRA) + a learned emit head that maps input text -> a latent in a bespoke geometry.
+"""Model and emission-head implementations for LangSet.
 
-The latent lives in the model's OWN hidden space, and the output is Sentence-Transformer-shaped (`encode`,
-`get_sentence_embedding_dimension`, `as_sentence_transformer`) so the trained model drops straight into SetFit
-as a `model_body`.
+`LangSetModel` combines a language-model backbone with a learned emission interface. The emission head can
+project backbone hidden states into a single embedding, multiple continuous latents, or autoregressive codebook
+states. Optional LoRA adaptation supports parameter-efficient fine-tuning.
+
+The model provides Sentence-Transformer-compatible ``encode``, ``get_sentence_embedding_dimension``, and
+``as_sentence_transformer`` methods. Codebook-configured multi-latent models additionally support autoregressive
+state emission through ``rollout``.
 """
 
 from __future__ import annotations
@@ -33,10 +37,9 @@ class _HiddenOutput(Protocol):
 
 
 class _Backbone(Protocol):
-    """The structural surface `LangSetModel` uses on its (peft-wrapped, maybe text-tower-unwrapped) backbone —
-    one Protocol spanning plain Llama/Qwen `ForCausalLM`, text towers, and Gemma-E PLE models. The PLE-only
-    `get_per_layer_inputs` is deliberately NOT declared: it exists on Gemma-E alone and is reached through the
-    `_ple_dim` runtime guard, so pinning it here would wrongly exclude every non-PLE backbone."""
+    """
+    Wraps the backbone model, providing a common interface for accessing hidden states.
+    """
 
     config: PretrainedConfig
 
@@ -219,10 +222,11 @@ def _cfg_set(config: PretrainedConfig, name: str, val: object) -> None:
 
 
 def _text_tower(model: _Backbone) -> _Backbone:
-    """Descend a (peft-wrapped) causal/conditional-generation model to its TEXT transformer — the module that
-    returns hidden states directly, with NO lm_head. Skips the huge-vocab logits projection (Gemma's 262k-vocab
-    lm_head over a full sequence OOMs — we only ever read hidden states) and any vision tower. LoRA is injected
-    in-place on the language Linears, so calling the text tower directly still applies it."""
+    """Return the text transformer inside a PEFT-wrapped generation model.
+
+    Calling the text tower directly avoids the vocabulary projection and any vision tower while retaining LoRA
+    modules injected into the language layers. The returned module exposes hidden states rather than LM logits.
+    """
     node = getattr(
         getattr(model, "base_model", model), "model", model
     )  # peft LoraModel -> underlying HF model
@@ -257,8 +261,8 @@ def build_backbone(
     vocab_size: Optional[int] = None,
 ) -> _Backbone:
     def _top_k_layers(n_layers: int) -> Optional[list[int]]:
-        # LoRA ONLY the top-K transformer layers -> fewer adapters, smaller activation graph -> bigger batch. Emission
-        # reads the FINAL hidden state, so the top layers carry the task-shaping. 0 = all layers (default, unchanged).
+        # Restrict LoRA to the top K transformer layers when requested. A value of zero leaves all eligible layers
+        # adapted. Emission reads the final hidden state, so upper-layer adapters can directly shape its representation.
         return (
             list(range(max(0, n_layers - lora_top_k), n_layers))
             if lora_top_k and n_layers
@@ -270,10 +274,8 @@ def build_backbone(
     dt = torch.bfloat16 if bf16 else torch.float32
 
     if not pretrained:
-        # RANDOM-INIT control arm: copy `llm_model`'s ARCHITECTURE (config) but NOT its weights, then train the whole
-        # net (no LoRA — a low-rank adapter over random weights is meaningless). `arch_overrides` shrinks the net; a
-        # decoupled tokenizer sets `vocab_size` so the fresh embedding table matches it. This is the "does pretraining
-        # matter" baseline: same emission/anti-collapse machinery, zero inherited knowledge.
+        # Build the requested architecture from configuration without loading pretrained weights. The complete
+        # backbone is trainable, and `vocab_size` keeps its new embedding table aligned with a decoupled tokenizer.
         from transformers import AutoConfig  # type: ignore[import-untyped]
 
         cfg = AutoConfig.from_pretrained(llm_model)
@@ -303,8 +305,8 @@ def build_backbone(
     from peft import LoraConfig, get_peft_model  # type: ignore[import-untyped]
 
     def _try_load(dtype_key: str, attn: Optional[str]) -> _Backbone:
-        # sdpa (default) avoids materializing the O(S^2) eager-attention score matrix — a long seed (3072 tokens)
-        # OOM'd a 0.6B model at 72GB on eager. attention_dropout is dropped for multimodal wrappers that reject it.
+        # SDPA avoids materializing the eager attention score matrix. Some multimodal wrappers reject
+        # `attention_dropout`, so retry without that keyword when necessary.
         kw: dict[str, Any] = {dtype_key: dt}
         if attn:
             kw["attn_implementation"] = attn
@@ -321,9 +323,9 @@ def build_backbone(
         except TypeError:
             return _try_load("torch_dtype", attn)
 
-    # A non-default impl (flash_attention_2, flex_attention, ...) is an EXPLICIT performance choice: refuse to silently
-    # downgrade it. sdpa/eager may still fall back (a model that can't do sdpa -> eager) since those are just defaults;
-    # with the default attn_implementation="sdpa", _strict is False so the load path is byte-identical to before.
+    # Treat an explicitly selected nonstandard attention implementation as a strict requirement. Default SDPA and
+    # eager modes may fall back to one another for model compatibility, but an explicit optimized kernel must not be
+    # silently replaced with a slower implementation.
     _strict = bool(attn_implementation) and attn_implementation not in ("sdpa", "eager")
     try:
         base = _load(attn_implementation or None)
@@ -372,19 +374,17 @@ def build_backbone(
         ],
         layers_to_transform=ltt,
     )
-    # strip the lm_head: we only read hidden states, and computing the full-vocab logits
-    # ([B,S,vocab]) every forward OOMs — a 0.6B at bs48/384 hit 78GB purely on Qwen3's 152k-vocab projection.
+    # The model consumes hidden states only. Returning the text tower avoids allocating full-vocabulary logits with
+    # shape `[batch, sequence, vocabulary]` on every forward.
     peft = get_peft_model(base, lora)
     if train_base:
-        # KNOWLEDGE INJECTION: rank-16 LoRA on a FROZEN base can't STORE new facts (only re-style existing ones) —
-        # facts live in the base MLP weights. Unfreeze the whole base so next-token [LEARN] can actually rewrite
-        # "GrEStG=Grundgesetz" -> the real statute. Full-FT capacity; default off (frozen-LoRA, unchanged).
+        # `train_base` requests full fine-tuning rather than adapter-only training, so next-token replay can update
+        # all backbone parameters.
         for p in peft.parameters():
             p.requires_grad_(True)
     if grad_ckpt:
-        # trade compute for activation memory so a LARGE InfoNCE batch (= more in-batch negatives, the dominant lever)
-        # fits — a 4B at batch 4 was negative-starved. use_cache off is required; input-require-grads lets grad reach
-        # checkpointed segments when only LoRA trains (frozen embeddings).
+        # Trade additional computation for lower activation memory. Caching must be disabled, and input gradients are
+        # enabled so checkpointed segments remain connected when embeddings are frozen and only LoRA is trainable.
         base.config.use_cache = False
         peft.gradient_checkpointing_enable()
         peft.enable_input_require_grads()
@@ -394,8 +394,13 @@ def build_backbone(
 
 
 class LangSetModel(nn.Module):
-    """LLM backbone (LoRA) + EmitHead. The latent lives in the model's own hidden space; the geometry is defined
-    by the `target_text` the Trainer contrasts against (see Trainer)."""
+    """Wrap a language-model backbone with continuous or codebook-based emission heads.
+
+    Depending on its configuration, a model can produce a single embedding, multiple learned latent vectors,
+    or an autoregressive sequence of named-state emissions. Use `from_pretrained` or `from_scratch`
+    to construct a model, `encode` for Sentence-Transformer-compatible embeddings, and `rollout` for
+    autoregressive codebook emission.
+    """
 
     def __init__(
         self,
@@ -419,9 +424,9 @@ class LangSetModel(nn.Module):
         self.embed = backbone.get_input_embeddings()
         self.h = _cfg_int(backbone.config, "hidden_size")
         self.vocab_size = _cfg_int(backbone.config, "vocab_size")
-        # Gemma E-series (3n/4) use Per-Layer Embeddings: each layer mixes in an embedding indexed by TOKEN ID.
-        # We pass `per_layer_inputs` explicitly (real tokens -> real PLE, synthetic emit/feedback tokens -> zeros)
-        # so `inputs_embeds` forwards don't crash on the reverse-ID lookup. 0 => not a PLE model (no-op).
+        # Gemma E-series models use per-layer embeddings indexed by token ID. Pass `per_layer_inputs` explicitly:
+        # real tokens receive their PLE values, while synthetic emit and feedback positions receive zeros. A zero
+        # `_ple_dim` identifies a backbone without per-layer embeddings.
         self._ple_dim = int(getattr(backbone.config, "hidden_size_per_layer_input", 0) or 0)
         self._n_layers = int(getattr(backbone.config, "num_hidden_layers", 0) or 0)
         # A text tower (when build_backbone unwrapped to one) always returns `last_hidden_state`, so we don't ask the
@@ -449,20 +454,18 @@ class LangSetModel(nn.Module):
         self.llm_model = llm_model
         self.max_len = max_len
         self._lora_top_k = 0  # overwritten by from_pretrained; persisted in config
-        # pool_mode="last": SKIP the learned emit-query; read the backbone's LAST real-token hidden and project it
-        # (head.out_proj). Lets a FROZEN strong-embedder backbone (e.g. F2LLM) be specialized by training ONLY the
-        # projection head -> nothing is backpropped through the layers (no grad_ckpt, huge batch). "" => emit-head
-        # (default, byte-identical: forward() takes the learned-query path exactly as before).
+        # `pool_mode="last"` bypasses the learned emit query and projects the final real-token hidden state. When
+        # the backbone is frozen, this allows head-only training without retaining a backbone autograd graph. The
+        # empty mode uses the learned-query emission path.
         self.pool_mode = pool_mode
         self._frozen_bb = (
             False  # set by from_pretrained(freeze_backbone=True); gates the no-grad backbone read
         )
-        # RANDOM-INIT bookkeeping (set by from_scratch). A pretrained model rebuilds its backbone from `llm_model`, so
-        # persistence stores only LoRA; a random-init model has no such source, so save/load must carry the FULL net.
+        # A pretrained model can rebuild its base weights from `llm_model`, so persistence needs only its adapters.
+        # A randomly initialized model has no external weight source and must persist the complete backbone.
         self._pretrained = True
-        # FULL-FINETUNE bookkeeping (set by from_pretrained(train_base=True)). A pretrained model normally stores only
-        # LoRA on save (base rebuilds from `llm_model`), but train_base=True trains the WHOLE base — those weights have
-        # no source to rebuild from, so save/snapshot/load must carry the FULL backbone exactly like a random-init net.
+        # Full fine-tuning changes base weights that cannot be reconstructed from `llm_model`; those runs persist the
+        # complete backbone just like randomly initialized models.
         self._full_ft = False
         self._tokenizer_id: Optional[str] = (
             None  # decoupled HF tokenizer id (None => same as llm_model/arch)
@@ -470,10 +473,8 @@ class LangSetModel(nn.Module):
         self._arch_overrides: Optional[dict] = (
             None  # config shrink applied to the from-scratch backbone
         )
-        # PERSISTED AUXILIARY HEADS (langset.heads): a name->nn.Linear map of PERSISTED heads (transient heads are
-        # never registered here — they live and die in the trainer). Each carries a metadata spec (read site, loss,
-        # in/out dims, CE classes) so save_pretrained can serialize it and `head_output(name, ...)` can read it back
-        # at inference. Empty by default => byte-identical: no extra params, nothing written to disk.
+        # Persisted auxiliary heads are registered by name with metadata describing their read site, loss, dimensions,
+        # and optional classes. Transient trainer-only heads are not registered here.
         self.aux_heads: nn.ModuleDict = nn.ModuleDict()
         self.aux_head_specs: dict[str, dict[str, Any]] = {}
 
@@ -502,6 +503,16 @@ class LangSetModel(nn.Module):
         code_tau: float = 0.07,
         res_dim: int = 0,
     ) -> "LangSetModel":
+        """Construct a LangSet model from a pretrained Hugging Face model.
+
+        The backbone is adapted with LoRA by default. Set ``train_base=True`` for full fine-tuning, or combine
+        ``pool_mode="last"`` with ``freeze_backbone=True`` to train only the output projection over frozen
+        backbone features. When ``latent_dim`` is omitted, it defaults to the backbone hidden size.
+
+        Set ``code_emit=True`` to enable codebook-based emission and configure ``n_codes`` for the codebook size.
+        Set ``multi_latent=True`` when the model will be trained with a multi-latent emission strategy. The
+        returned model is moved to ``device``, or to CUDA when available if no device is specified.
+        """
         from transformers import AutoTokenizer  # type: ignore[import-untyped]
 
         dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -539,15 +550,12 @@ class LangSetModel(nn.Module):
         model._lora_top_k = int(lora_top_k)  # persisted in config so load() rebuilds same adapters
         model._full_ft = bool(
             train_base
-        )  # train_base trains the whole base -> persist FULL backbone
-        if pool_mode == "last":  # WARM-START the pool head at the base's NATIVE embedding: identity
+        )  # full fine-tuning requires persisting the complete backbone
+        if pool_mode == "last":  # initialize the projection as an identity mapping
             torch.nn.init.eye_(
                 model.head.out_proj.weight
-            )  # out_proj -> head_project == normalize(last-token hidden) ==
-            torch.nn.init.zeros_(
-                model.head.out_proj.bias
-            )  # the base's own readout (last-token pool) -> starts at base
-            #  quality and REFINES, instead of a random head destroying the base geometry and relearning it worse.
+            )  # `head_project` initially preserves the normalized final-token hidden state
+            torch.nn.init.zeros_(model.head.out_proj.bias)
         if freeze_backbone:  # FROZEN base: only the head trains -> backbone read needs no graph
             for p in model.backbone.parameters():
                 p.requires_grad_(False)
@@ -575,13 +583,14 @@ class LangSetModel(nn.Module):
         code_tau: float = 0.07,
         res_dim: int = 0,
     ) -> "LangSetModel":
-        """RANDOM-INIT control arm (the "does pretraining matter" baseline). `arch` names an HF model whose
-        ARCHITECTURE is copied, but the weights are NOT loaded — the backbone starts from scratch and trains fully
-        (no LoRA). The tokenizer is decoupled: pass any HF `tokenizer_id` (default = `arch`) and the fresh embedding
-        table is sized to it, so there is no baked-in tokenizer. `arch_overrides` shrinks the net, e.g.
-        `{"num_hidden_layers": 4, "hidden_size": 256, "num_attention_heads": 4, "num_key_value_heads": 4,
-        "intermediate_size": 1024}`. Everything downstream (emit head, target source, and losses) is
-        identical to `from_pretrained`; only the source of the backbone weights differs."""
+        """Construct a LangSet model with randomly initialized backbone weights.
+
+        ``arch`` identifies a Hugging Face configuration, but its pretrained weights are not loaded. The complete
+        backbone remains trainable and no LoRA adapters are added. ``tokenizer_id`` defaults to ``arch``, and the
+        new input embedding table is sized for that tokenizer. Use ``arch_overrides`` to replace configuration
+        fields such as the number of layers, hidden size, or attention-head count. The returned model is moved to
+        ``device``, or to CUDA when available if no device is specified.
+        """
         from transformers import AutoTokenizer  # type: ignore[import-untyped]
 
         dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -678,8 +687,11 @@ class LangSetModel(nn.Module):
         return h if h is not None else out.hidden_states[-1]
 
     def _pool_hidden(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """Last real-token hidden of the raw text (frozen-backbone read when _frozen_bb). [B, h]. This is the STATIC
-        feature the frozen-pool fast path caches ONCE; head_project() then turns it into the trainable latent."""
+        """Return each row's final real-token hidden state with shape ``[batch, hidden_size]``.
+
+        When the backbone is frozen, the forward pass runs without gradient
+        tracking so callers can cache these features for projection-head training.
+        """
         if self._frozen_bb:  # frozen backbone -> read under no_grad (zero activation memory)
             with torch.no_grad():
                 hid = self._last_hidden(
@@ -693,11 +705,15 @@ class LangSetModel(nn.Module):
         return hid[torch.arange(hid.size(0), device=hid.device), last]  # [B, h]
 
     def head_project(self, feats: torch.Tensor) -> torch.Tensor:
-        """Project pooled features through the trainable head -> normalized latent. [B, h] -> [B, d]."""
+        """Project ``[batch, hidden_size]`` pooled features to normalized latent vectors."""
         return F.normalize(self.head.out_proj(feats.float()), p=2, dim=-1)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """Read input text, emit the latent. Returns [B, d]."""
+        """Emit latent vectors from a tokenized batch.
+
+        Returns ``[batch, latent_dim]`` when one latent is configured, or
+        ``[batch, n_latents, latent_dim]`` otherwise.
+        """
         if self.pool_mode == "last":  # POOL path: no emit query; last real-token hidden -> out_proj
             return self.head_project(self._pool_hidden(input_ids, attention_mask))
         nl = self.head.n_latents
@@ -729,18 +745,20 @@ class LangSetModel(nn.Module):
         show_progress_bar: bool = False,
         device: Optional[str] = None,
     ) -> Union[np.ndarray, torch.Tensor]:
-        """Sentence-Transformer-compatible. This is the method SetFit calls on its body."""
+        """Encode one or more sentences using the Sentence-Transformer-compatible interface.
+
+        Inputs are tokenized in batches and truncated to `max_len`. A single string returns one embedding;
+        a sequence returns a batch. Results are NumPy arrays by default or CPU tensors when
+        ``convert_to_numpy=False``. ``show_progress_bar`` and ``device`` are accepted for interface compatibility
+        but are currently ignored.
+        """
         single = isinstance(sentences, str)
         texts = [sentences] if single else list(sentences)
         was_training = self.training
         self.eval()
         out: list[torch.Tensor] = []
-        with (
-            torch.no_grad()
-        ):  # eval-only: LoRA params require grad, so w/o this every forward builds
-            for i in range(
-                0, len(texts), batch_size
-            ):  # a throwaway autograd graph -> slower + huge VRAM (caps batch)
+        with torch.no_grad():
+            for i in range(0, len(texts), batch_size):
                 enc = self.tokenizer(
                     texts[i : i + batch_size],
                     padding=True,
@@ -759,25 +777,32 @@ class LangSetModel(nn.Module):
         return emb.numpy() if convert_to_numpy else emb
 
     def emit(self, sentences: Union[str, list[str]], **kw: Unknown) -> torch.Tensor:
-        # kw is a genuine passthrough to encode() -> Unknown (gradual) so it forwards into encode's typed
-        # params without ANN401 tripping on Any. cast the union return (encode -> ndarray | Tensor).
+        """Encode text and return the result as a PyTorch tensor.
+
+        Additional keyword arguments are forwarded to `encode`. This is equivalent to calling
+        ``encode(..., convert_to_numpy=False)``.
+        """
+        # `kw` is a typed passthrough to `encode`; `Unknown` avoids weakening the public signature to `Any`.
         return cast("torch.Tensor", self.encode(sentences, convert_to_numpy=False, **kw))
 
     # --- auxiliary supervised heads (langset.heads) --------------------------------------------------------------
     def seed_hidden(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """Per-sequence backbone hidden for a LEFT-padded batch -> [B, h]. Left padding puts every row's last real
-        token at the final column, so the pooled/final hidden is simply `hid[:, -1]` (this is the "hidden" read
-        site a value/time head reads; distinct from `_pool_hidden`, which assumes RIGHT padding). Grad flows into
-        the backbone/LoRA when they are trainable, so the head can SHAPE the representation."""
+        """Return the final-token backbone hidden state for each sequence.
+
+        The batch must be left-padded so every sequence's final real token occupies the last column. The result
+        has shape ``[batch, hidden_size]`` and remains connected to trainable backbone parameters.
+        """
         hid = self._last_hidden(
             self._run_backbone(self.embed(input_ids), attention_mask, input_ids, 0)
         )
         return hid[:, -1]
 
     def add_aux_head(self, module: nn.Linear, spec: dict[str, Any]) -> None:
-        """Register a PERSISTED auxiliary head so `save_pretrained` serializes it and `head_output` can read it back.
-        `spec` is the head's metadata (name / reads / loss / in_dim / out_dim / classes). Called by the trainer for
-        each persisted Head; the module object is SHARED with the trainer so in-place training keeps it current."""
+        """Register an auxiliary linear head and its persistence metadata.
+
+        ``spec`` describes the head name, read site, loss, input and output dimensions, and optional class labels.
+        Registered heads are serialized by `save_pretrained` and can be queried with `head_output`.
+        """
         name = str(spec["name"])
         self.aux_heads[name] = module
         self.aux_head_specs[name] = dict(spec)
@@ -790,12 +815,18 @@ class LangSetModel(nn.Module):
         batch_size: int = 32,
         reduce: str = "mean",
     ) -> Union[torch.Tensor, list[torch.Tensor]]:
-        """Query a PERSISTED auxiliary head at inference — the readout that makes a value/time head useful.
-        `reads="hidden"` heads read the pooled seed hidden -> one [out_dim] vector per sentence ([N, out_dim]).
-        `reads="recon"` heads read every emitted latent of the rollout: reduce="mean" -> [N, out_dim] (mean over a
-        row's emitted latents); reduce="none" -> a per-row list of [Li, out_dim] (the dense per-tick readout).
-        For a `loss="mse"` value head out_dim=1 (a scalar per state); for a `loss="ce"` head the columns are class
-        logits (argmax -> `aux_head_specs[name]['classes']`)."""
+        """Run a persisted auxiliary head on one or more sentences.
+
+        Heads with ``reads="hidden"`` consume one pooled seed representation per sentence. Heads with
+        ``reads="recon"`` consume every latent produced by `rollout`; ``reduce="mean"`` averages each
+        sequence, while ``reduce="none"`` preserves the per-step outputs. MSE heads typically return scalar
+        values. Classification heads return logits whose columns correspond to
+        ``aux_head_specs[name]["classes"]``.
+
+        Raises:
+            KeyError: If ``name`` is not registered.
+            ValueError: If the reduction or the head's read site is unsupported.
+        """
         if name not in self.aux_heads:
             raise KeyError(f"no persisted head {name!r}; have {sorted(self.aux_heads)}")
         if reduce not in (
@@ -851,8 +882,11 @@ class LangSetModel(nn.Module):
 
     @torch.no_grad()
     def generate_text(self, prompt: str, max_new: int = 200) -> str:
-        """Greedy text generation via the TIED input embedding (the lm_head is stripped). Used to MEASURE whether
-        [LEARN]/train_base actually injected knowledge — ask the trained model a question and read its answer."""
+        """Generate text greedily using the tied input embeddings as the output projection.
+
+        Generation stops at the tokenizer's EOS token or after ``max_new`` tokens. The model is left in evaluation
+        mode after this call.
+        """
         self.eval()
         tok, dev = self.tokenizer, self.device
         msgs = [{"role": "user", "content": prompt}]
@@ -900,11 +934,17 @@ class LangSetModel(nn.Module):
         tuple[torch.Tensor, ...],
         tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]],
     ]:
-        """Autoregressively emit named-state superpositions and feed each one back.
+        """Autoregressively emit codebook-based latent states.
 
-        ``temperature`` reshapes the code distribution before it is committed; zero uses the trained
-        distribution unchanged. ``return_soft`` returns the committed vectors and per-step code entropy.
-        QueryBridge is a separate non-autoregressive family and routes inference through its objective.
+        Each emitted state is fed back into the backbone until its stop logit exceeds ``stop_threshold`` or
+        ``max_steps`` is reached. This method requires a model constructed with ``code_emit=True``.
+        ``temperature <= 0`` uses the learned code distribution unchanged; positive values rescale its logits.
+        Batched outputs zero-pad halted rows, while outputs for a single string are trimmed to their emitted length.
+
+        By default, returns the emitted latents. ``return_lengths`` adds per-row lengths; ``return_confidence``
+        returns ``(latents, lengths, confidence)``; and ``return_soft`` returns
+        ``(latents, lengths, committed_latents, entropy)``. These flags are checked in that precedence order:
+        ``return_soft``, then ``return_confidence``, then ``return_lengths``.
         """
         if not self.head.code_emit:
             raise ValueError(
@@ -991,24 +1031,21 @@ class LangSetModel(nn.Module):
         kv_cache: bool = False,
         return_emit_hidden: bool = False,
     ) -> tuple[torch.Tensor, ...]:
-        """Autoregressive concept/codebook pass.
+        """Run an autoregressive concept/codebook training pass.
 
-        Maps targets to nearest code indices for code-classification objectives while preserving the exact target
-        vectors for teacher forcing. Returns code logits ``[B, L+1, 1, n_codes]``, STOP logits, indices, and exact
-        target vectors.
+        Targets are mapped to nearest code indices for code-classification objectives while their exact vectors are
+        retained for teacher forcing. Returns code logits with shape ``[B, L + 1, 1, n_codes]``, stop logits, code
+        indices, and exact target vectors. When ``return_emit_hidden=True``, the corresponding emission hidden states
+        are appended to the result.
 
-        `ss_prob`=0 (default): pure TEACHER FORCING in ONE forward pass — every position predicted from the true
-        prefix, gradients flow at most ONE hop (byte-identical to before). `ss_prob`>0: SCHEDULED SAMPLING for the
-        first `train_hops` positions (None = all) — with prob `ss_prob` each of those positions is fed the model's
-        OWN emitted latent instead of the ground truth, so the emitter learns to consume its own (imperfect)
-        predictions. This is the exposure-bias fix that makes MULTI-HOP rollout trained rather than emergent. Self-
-        fed latents are DETACHED (standard scheduled sampling). Cost = train_hops+1
-        backbone passes (positions past train_hops are teacher-forced in one pass).
+        With ``ss_prob=0``, all positions are predicted from the true prefix in one forward pass. With a positive
+        probability, the first ``train_hops`` positions may consume detached model emissions instead of ground-truth
+        latents; later positions remain teacher-forced. This scheduled-sampling path requires multiple backbone
+        forwards.
 
-        `ss_mask` (optional [B, H] bool): the PRECOMPUTED per-(row, hop) self-feed decisions. When given, the loop
-        uses `ss_mask[:, h]` in place of a fresh `torch.rand < ss_prob` draw. This makes the rollout DETERMINISTIC
-        given the mask, so GradCache's phase-1 (no_grad, full batch) and phase-2 (grad, per chunk) forwards produce
-        identical `recon` and the cached gradients line up exactly. None = sample as usual (byte-identical)."""
+        ``ss_mask`` optionally supplies precomputed ``[B, H]`` self-feed decisions. Reusing the same mask makes
+        GradCache's detached and gradient-enabled passes produce aligned emissions and cached gradients.
+        """
         assert self.head.multi_latent and self.head.code_emit
         bsz, s_len = input_ids.size(0), input_ids.size(1)
         n = target_latents.size(1)
@@ -1016,7 +1053,7 @@ class LangSetModel(nn.Module):
         codes = codes.view(bsz, n, -1)  # [B, L, 1]
         recon = recon.view(bsz, n, -1)  # [B, L, d] — clean feedback + recon target
         H = n if train_hops is None else max(0, min(int(train_hops), n))
-        if ss_prob <= 0 or n == 0 or H == 0:  # TEACHER-FORCED one-shot (default, fast)
+        if ss_prob <= 0 or n == 0 or H == 0:  # one-pass teacher forcing
             seed = self.embed(input_ids)
             fb = self.head.feedback(
                 recon.detach().to(seed.dtype)
@@ -1033,7 +1070,7 @@ class LangSetModel(nn.Module):
                 if return_emit_hidden
                 else (code_lg, stop_lg, codes, recon)
             )
-        # SCHEDULED-SAMPLING multi-hop path
+        # Scheduled-sampling path: self-fed positions are evaluated serially.
         dev = recon.device
         if (
             kv_cache
@@ -1147,16 +1184,23 @@ class LangSetModel(nn.Module):
         return code_lg, stop_lg, codes, recon
 
     def get_sentence_embedding_dimension(self) -> int:
+        """Return the configured latent embedding dimension."""
         return self.latent_dim
 
     def as_sentence_transformer(self) -> SentenceTransformer:
-        """Wrap as a `sentence_transformers.SentenceTransformer` so it drops into SetFit as `model_body`."""
+        """Return a SentenceTransformer wrapper suitable for APIs such as SetFit."""
         from langset.st_module import to_sentence_transformer
 
         return to_sentence_transformer(self)
 
     # ---- persistence (LoRA + head + config; backbone rebuilt from ids) ----
     def save_pretrained(self, path: Union[str, Path]) -> None:
+        """Save the LangSet configuration and trainable state to a directory.
+
+        Pretrained models whose base weights can be reconstructed store the emission head and LoRA adapters.
+        Randomly initialized or fully fine-tuned models store the complete backbone. Persisted auxiliary heads and
+        emission-bridge state are included when present.
+        """
         import json
 
         p = Path(path)
@@ -1228,6 +1272,12 @@ class LangSetModel(nn.Module):
         device: Optional[str] = None,
         attn_implementation: str = "sdpa",
     ) -> "LangSetModel":
+        """Load a model saved by `save_pretrained`.
+
+        Reconstructs the original pretrained or randomly initialized backbone, restores the saved trainable state,
+        rebuilds persisted auxiliary heads, moves the model to ``device``, and returns it in evaluation mode.
+        Checkpoints using the removed FSQ emitter are rejected.
+        """
         import json
 
         p = Path(path)
