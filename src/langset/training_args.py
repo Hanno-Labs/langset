@@ -1,6 +1,6 @@
 """Declarative training configuration for langset's trainer and strategies.
 
-:class:`TrainingArguments` collects the knobs that control tokenization,
+`TrainingArguments` collects the knobs that control tokenization,
 optimization, latent emission, auxiliary objectives, validation, checkpointing,
 and strategy injection. It is intentionally configuration-only: the trainer
 consumes these values, while the interchangeable strategy classes and loss

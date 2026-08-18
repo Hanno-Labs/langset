@@ -164,7 +164,7 @@ def _snapshot_best(m: LangSetModel) -> dict[str, Any]:
 
 
 def _restore_best(m: LangSetModel, best_state: dict[str, Any]) -> None:
-    """Restore a snapshot created by :func:`_snapshot_best`, including legacy LoRA-only snapshots."""
+    """Restore a snapshot created by `_snapshot_best`, including legacy LoRA-only snapshots."""
     m.head.load_state_dict(best_state["head"])
     if "backbone" in best_state:  # random-init: full backbone
         m.backbone.load_state_dict(best_state["backbone"], strict=False)
@@ -212,7 +212,7 @@ class BackboneStepEngine(_StepEngine):
     This is the default single-latent engine. It computes input, target, and
     optional hard-negative features and supports reconstruction auxiliaries;
     runtime options such as view fusion and target stop-gradient are handled
-    inside :meth:`featurize`.
+    inside `featurize`.
     """
 
     supports_recon = True
@@ -378,15 +378,16 @@ class FrozenPoolStepEngine(_StepEngine):
 
 
 class Trainer:
-    """Train a :class:`LangSetModel` on text-to-latent alignment data.
+    """Train a `LangSetModel` on text-to-latent alignment data.
 
     The trainer selects the single- or multi-latent path from the model configuration. Single-latent rows require
     ``input_text`` and ``target_text``; multi-latent rows require ``input_text`` and a non-empty ``target_texts``
     list. Optional columns configure hard negatives, false-negative masks, concepts, states, auxiliary heads, and
-    text replay according to :class:`TrainingArguments`.
+    text replay according to `TrainingArguments`.
 
     ``eval_dataset`` is currently reserved and ignored; validation rows are split from ``train_dataset``.
-    ``on_checkpoint``, when provided, is called after a durable checkpoint is written.
+    ``on_checkpoint``, when provided, is called after the checkpoint is written locally so callers can perform
+    external persistence or synchronization.
     """
 
     def __init__(
@@ -625,7 +626,7 @@ class Trainer:
 
         Dispatches to the multi-latent strategy loop when the model uses a multi-latent head; otherwise runs
         single-latent contrastive training. Checkpointing, early stopping, text replay, and auxiliary losses are
-        controlled by :class:`TrainingArguments`.
+        controlled by `TrainingArguments`.
         """
         if self.multi_latent:
             return self._train_multi()

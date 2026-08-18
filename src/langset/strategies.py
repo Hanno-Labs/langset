@@ -1,7 +1,7 @@
 """Interchangeable strategies for multi-latent training.
 
 A training step combines an emission objective, a target source, optional loss terms, and small callables for
-epoch ordering, checkpoint selection, and seed construction. :class:`TrainingArguments` stores the selected
+epoch ordering, checkpoint selection, and seed construction. `TrainingArguments` stores the selected
 implementations, which are instantiated once and used through shared interfaces.
 """
 
@@ -205,7 +205,7 @@ class CoTGenTerm(_LossTerm):
     """Train next-token generation of each row's ``cot_text`` from its input seed.
 
     The term uses an isolated backward pass so its long generation graph does not coexist with the latent-emission
-    graph. Pair it with :func:`cot_seed_texts` when emissions should also condition on the provided reasoning.
+    graph. Pair it with `cot_seed_texts` when emissions should also condition on the provided reasoning.
     Batches without reasoning text are skipped.
     """
 
@@ -250,7 +250,7 @@ class CoTGenTerm(_LossTerm):
 
 
 def build_cot_loss_terms(args: TrainingArguments) -> list[_LossTerm]:
-    """Build the default auxiliary terms plus :class:`CoTGenTerm`.
+    """Build the default auxiliary terms plus `CoTGenTerm`.
 
     Use with ``seed_builder=cot_seed_texts`` and a dataset containing ``cot_text``.
     """
@@ -744,7 +744,7 @@ class _TargetSource:
 class EMATwinTarget(_TargetSource):
     """Produce stop-gradient targets from an exponential-moving-average copy of the online model.
 
-    After each optimizer step, :meth:`update` moves the target model toward the trainable online parameters using
+    After each optimizer step, `update` moves the target model toward the trainable online parameters using
     ``ema_m``. The lagged target provides a more stable comparison geometry than using the online model on both sides.
     """
 
@@ -791,7 +791,7 @@ class CachedTarget(_TargetSource):
 
     If ``target_encoder_ckpt`` is configured, the encoder is loaded from that LangSet checkpoint. Otherwise, the
     source is a frozen copy of the online model taken at initialization. Each unique text is encoded once and
-    subsequent calls reuse the cached latent. :meth:`update` is a no-op because the target geometry is fixed.
+    subsequent calls reuse the cached latent. `update` is a no-op because the target geometry is fixed.
     """
 
     suppresses_nce = False
@@ -1048,7 +1048,7 @@ def multi_seed_texts(trainer: Trainer, seeds: list[str], args: TrainingArguments
 def cot_seed_texts(trainer: Trainer, seeds: list[str], args: TrainingArguments) -> list[str]:
     """Append each row's reasoning text to its seed before emission.
 
-    Pair with :func:`build_cot_loss_terms` so the same reasoning is trained autoregressively. Targets and evaluation
+    Pair with `build_cot_loss_terms` so the same reasoning is trained autoregressively. Targets and evaluation
     continue to use the raw seeds.
     """
     return [f"{s}\n\nReasoning:\n{trainer.cot_texts[i]}" for i, s in enumerate(seeds)]

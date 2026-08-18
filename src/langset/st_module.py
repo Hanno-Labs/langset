@@ -1,6 +1,6 @@
 """Sentence-Transformers compatibility for trained langset models.
 
-This adapter wraps a trained single-latent :class:`langset.LangSetModel` as a
+This adapter wraps a trained single-latent `langset.LangSetModel` as a
 ``sentence_transformers.SentenceTransformer``-compatible object. It provides
 the interface expected by SetFit and similar tooling while keeping langset's
 model and latent geometry underneath.
@@ -11,7 +11,7 @@ Typical usage::
     setfit_model = SetFitModel(model_body=body, labels=[...])
 
 Use this integration for embedding-style models; autoregressive multi-latent
-rollouts remain on :class:`langset.LangSetModel` itself.
+rollouts remain on `langset.LangSetModel` itself.
 """
 
 from __future__ import annotations

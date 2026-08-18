@@ -1,6 +1,6 @@
 """Model and emission-head implementations for LangSet.
 
-:class:`LangSetModel` combines a language-model backbone with a learned emission interface. The emission head can
+`LangSetModel` combines a language-model backbone with a learned emission interface. The emission head can
 project backbone hidden states into a single embedding, multiple continuous latents, or autoregressive codebook
 states. Optional LoRA adaptation supports parameter-efficient fine-tuning.
 
@@ -397,8 +397,8 @@ class LangSetModel(nn.Module):
     """Wrap a language-model backbone with continuous or codebook-based emission heads.
 
     Depending on its configuration, a model can produce a single embedding, multiple learned latent vectors,
-    or an autoregressive sequence of named-state emissions. Use :meth:`from_pretrained` or :meth:`from_scratch`
-    to construct a model, :meth:`encode` for Sentence-Transformer-compatible embeddings, and :meth:`rollout` for
+    or an autoregressive sequence of named-state emissions. Use `from_pretrained` or `from_scratch`
+    to construct a model, `encode` for Sentence-Transformer-compatible embeddings, and `rollout` for
     autoregressive codebook emission.
     """
 
@@ -747,7 +747,7 @@ class LangSetModel(nn.Module):
     ) -> Union[np.ndarray, torch.Tensor]:
         """Encode one or more sentences using the Sentence-Transformer-compatible interface.
 
-        Inputs are tokenized in batches and truncated to :attr:`max_len`. A single string returns one embedding;
+        Inputs are tokenized in batches and truncated to `max_len`. A single string returns one embedding;
         a sequence returns a batch. Results are NumPy arrays by default or CPU tensors when
         ``convert_to_numpy=False``. ``show_progress_bar`` and ``device`` are accepted for interface compatibility
         but are currently ignored.
@@ -779,7 +779,7 @@ class LangSetModel(nn.Module):
     def emit(self, sentences: Union[str, list[str]], **kw: Unknown) -> torch.Tensor:
         """Encode text and return the result as a PyTorch tensor.
 
-        Additional keyword arguments are forwarded to :meth:`encode`. This is equivalent to calling
+        Additional keyword arguments are forwarded to `encode`. This is equivalent to calling
         ``encode(..., convert_to_numpy=False)``.
         """
         # `kw` is a typed passthrough to `encode`; `Unknown` avoids weakening the public signature to `Any`.
@@ -801,7 +801,7 @@ class LangSetModel(nn.Module):
         """Register an auxiliary linear head and its persistence metadata.
 
         ``spec`` describes the head name, read site, loss, input and output dimensions, and optional class labels.
-        Registered heads are serialized by :meth:`save_pretrained` and can be queried with :meth:`head_output`.
+        Registered heads are serialized by `save_pretrained` and can be queried with `head_output`.
         """
         name = str(spec["name"])
         self.aux_heads[name] = module
@@ -818,7 +818,7 @@ class LangSetModel(nn.Module):
         """Run a persisted auxiliary head on one or more sentences.
 
         Heads with ``reads="hidden"`` consume one pooled seed representation per sentence. Heads with
-        ``reads="recon"`` consume every latent produced by :meth:`rollout`; ``reduce="mean"`` averages each
+        ``reads="recon"`` consume every latent produced by `rollout`; ``reduce="mean"`` averages each
         sequence, while ``reduce="none"`` preserves the per-step outputs. MSE heads typically return scalar
         values. Classification heads return logits whose columns correspond to
         ``aux_head_specs[name]["classes"]``.
@@ -1272,7 +1272,7 @@ class LangSetModel(nn.Module):
         device: Optional[str] = None,
         attn_implementation: str = "sdpa",
     ) -> "LangSetModel":
-        """Load a model saved by :meth:`save_pretrained`.
+        """Load a model saved by `save_pretrained`.
 
         Reconstructs the original pretrained or randomly initialized backbone, restores the saved trainable state,
         rebuilds persisted auxiliary heads, moves the model to ``device``, and returns it in evaluation mode.

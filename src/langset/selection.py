@@ -1,11 +1,9 @@
-"""Collapse-aware validation metrics for checkpoint selection.
+"""Validation metrics for retrieval quality and representation collapse.
 
-Training loss is deliberately not used to select the best model: a contrastive
-objective can reduce its loss by collapsing the representation geometry. These
-metrics instead evaluate held-out input-to-target retrieval and reconstruction,
-then apply a hard penalty when the embedding geometry collapses. The trainer
-uses them for early stopping and checkpoint selection so optimization and model
-selection measure different things.
+This module provides held-out retrieval MRR, mean-cosine collapse scoring, and
+k-nearest-neighbor purity. The trainer combines these metrics with
+reconstruction evaluation and a collapse penalty when selecting checkpoints;
+the metric functions here do not apply that policy themselves.
 """
 
 from __future__ import annotations

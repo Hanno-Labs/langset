@@ -9,9 +9,9 @@ The core training contract is a row with two views of the same item:
   interest and cannot be trivially regenerated from ``input_text``; otherwise
   the objective mostly distills a text encoder.
 
-Pass a ``datasets.Dataset`` or ``list[dict]`` to :class:`langset.Trainer`. Use
+Pass a ``datasets.Dataset`` or ``list[dict]`` to `langset.Trainer`. Use
 ``column_mapping`` when an existing dataset uses different column names, or
-use :func:`from_records` to project arbitrary records onto the basic contract.
+use `from_records` to project arbitrary records onto the basic contract.
 """
 
 from __future__ import annotations
