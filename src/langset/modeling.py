@@ -555,9 +555,7 @@ class LangSetModel(nn.Module):
             torch.nn.init.eye_(
                 model.head.out_proj.weight
             )  # `head_project` initially preserves the normalized final-token hidden state
-            torch.nn.init.zeros_(
-                model.head.out_proj.bias
-            )
+            torch.nn.init.zeros_(model.head.out_proj.bias)
         if freeze_backbone:  # FROZEN base: only the head trains -> backbone read needs no graph
             for p in model.backbone.parameters():
                 p.requires_grad_(False)
@@ -759,12 +757,8 @@ class LangSetModel(nn.Module):
         was_training = self.training
         self.eval()
         out: list[torch.Tensor] = []
-        with (
-            torch.no_grad()
-        ):
-            for i in range(
-                0, len(texts), batch_size
-            ):
+        with torch.no_grad():
+            for i in range(0, len(texts), batch_size):
                 enc = self.tokenizer(
                     texts[i : i + batch_size],
                     padding=True,
